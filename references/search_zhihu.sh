@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Grep hexin's scraped Zhihu corpus. Usage: search_zhihu.sh "关键词"
+# Grep marsggbo's scraped Zhihu corpus. Usage: search_zhihu.sh "关键词"
 set -e
 KEYWORD="${1:?need keyword}"
 DATA_DIR="/Users/hex/marsggbo-skill/data/zhihu"
