@@ -188,13 +188,15 @@ def _pdf_metadata_title(pdf_path: Path) -> str:
 
 # ─── Strategy 1: arXiv HTML ───────────────────────────────────────────────────
 
-def _strategy_html(arxiv_id: str, output_dir: Path) -> tuple[str, list[FigureAsset]]:
+def _strategy_html(arxiv_id: str, output_dir: Path, flat: bool = False) -> tuple[str, list[FigureAsset]]:
     """
     Fetch the arXiv HTML version of a paper and extract all <figure> elements.
     Returns (title, figures). Raises requests.HTTPError / RuntimeError on failure.
     """
     # arXiv HTML lives at /html/<id>  (e.g. /html/2604.07144v1)
-    base_url = f"https://arxiv.org/html/{arxiv_id}"
+    # Trailing slash is critical for urljoin: without it, relative image paths
+    # like "x1.png" resolve to /html/x1.png instead of /html/<id>/x1.png
+    base_url = f"https://arxiv.org/html/{arxiv_id}/"
     r = requests.get(base_url, headers={"User-Agent": "paper-assets/1.0"}, timeout=30)
     r.raise_for_status()
 
@@ -209,7 +211,7 @@ def _strategy_html(arxiv_id: str, output_dir: Path) -> tuple[str, list[FigureAss
     # Strip "arXiv:XXXX - " prefix common in <title>
     title = re.sub(r"^\[?\d{4}\.\d+\]?\s*[-–—]?\s*", "", title).strip()
 
-    figs_dir = output_dir / "figures"
+    figs_dir = output_dir if flat else output_dir / "assets"
     figs_dir.mkdir(parents=True, exist_ok=True)
 
     assets: list[FigureAsset] = []
@@ -287,10 +289,11 @@ def _strategy_pdf_embedded(
     output_dir: Path,
     min_width: int = 80,
     min_height: int = 80,
+    flat: bool = False,
 ) -> list[FigureAsset]:
     """Extract raster images embedded in the PDF via PyMuPDF."""
     doc = fitz.open(str(pdf_path))
-    figs_dir = output_dir / "figures"
+    figs_dir = output_dir if flat else output_dir / "assets"
     figs_dir.mkdir(parents=True, exist_ok=True)
 
     assets: list[FigureAsset] = []
@@ -342,10 +345,11 @@ def _strategy_page_render(
     output_dir: Path,
     page_indices: list[int],
     dpi: int = 150,
+    flat: bool = False,
 ) -> list[FigureAsset]:
     """Render listed PDF pages (0-indexed) as PNG images."""
     doc = fitz.open(str(pdf_path))
-    pages_dir = output_dir / "pages"
+    pages_dir = output_dir if flat else output_dir / "assets"
     pages_dir.mkdir(parents=True, exist_ok=True)
 
     mat = fitz.Matrix(dpi / 72, dpi / 72)
@@ -400,6 +404,7 @@ def extract_assets(
     min_height: int = 80,
     render_pages: Optional[str] = None,
     cache_dir: Optional[str] = None,
+    flat: bool = False,
 ) -> PaperAssets:
     """
     Extract figures, tables, and page renders from an academic paper.
@@ -484,7 +489,7 @@ def extract_assets(
             if not arxiv_id:
                 continue
             try:
-                t, figs = _strategy_html(arxiv_id, out)
+                t, figs = _strategy_html(arxiv_id, out, flat=flat)
                 if figs:
                     figures = figs
                     title = title or t
@@ -494,7 +499,7 @@ def extract_assets(
                 continue
 
         elif strat == "pdf":
-            figs = _strategy_pdf_embedded(pdf_path, out, min_width, min_height)
+            figs = _strategy_pdf_embedded(pdf_path, out, min_width, min_height, flat=flat)
             if figs:
                 figures = figs
                 strategy_used = "pdf_embedded"
@@ -505,7 +510,7 @@ def extract_assets(
             if not pages:
                 doc = fitz.open(str(pdf_path))
                 pages = list(range(len(doc)))
-            figs = _strategy_page_render(pdf_path, out, pages, dpi)
+            figs = _strategy_page_render(pdf_path, out, pages, dpi, flat=flat)
             if figs:
                 figures = figs
                 strategy_used = "page_render"
@@ -514,7 +519,7 @@ def extract_assets(
     # ── Optional explicit page renders (additive) ─────────────────────────────
     if render_pages:
         page_indices = _parse_page_spec(render_pages)
-        extra = _strategy_page_render(pdf_path, out, page_indices, dpi)
+        extra = _strategy_page_render(pdf_path, out, page_indices, dpi, flat=flat)
         # Avoid duplicating pages already rendered
         existing_pages = {f.page for f in figures if f.source == "page_render"}
         extra = [f for f in extra if f.page not in existing_pages]
@@ -584,6 +589,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--format", choices=["json", "summary", "md"], default="json",
         help="Output format: json (default), summary (human), or md (image refs)",
     )
+    p.add_argument(
+        "--flat", action="store_true", default=False,
+        help="Save all images directly to output-dir (no figures/ or pages/ subdirs)",
+    )
     return p
 
 
@@ -598,6 +607,7 @@ def main() -> None:
         min_height=args.min_height,
         render_pages=args.render_pages,
         cache_dir=args.cache_dir,
+        flat=args.flat,
     )
     if result.error:
         print(f"ERROR: {result.error}", file=sys.stderr)
