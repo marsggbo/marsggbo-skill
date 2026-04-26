@@ -168,70 +168,135 @@ OR 直接用加粗关键概念 + 正文展开，适合短文/回答。
 
 当用户提供论文 URL（arXiv / PDF 直链）或本地 PDF 路径，且任务是**写文章/解读**时，执行以下流程：
 
-### 第一步：提取论文资源
+### 第一步：创建论文目录
 
-使用 `paper_assets.py` 脚本提取所有图表：
+确定 `<paper_slug>`：
+- arXiv paper：用 arXiv ID（下划线），如 `2603_27624`
+- 其他来源：用论文缩写（小写连字符），如 `cacheslide`
 
 ```bash
-# 基本用法（auto 策略：优先 arXiv HTML → PDF 嵌入图 → 整页渲染）
+mkdir -p ~/Desktop/posts/<paper_slug>/
+```
+
+目录结构（执行完第二步后）：
+```
+posts/
+  <paper_slug>/
+    YYYY-MM-DD-<paper_slug>.md   ← 最终 markdown（含 Jekyll front matter）
+    assets.json                  ← paper_assets 生成的 manifest
+    assets/                      ← 图片子目录
+      001_Figure_1.png
+      002_Figure_2.png
+```
+
+### 第二步：提取论文资源
+
+使用 `paper_assets.py` 脚本提取所有图表（**不加 `--flat`**，图片自动存到 `assets/` 子目录）：
+
+```bash
 ~/miniforge3/bin/python3 ~/.claude/skills/marsggbo/paper_assets.py \
   <paper_url_or_path> \
-  --output-dir <markdown输出目录>/<论文名>_assets \
+  --output-dir ~/Desktop/posts/<paper_slug>/ \
   --format summary
 
-# 如需额外渲染特定页（如算法页、主结果表）
+# 如需额外渲染特定页（算法页、主结果表等）
 ~/miniforge3/bin/python3 ~/.claude/skills/marsggbo/paper_assets.py \
   <paper_url_or_path> \
-  --output-dir <markdown输出目录>/<论文名>_assets \
+  --output-dir ~/Desktop/posts/<paper_slug>/ \
   --render-pages 3,5,8 \
   --dpi 180 \
   --format summary
 ```
 
-**输出目录规则**：与 markdown 文件同级，这样相对路径能在本地正确渲染。
-例如 markdown 保存到 `~/Desktop/article.md`，则：
-`--output-dir ~/Desktop/article_assets`
+图片保存到 `<paper_slug>/assets/` 子目录，文件名如 `001_Figure_1.png`。
 
-### 第二步：读取提取结果
+### 第三步：读取提取结果
 
-脚本在 `output_dir/assets.json` 保存完整 manifest，格式：
-```json
-{
-  "figures": [
-    {
-      "rel_path": "figures/001_Figure_1.png",
-      "label": "Figure 1",
-      "caption": "...",
-      "category": "figure|table|algorithm|page"
-    }
-  ]
-}
+读取 `output_dir/assets.json`，记录所有图的 `rel_path` 和 `caption`，供写文章时引用。
+
+### 第四步：写文章时的要求
+
+#### 4.1 文章开头格式（必须）
+
+文章第一行是 Jekyll YAML front matter，其次是正文标题，然后是原文引用链接：
+
+```markdown
+---
+layout: post
+title: "文章标题"
+date: YYYY-MM-DD
+tags: [LLM, 论文解读]
+---
+
+# 文章标题
+
+> 原文：[论文完整标题](原文URL)
+
+---
+
+## 1. 前言
+...
 ```
 
-读取后，把所有图的 `rel_path` 和 `caption` 记下来，写文章时按需引用。
+- `date` 填写今天日期（从系统获取）
+- `tags` 根据论文主题填写，如 `[LLM, KV Cache, 论文解读]`
+- 原文引用块紧跟在正文 `# 标题` 之后，与章节之间用 `---` 分割
 
-### 第三步：写文章时的要求
+#### 4.2 图片路径：使用相对路径（本地）+ 上传时自动转换
 
-1. **数据必须来自原文**：不得凭记忆或 WebFetch 摘要臆造数字。
-   - 性能数字、提升幅度、实验设置，先从 paper PDF 文本或图表读取确认
-   - 做法：从 `assets.json` 的 caption 里提取数字；或在正文写作前用 WebFetch 再读一次原文 abstract/experimental results
+markdown 里**所有图片引用**使用相对路径（相对于 md 文件）：
 
-2. **图表必须嵌入**：凡是行文中提到"如图所示"、"实验结果"、"系统架构"、"算法流程"，
-   就在该位置插入对应图片：
-   ```markdown
-   ![Figure 3: 系统架构图](article_assets/figures/003_Figure_3.png)
-   ```
-   - 优先用 caption 作为 alt text（截取前 80 字）
-   - 对于算法/伪代码页，用 `--render-pages` 渲染原始页面后嵌入
+```markdown
+![简短中文描述](assets/001_Figure_1.png)
+```
 
-3. **图表引用格式**：
-   ```markdown
-   如下图所示（Figure 3），系统分为上下两个平面...
+- `rel_path` 来自 `assets.json`，直接使用（格式已是 `assets/xxx.png`）
+- 上传脚本会自动将 `assets/xxx.png` 替换为 `/assets/img/posts/<slug>/xxx.png`（GitHub Pages 绝对路径）
+- **不要手动写 `/assets/img/posts/` 开头的路径**，让脚本处理
 
-   ![Figure 3: Overview of Autopoiesis's two-plane system architecture...](article_assets/figures/003_Figure_3.png)
-   ```
+#### 4.3 图片的行文引用格式（博客风格，非论文风格）
 
-4. **不要空手写**：如果 paper_assets.py 失败（网络/格式问题），**必须明确告知用户**，不可跳过图表直接写纯文字文章。
+**不要写 "Figure X"**。博客文章不是学术论文，不需要图编号。正文用"如下图"、"如图"即可：
+
+```markdown
+❌ 错误（论文风格）：
+如下图所示（Figure 3），系统分为两个平面...
+![Figure 3: Overview of the two-plane...](assets/003_Figure_3.png)
+
+✅ 正确（博客风格）：
+如下图，系统分为两个平面...
+![系统总体架构](assets/003_Figure_3.png)
+```
+
+alt text 用**简短的中文描述**（5-15 字），说明图的内容，不抄 caption 全文，不写 "Figure X"。
+
+#### 4.4 数据来自原文
+
+不得凭记忆臆造数字：
+- 从 `assets.json` 的 caption 提取数字
+- 或写作前 WebFetch 再读一次原文 abstract/experimental results
+
+#### 4.5 不要空手写
+
+如果 paper_assets.py 失败，**必须告知用户**，不可绕过图表直接写纯文字。
+
+#### 4.6 文件命名与保存路径
+
+文章保存为：`~/Desktop/posts/<paper_slug>/YYYY-MM-DD-<paper_slug>.md`
+
+### 第五步：自动上传到 GitHub Pages（写完文章后必须执行）
+
+写完文章后，立即执行上传脚本：
+
+```bash
+~/miniforge3/bin/python3 ~/.claude/skills/marsggbo/upload_post.py ~/Desktop/posts/<paper_slug>/
+```
+
+脚本会自动：
+1. 读取 `<paper_slug>/YYYY-MM-DD-<slug>.md`，将图片路径从 `assets/xxx.png` 替换为 `/assets/img/posts/<slug>/xxx.png`，上传到 repo 的 `_posts/` 目录
+2. 将 `<paper_slug>/assets/` 里所有图片上传到 repo 的 `assets/img/posts/<slug>/` 目录
+
+上传成功后告知用户文章链接（格式：`https://marsggbo.github.io/blog/<year>/<title>/`）。
 
 ### paper_assets.py 接口速查
 
@@ -242,6 +307,7 @@ source：arXiv URL、arXiv ID（如 2604.07144v1）、HTTP PDF URL、本地 PDF 
 
 选项：
   --output-dir DIR        资产保存目录（默认 ./paper_assets/）
+  --flat                  图片直接存到 output-dir，不建 figures/ pages/ 子目录
   --strategy auto|html|pdf|pages
                           提取策略（auto = html→pdf→pages 依次尝试）
   --dpi N                 整页渲染分辨率（默认 150）
@@ -253,7 +319,7 @@ source：arXiv URL、arXiv ID（如 2604.07144v1）、HTTP PDF URL、本地 PDF 
 
 Python import：
   from paper_assets import extract_assets
-  assets = extract_assets("https://arxiv.org/abs/2604.07144", "/tmp/out")
+  assets = extract_assets("https://arxiv.org/abs/2604.07144", "/tmp/out", flat=True)
   print(assets.summary())
   print(assets.md_snippets())  # 直接粘贴进 markdown 的图片引用
 ```
