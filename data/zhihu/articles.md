@@ -1,6 +1,750 @@
 # hexin — articles
 
-Total: 187
+Total: 191
+
+
+---
+
+## NSDI26 | DroidSpeak让不同 LLM 之间共享 KV Cache
+
+`link: http://zhuanlan.zhihu.com/p/2031750167255367893 · created: 1777187334`
+
+
+> 原文：[DroidSpeak: KV Cache Sharing for Cross-LLM Communication and Multi-LLM Serving](https://link.zhihu.com/?target=https%3A//arxiv.org/abs/2411.02820)
+
+## 1. 前言：一个很自然但从没人解决过的问题
+
+KV Cache 共享这件事，在单个模型的场景里已经做得很成熟了——vLLM 的 prefix caching、SGLang 的 RadixAttention，本质都是"同一个模型、不同请求共享相同前缀的 KV Cache"。
+
+但有一个问题从来没人认真解决过：**如果是两个不同的模型，能共享 KV Cache 吗？**
+
+听起来是个怪问题。为什么两个不同模型会需要共享 KV Cache？
+
+在多 Agent 系统里，这其实很常见。比如一个 coding agentic workflow 里，有个 coding agent 和一个 testing agent，它们分别是从同一个基础模型 fine-tune 出来的不同版本。两个 agent 都要读同一套背景文档或对话历史，然后分别生成各自的输出。
+
+按现在的做法，两个 agent 各自跑各自的 prefill，把同一段上下文算两遍——一遍都不能省。
+
+**这就是 DroidSpeak 要解决的核心问题**：在分布式 LLM 推理系统里，让运行着不同模型的 GPU 节点之间，能够安全地共享 KV Cache，从而省掉重复的 prefill 计算。
+
+来自芝加哥大学 + 微软的工作，今天聊聊它怎么做到的。
+
+---
+
+## 2. 背景：跨模型 KV Cache 共享的三个场景
+
+如下图，论文给了三类典型场景：
+
+![](https://pica.zhimg.com/v2-f884f0c93183ce2734897677b857b430_r.jpg)
+
+**场景 A — Multi-agent workflow**：baseline agent + expert agent 协作，两个模型处理同一条用户输入。
+
+**场景 B — 多模型服务同一内容**：同样的文档或背景，被多个不同的专业化模型各自处理，各建各的 KV Cache，重复计算严重。
+
+**场景 C — 个性化 Agent**：coding agent、validation agent、debugging agent，三者处理同一个代码问题，上下文高度重叠。
+
+这三个场景有个共同点：**多个 fine-tune 自同一基础模型的不同 LLM，重复处理相同的输入前缀。** 如果能让一个模型算好 KV Cache 之后，另一个模型直接拿来用，prefill 成本就能大幅降低。
+
+前人做的 prefix caching 能省掉同一个模型内部的重复计算，但跨模型的这层从来没人碰过。
+
+---
+
+## 3. 第一个问题：直接复用 KV Cache 行不行？
+
+直觉上，两个 fine-tune 自同一基础模型的模型，权重差别不大，KV Cache 应该也差不多，直接拿来用应该没啥问题？
+
+论文做了实测。结论一句话：**直接复用另一个模型的 KV Cache，精度暴跌。**
+
+如下图，对 8 个 model pair 的测试结果：
+
+![](https://pica.zhimg.com/v2-a29beacaa2513196d5c57cd0c397065a_r.jpg)
+
+HotpotQA 上，大多数 model pair 直接复用后 F1 score 下降超过 50%。其他 dataset 情况各异，但基本上都是精度受损。
+
+所以直接复用走不通。问题变成：**有没有一部分 KV Cache 是可以安全复用的，只重算少数关键层？**
+
+---
+
+## 4. 关键发现：只有 ~11% 的 layer 是敏感的
+
+论文逐层测试了"只复用这一层的 KV Cache，其余层全部重算，精度会怎样"。结论非常清晰：
+
+**不同 layer 对 KV Cache 偏差的敏感度差异极大，平均只有约 11% 的 layer 是"critical layer"（精度敏感的）。**
+
+如下图（每个子图对应一个 model pair，红色 bar 表示 critical layer）：
+
+![](https://pic2.zhimg.com/v2-06149f635019cf808ad9a614bccc077b_r.jpg)
+
+几个很有意思的观察：
+
+1. **critical layer 的位置因 model pair 而异**——对于某个 pair，layer 23 最敏感；对另一个 pair，可能是 layer 5-7。没有通用规律，必须针对每个 pair 单独 profiling。
+2. **对于同一个 model pair，critical layer 的分布在不同输入上高度稳定**。也就是说，用一个小的"训练集"测出来的 critical layer pattern，可以泛化到其他数据集上。这个性质非常关键——意味着 offline profiling 的结论是可信的。
+
+如下图，同一 dataset 内不同输入的 F1 score 方差极小：
+
+![](https://pic2.zhimg.com/v2-c1daa8d482c7c8c76bbb0e0bec7e5f27_r.jpg)
+
+1. **non-critical layer 的误差在不同输入间方差极小**。Critical layer 的误差波动很大，non-critical layer 几乎没有波动。这和直觉一致：critical layer 往往承担推理能力或任务适应能力，必须精确；non-critical layer 相对"平滑"，复用的代价很低。
+
+---
+
+## 5. DroidSpeak 的设计
+
+### 5.1 为什么要用"连续层组"，而不是把所有 critical layer 都重算
+
+有了上面的发现，直觉是：建个映射，把各散落在不同位置的 critical layer 全部重算，非 critical layer 全部复用。
+
+但这行不通，原因是 **E cache（embedding cache）的传输成本**。
+
+在 prefill 阶段，逐 layer 处理时，如果从"复用 KV"切换到"重算"，需要知道上一层的 E cache（该 layer 的输入 embedding）才能重算。如果非连续地重算多个 critical layer，每个切换点都要传一次 E cache——而 E cache 的大小是 KV cache 的 2-4 倍。多个切换点意味着多次大块数据传输，overhead 很快就超过复用带来的收益。
+
+如下图，transition point 越多，误差越大，传输成本也越高：
+
+![](https://pica.zhimg.com/v2-c546d85d511d4147ab646b0787e6707e_r.jpg)
+
+所以 DroidSpeak 的解法是：**选择一个连续的 layer group 来重算**，只有一个 transition point，只传一次 E cache，其余大量 layer 的 KV Cache 直接从 sender model 复用。
+
+如下图，DroidSpeak 选出最优的连续层组（例如 layer 4-5）来重算：
+
+![](https://pic4.zhimg.com/v2-10c4d9f1c836de50d252bfc601d7a523_r.jpg)
+
+### 5.2 Offline Profiling：找到效率最优的 layer group
+
+不同 layer group 的重算范围不同，产生的精度和延迟 tradeoff 也不同。DroidSpeak 通过 offline profiling 找到 Pareto frontier——在精度损失 ≤5% 的前提下，最小化需要重算的 layer 数量。
+
+如下图是 profiling 结果的示例（scatter plot + Pareto frontier）：
+
+![](https://pic4.zhimg.com/v2-62201279c13a7782844f3f96959c1a37_r.jpg)
+
+Profiling 的计算复杂度是 O(l²)（l = 模型层数），对于 32 层的 Llama-3-8B，在 A100 上大概需要 3 小时。**但这是一次性成本**——profile 完之后，这个 model pair 的最优配置就固定了，之后一直沿用。
+
+实际部署时可以用 2-layer group 粒度做 profiling，计算量减少约 3x，精度损失可以忽略。
+
+### 5.3 Online Stage：Pipeline 化加载，把延迟藏起来
+
+即使确定了哪些 layer 要重算，从 sender model 加载 KV Cache 的网络延迟仍然可能成为瓶颈（跨节点走 InfiniBand）。
+
+DroidSpeak 用 pipeline 化加载来解决这个问题：
+
+如下图，对比了三种策略：
+
+![](https://picx.zhimg.com/v2-7190500533005697d36a649f731fe6e7_r.jpg)
+
+* \*\*策略 (a)\*\*：先把所有 layer 的 KV Cache 都传过来，再开始重算。最慢。
+* \*\*策略 (b)\*\*：只传需要复用的 layer 的 KV Cache，然后重算。稍好。
+* **策略 (c)：先传 transition layer 的 E cache（体积小），立刻开始重算；同时在后台把复用 layer 的 KV Cache 加载进来。** 加载和重算完全并行，TTFT 减少约 2x。
+
+### 5.4 整体系统架构
+
+系统分两阶段：
+
+![](https://pica.zhimg.com/v2-5bbf63218d01b45ef22a59a8e4bc0634_r.jpg)
+
+**Offline stage**：用 training dataset 对每个 model pair 做 profiling，得到最优重算配置（Pareto frontier 上的点）。
+
+**Online stage**：根据当前可用资源，动态选择 Pareto frontier 上的配置，执行 partial prefill + pipeline 化 KV Cache 加载。
+
+实现基于 vLLM + LMCache，约 3K 行 Python 代码，提供三个核心接口：`store()`、`fetch()`、`partial_prefill()`。
+
+---
+
+## 6. 实验结果
+
+### 6.1 延迟和精度 tradeoff
+
+如下图，8 个 model pair × 多个 dataset 的 prefill 延迟 vs 精度散点图：
+
+![](https://picx.zhimg.com/v2-5d11c7cb6a1af067344825da953a2b69_r.jpg)
+
+* vs full prefill：prefill 延迟降低 **1.7-3.1x**，精度持平
+* vs full KV reuse：精度大幅优于直接复用（避免了前文提到的精度暴跌）
+* vs CacheBlend：同等延迟下，精度高 \*\*5-33%\*\*（平均 16%）
+
+### 6.2 吞吐量和 TTFT
+
+在模拟在线请求（Poisson 分布到达率）的场景下：
+
+![](https://pic2.zhimg.com/v2-faf70a092b711dce9d284e0418a3e69b_r.jpg)
+
+* 假设在 full prefill 开始出现队列积压（TTFT 膝点）之前的 SLO，DroidSpeak 能支持 **2-4x 更高的吞吐**。
+* TBT（Token Between Tokens）和 E2E 也得到二阶改善——prefill 变快，减少了对 decode 阶段的干扰。
+
+### 6.3 真实 Agentic Workflow 测试
+
+在 MetaGPT 编排的 coding agentic workflow（coder + tester 两个 agent）上：
+
+![](https://pic4.zhimg.com/v2-bfcf0f7caa722177e12fdee4b8d439c5_r.jpg)
+
+* TTFT 提升 **2.7x**
+* E2E 延迟大幅降低
+
+### 6.4 Profiling 结果泛化性
+
+如下图，用 HotpotQA 训练集 profile 完的配置，拿去跑 multifieldQA、2wikimQA 等其他 dataset，最大精度差距 4 个百分点，平均差 2 个百分点。**一次 profiling，多 dataset 通用**。
+
+![](https://pic2.zhimg.com/v2-c7ba8807f18ff971a0546510df50ab91_r.jpg)
+
+### 6.5 MoE 模型也能用
+
+如下图，论文还测了 Mixtral-8x7B（MoE 模型），在 2wikimQA 和 repobench-p 上同样有效，说明 DroidSpeak 不局限于 dense 模型。
+
+![](https://pic3.zhimg.com/v2-e0c5f5051f4d22b41afeff455861af42_r.jpg)
+
+---
+
+## 7. 个人评价
+
+这篇工作切入点很好：\*\*"单模型内的 KV Cache 共享"已经做烂了，跨模型的这道门还没人破。\*\* 选了一个真实存在的系统级问题，然后用扎实的 empirical study 先把问题量化清楚（直接复用行不行、哪些 layer 敏感、是否跨输入稳定），再基于这三个 insight 设计系统。
+
+几个细节值得学习：
+
+1. **E cache 的大小分析**（是 KV cache 的 2-4x）直接决定了为什么要用连续层组而不是散点重算。这个约束如果没算清楚，设计就会走弯路。
+2. **Offline profiling 的 Pareto frontier 抽象**很优雅——不是找一个固定的"最优配置"，而是给出整条 tradeoff 曲线，让 online stage 按资源情况动态选点。
+3. **Pipeline 化加载的 timeline 分析**（三种传输策略对比）讲得非常清楚，从"为什么要 pipeline"到"省了多少"一气呵成。
+
+一个没有完全解决的点是：profiling 开销是 O(l²)，虽然是一次性成本，但对于每一个新的 model pair 都要重新 profile。随着生态里 fine-tuned 模型爆炸式增长，model pair 的数量会快速膨胀，这个 profiling 的扩展性值得后续工作继续探讨。
+
+整体来说，这是一篇工程导向、insight 清晰的系统论文，做 multi-agent serving 或分布式 LLM 推理的同学可以重点关注。
+
+---
+
+如有错误欢迎评论区指出。
+
+
+---
+
+## KV Cache 复用的第三条路：FAST 2026 CacheSlide 是怎么解决 Agent 推理的位置漂移问题的
+
+`link: http://zhuanlan.zhihu.com/p/2031738806794199145 · created: 1777184590`
+
+
+## 1. 前言：两种方案都不够用
+
+作为一个天天和 LLM 推理打交道的牛马，我对 KV Cache 这个话题有复杂感情——它是 LLM serving 里最核心的优化点，但研究来研究去，工程上每次都会冒出新的问题。
+
+今天想聊一篇 USENIX FAST 2026 的工作：**CacheSlide**，来自上海交通大学和华为云的联合工作，专门解决 Agent 场景下 KV Cache 复用的一个根本性矛盾。
+
+先交代背景。现有的 KV Cache 复用策略被划分成两类：
+
+* **PDC（Position-Dependent Caching）**：代表是 vLLM 的 prefix caching、ContextCache。要求共享内容必须在固定绝对位置（通常是 prompt 开头）。一旦前面插入了动态内容，位置变了，缓存就失效了。
+* **PIC（Position-Independent Caching）**：代表是 CacheBlend、EPIC。不限制位置，但引入了一个叫 **PMKD（Positionally Misaligned KV Drift）**的问题——缓存的 KV 和实际推理时的 KV 因为位置编码不同产生漂移，导致精度下降。
+
+**Agent 场景偏偏是两种方案的共同盲区。**
+
+这就是这篇论文出发的地方。
+
+---
+
+## 2. Agent 场景到底是什么样的结构？
+
+在 Agent 系统里，prompt 通常是"固定+动态"的混合结构：有些段（系统 prompt、历史记忆、工具描述）是不变的，有些段（当前轮输入、新的工具调用结果）每轮都在变。
+
+下图给了两个典型例子：
+
+![](https://picx.zhimg.com/v2-9a25232629a906e9b6349fc89d1b594f_r.jpg)
+
+* **MemGPT**：系统 prefix + Working Window（FIFO 工作窗口，每轮滚动更新）+ 历史 suffix。固定段和动态段交错排列。
+* **SWE-Agent**：系统指令 + 多个 Updated Slot（代码调试时每轮注入新的运行结果）+ 各个不可变段。
+
+这些设计不是随意的——MemGPT 把近期记忆放在 prompt 头部是因为 attention 机制对头部更敏感，调换顺序会降低推理质量；SWE-Agent 的 Updated Slot 和 Immutable 段之间有数据依赖，不能随意挪位置。
+
+也就是说，**你没法通过重排段的顺序来满足 PDC 的前缀要求**，又没法用 PIC 来无损复用（位置漂移太大）。
+
+实际测量下来，MemGPT、SWE-Agent 等 Agent 系统中可复用的 KV Cache 占 prompt 总长度的比例非常高——但这些可复用段几乎全部被现有方案浪费掉了：
+
+![](https://pic4.zhimg.com/v2-2204fbac59d7caaf33203a08d029d299_r.jpg)
+
+---
+
+## 3. 问题根源：PMKD 有多严重？
+
+论文用 CKSim（cosine similarity between cached and recomputed KVs）来量化 KV 漂移。结论是：
+
+**用 RoPE 的系统，位置偏移 0-1000 token 时，CKSim 下降超过 90%。**
+
+也就是说，cached KV 和从头算出来的 KV 几乎完全不同了，直接复用 = 直接污染推理质量。
+
+而换成 CoPE（一种对位置变化敏感度低的位置编码），同样的偏移下 CKSim 只下降 28%：
+
+![](https://pica.zhimg.com/v2-7fb92f07a1bd2dd10b620ed90edb27e0_r.jpg)
+
+背后的原因：RoPE 给每个 token 分配一个绝对位置旋转角，位置变了旋转就变了；CoPE 是按语义边界索引、而非单个 token，相邻 token 可以共享索引，绝对偏移对它的影响更平滑：
+
+![](https://pic2.zhimg.com/v2-5092998d4b94d3a748bb739817ab485f_r.jpg)
+
+这就给了 CacheSlide 的核心设计方向：**把 RoPE 换成 CoPE，再把 prompt 按固定段/动态段切块，对固定段分配稳定的位置编码范围。**
+
+---
+
+## 4. RPDC 范式：第三条路
+
+论文提出了一个新概念 **RPDC（Relative-Position-Dependent Caching）**：
+
+> *reusable segments maintain consistent relative ordering despite absolute position shifts.*
+
+说人话：固定段的**相对顺序**不变，但**绝对位置**会因为动态段长度变化而漂移。这是 Agent 场景的本质结构——既不是 PDC（绝对位置固定），也不是 PIC（完全位置无关），而是"相对位置固定"这个中间状态。
+
+如下图直观对比了三种范式：
+
+![](https://pic1.zhimg.com/v2-4e000dc5a7cf88c550560d4f4e710848_r.jpg)
+
+RPDC 保留了段间的相对顺序，所以固定段内部的 attention 和固定段之间的 cross-attention 都可以**近乎无损地**复用。唯一需要修正的是固定段和动态段之间的 cross-attention——这是 update 之后新产生的依赖，必须重算，但重算的 token 数量可以很少。
+
+---
+
+## 5. CacheSlide 的三板斧
+
+CacheSlide 的整体流程如下：
+
+![](https://pic1.zhimg.com/v2-29a04b36e95dc8e7bb47f22fa3b2f1c6_r.jpg)
+
+三个核心组件：CCPE + Weighted Correction Attention + SLIDE。
+
+---
+
+### 5.1 CCPE：Chunked Contextual Position Encoding
+
+CCPE 做的事情是：把 prompt 按模板切成若干 chunk，标注哪些是"reuse chunk"（固定段），哪些是"recompute chunk"（动态段）；然后对 reuse chunk 分配稳定的位置编码范围，让每次推理时 cache 的位置和实际推理的位置尽量接近。
+
+具体实现上，先在同类任务上做一轮 CoPE-based 预训练，识别 reuse chunk 的最高频编码模式 `e*`，然后在实际推理时把这个 `e*` 固定分配给对应 chunk。
+
+如下图：
+
+![](https://picx.zhimg.com/v2-cc486c2996e24bc5c106267a9c5f0f7d_r.jpg)
+
+结果是：cached positional indices（比如 10-20）和实际推理时的索引（9-21 或 10-20）几乎没有偏差，∆pos 极小，CKSim 保持在高位。
+
+**本质上还是换掉 RoPE 加上静态范围分配**，但因为先做了预训练对每类任务学了最优编码，比暴力用 CoPE 效果要好很多。
+
+---
+
+### 5.2 Weighted Correction Attention：只修正真正漂移的 token
+
+即使 CCPE 大幅降低了漂移，固定段和动态段之间的 cross-attention 仍然需要修正——毕竟新的输入 token 进来了，固定段里有些 token 的 KV 受到了影响。
+
+全部重算的话开销太大；完全不管的话精度不够。Weighted Correction Attention 的思路是：**只找出漂移最大的 top-k 个 token，精准修正这些 token 的 KV。**
+
+具体流程：
+
+![](https://pic1.zhimg.com/v2-cee59807759d719ea383770da40432f0_r.jpg)
+
+1. **Layer 1**：对全部 token 做一次完整 recompute，计算每个 token 的偏差 `d_i = ||K_recompute - K_reuse||²`，取 deviation 最大的 top-k 个 token 放入集合 `Sk`。
+2. **Layer 2 以后**：只对 `Sk` 里的 token 重算 KV，然后用加权融合：  
+    ![ K_i = \alpha_i · K_{recompute} + (1 - \alpha_i) · K_{reuse}](https://www.zhihu.com/equation?tex=+K_i+%3D+%5Calpha_i+%C2%B7+K_%7Brecompute%7D+%2B+%281+-+%5Calpha_i%29+%C2%B7+K_%7Breuse%7D)   
+     
+    权重 `α` 根据 deviation 动态计算，漂移大的 token 更偏向 recompute，漂移小的 token 更偏向 cache。
+3. **每 4 层评估一次 CKSim**：如果某个 token 的 CKSim < 阈值 τ，说明它已经修正得差不多了，从 `Sk` 里移出；同时把 `S` 里下一个偏差最大的 token 加入。
+
+这个设计的核心在于：大部分固定段 token 在 CCPE 之后已经高度相似，真正需要修正的只是少数边界处的 token。只修正 k 个 token，计算量大幅缩减。
+
+---
+
+### 5.3 SLIDE：把系统层的坑填掉
+
+Weighted Correction Attention 引入了一个工程问题：因为要 layer-by-layer 地 load KV cache 然后写回修正后的结果，会出现：
+
+1. **load-before-write 锁**：同一层要先 load 老的 KV，才能写新的 KV，变成串行。
+2. **dirty page SSD 写入放大**：当容量不够需要把 KV spill 到 SSD 时，被修正过的 dirty page 分布零散，引发大量随机小写，WAF（Write Amplification Factor）飙升。
+
+SLIDE（Spill-aware & Load-write decoupling Intra-layer & Dirty-page Eviction）专门解这两个问题：
+
+![](https://pica.zhimg.com/v2-299ad6238b84f9e8136b9cd8e3d2d41e_r.jpg)
+
+* **Load-write decoupling**：在 layer i 开始 recompute 的同时，pipeline 地异步加载该层的 KV cache。如果 recompute 先完成，直接写到新分配的 page K，不阻塞等 load；之后 decode 阶段再优先 overwrite 原始 slot。
+* **Dirty-aware eviction**：把含有 selected token 的 page 标记为 dirty，eviction 时**优先驱逐 clean page**；dirty page 按 selected token 数量降序驱逐，确保写入尽量连续，减少随机写。
+
+---
+
+## 6. 实验结果
+
+**TTFT（首 token 延迟）对比**（Figure 10），三个模型（Mistral-7B、MPT-30B、Llama-3 70B），三个 Agent（Reflexion、MemGPT、SWE-Agent）：
+
+![](https://pic3.zhimg.com/v2-9e4952d80ce3223dd5e6ab763641ffb8_r.jpg)
+
+* vs ContextCache（PDC 代表）：TTFT 降低 **2.4-3.3x**，精度可比
+* vs CacheBlend（PIC 代表）：TTFT 降低 **1.21-2.11x**，精度提升 **1.97-2.28x**
+* vs PromptCache：TTFT 降低 **1.12-2.45x**，精度提升 **1.41-3.95x**
+
+CacheSlide 是**唯一一个在效率和精度上同时占优**的方案。
+
+**并行推理和 Beam Search 下的 throughput**（Figure 11），batch size 从 2 扩到 6：
+
+![](https://pic1.zhimg.com/v2-2120efa6632dc1190bec9fe91dc5372a_r.jpg)
+
+随着 batch size 增大（存储压力上升，KV cache 开始 spill），其他方案的 TTFT 快速劣化，CacheSlide 的优势从 1.2x 扩大到 **2.3x**。因为 SLIDE 的 dirty-page eviction 避免了对已修正 KV 的反复 I/O。
+
+**SLIDE 组件消融**（Figure 12）：
+
+![](https://pic2.zhimg.com/v2-056fd113dc28a12641d25b3b5efa203d_r.jpg)
+
+* Layer-wise Load-write decoupling（LWD）：层并行等待时间降低 \*\*26.7-51.5%\*\*（batch 2→6）
+* Dirty-page eviction：write stall 降低 **66.9-73.5%**
+* SSD 写放大（WAF）：降低 **3.11-3.62x**
+* GPU storage 占用 vs PromptCache：降低 **1.63-1.9x**
+
+**Throughput 稳定性**（Figure 13），Mistral-7B 和 MPT-30B，Reflexion + HotPotQA，batch size=8：
+
+* Mistral-7B：throughput 比 CacheBlend/EPIC 高 \*\*49.6%/45.2%\*\*，throughput 标准差（σ）低 **77.4%/58.6%**
+* MPT-30B：throughput 比 CacheBlend/EPIC 高 \*\*75-82.2%\*\*，σ 低 **75.8-64.1%**
+
+注意 σ 这个指标——lower variance 说明 CacheSlide 不只是快，而且**稳**，SLIDE 消除了 SSD random I/O 带来的尾延迟抖动。
+
+**Top-k 和 CKSim 阈值的影响**（Figure 14），QPS heatmap：
+
+![](https://pic3.zhimg.com/v2-b872cbce4e5415dfca967de0803af7d2_r.jpg)
+
+这两个参数控制了 WCA 的修正深度，有个 sweet spot——top-k 太大，修正太多 token，反而 overhead 高；top-k 太小，修正不足，精度掉。实际部署可以根据负载动态调整。
+
+---
+
+## 7. 个人评价
+
+这篇工作最值得学习的一点是**问题的精确定义**。在提出 CacheSlide 之前，论文先花了大量篇幅把 RPDC 这个范式讲清楚——Agent 系统里的 KV Cache 复用问题，既不是 PDC（不能假设固定绝对位置），又不是 PIC（不能完全位置无关），而是一个有独特结构的中间状态。给问题起名、量化它、然后专门设计解法——这是系统论文里比较规范的做法。
+
+几个设计细节写得也比较扎实：
+
+1. **CCPE 的预训练**不是拍脑袋决定用 CoPE，而是先量化了 RoPE vs CoPE 的 PMKD 差异（90% vs 28%），再针对性地在 CoPE 上做任务级预训练学稳定编码范围。
+2. **Weighted Correction Attention** 里的 similarity-gated 动态 token 集合是个不错的设计——每 4 层重新评估哪些 token 仍然需要修正，真正需要修正的 token 数量会随层数增加而减少（inter-layer similarity 随深度增大），避免了无效计算。
+3. **SLIDE 里对 dirty page 按 selected token 数降序排 eviction 优先级**，这个细节直接决定了 SSD 写入是否连续，工程上真的很重要。
+
+唯一的疑虑是 CoPE adapter-based 预训练会不会影响基础模型的泛化能力，论文里测的三个 Agent 可能不能完全覆盖所有 agentic 场景，这块的鲁棒性还有待观察。LLM
+
+---
+
+如有错误欢迎评论区指出。
+
+
+---
+
+## MoE 推理的内存墙，被一块多芯粒芯片打穿了？
+
+`link: http://zhuanlan.zhihu.com/p/2031042989108228947 · created: 1777018679`
+
+
+> (尝试了一下标题党风格，不知道为什么很羞耻 hhh
+
+今天想和大家聊聊这篇来自港科大的工作 —— **Expert Streaming**，最近在 arXiv 上出现，是少见的从芯片架构角度直接解决 MoE 推理内存瓶颈的硬核工作。
+
+先交代下背景：MoE 火是真的火，DeepSeek、Qwen3 都在往 MoE 走，但我们自己跑的时候，却结结实实踩了个大坑 —— **显存根本不够用**。稀疏激活的好处（计算量小）在 edge 设备上被"要把所有 expert 权重全量加载进来"这一条给彻底抵消了。
+
+---
+
+## 1. 问题到底出在哪里
+
+MoE 的逻辑是：每次 forward，一个 token 只激活 top-K 个 expert，90% 以上的 expert 权重全程闲着。理论上很省计算，但现实是：
+
+**你得把所有 expert 的权重都放进 on-chip memory，才能在激活时立刻取用。**
+
+Qwen3-30B-A3B 有 128 个 expert，全量加载就是海量的 on-chip 存储需求。在 edge 多芯粒（multi-chiplet）加速器上，每块芯粒的 SRAM 是有限的，放不下。
+
+大家的常见做法是 Expert Parallelism（EP）—— 把不同的 expert 分到不同芯粒上，每个芯粒只存一部分 expert。但这带来两个问题：
+
+1. **all-to-all 通信开销**：token 要跨芯粒路由到对应 expert 所在的芯粒，通信量随 batch size 下降而急剧放大
+2. **负载不均衡**：MoE 有个很典型的"长尾效应"——
+
+![](https://pica.zhimg.com/v2-e9ed22883ae6d827680faed5ca117c6e_r.jpg)
+
+如上图，小 batch 下这个长尾效应更严重：少数 hot expert 处理大量 token，大量 cold expert 几乎空转，芯粒利用率极不均匀。
+
+还有个 state-of-the-art 的方案叫 **Hydra**，思路是利用 cross-layer expert popularity 来提前预测哪些 expert 会被激活，减少跨片通信。但本质还是基于 EP 的思路，没有从根上解决 on-chip memory 压力。
+
+这也是整个行业 MoE edge 部署面临的**核心矛盾**：稀疏激活带来的计算收益，被全量权重加载的内存代价完全吃掉了。
+
+---
+
+## 2. Expert Streaming 的核心思路
+
+这篇工作的出发点很有意思 —— 既然 D2D（die-to-die）高带宽互联（比如 UCIe）越来越成熟，**为什么不把它当成一种计算资源，而不是单纯的通信开销来对待？**
+
+![](https://pica.zhimg.com/v2-60a0d55ea1e2dac1dac754bdd8f9133c_r.jpg)
+
+核心方案叫 **FSE-DP（Fully Sharded Expert Data Parallelism）**，可以拆成三个互相咬合的设计：
+
+### 2.1 Micro-slice Streaming
+
+把每个 expert 的权重切成小块（micro-slice），在芯粒之间像流水线一样循环传输。
+
+每个芯粒同时做三件事：
+
+* **计算**当前 micro-slice 对应的矩阵乘
+* **接收**下一块从邻居芯粒传来的 micro-slice
+* **转发**刚算完的 micro-slice 给下一个芯粒
+
+这样，D2D 通信和计算完全 overlap，expert 权重不需要全量驻留在任何一个芯粒上。
+
+![](https://pic4.zhimg.com/v2-66db274166d52b4f43d2708eef7e13ff_r.jpg)
+
+**关键效果：on-chip memory 只需要存若干个 micro-slice 大小的 buffer，而不是整个 expert 的权重。**
+
+更进一步，他们做了"eager micro-slice usage"的优化 —— 芯粒收到 micro-slice 后立刻转发，不等计算完，这样每块 micro-slice 在 ring 上停留时间更短，buffer 占用更低。
+
+### 2.2 多芯粒下的全分片并行（FSE-DP）
+
+一个 expert 不再绑定在某一个芯粒上，而是**均匀切分到所有芯粒上**。每个芯粒持有这个 expert 的一个 slice，token 在芯粒间做 redispatch 以均衡负载。
+
+![](https://picx.zhimg.com/v2-91e87eed556ff7cd5919c93563a35591_r.jpg)
+
+两种等价的执行方式：
+
+* (a) token sequence 不动，expert slice 在芯粒间流动
+* (b) expert slice 不动，token sequence 在芯粒间流动
+
+本质是一样的，调度器统一抽象为"trajectory"来管理。
+
+### 2.3 Paired-load + Token Buffering
+
+光有 micro-slice streaming 还不够，还有个利用率问题：DDR 加载 expert 权重的延迟（off-chip）比 D2D 通信慢得多。
+
+**Paired-load**：把 hot expert（处理 token 多，compute-bound）和 cold expert（处理 token 少，memory-bound）配对，在同一个时间窗口内交错执行，让计算和 DDR 加载互相掩盖对方的 idle 时间。
+
+**Token Buffering**：遇到 cold expert 时，不急着立刻处理这个 request，而是在 MoE 层边界暂停，等积累到一定数量的 token 之后再一起处理，提升 expert 利用率。
+
+![](https://pic2.zhimg.com/v2-fd478dd29f6e5bc3bd7a28801d0085b7_r.jpg)
+
+这两个策略把 DDR 加载的 overhead 和 D2D 的 micro-slice 流完全融合进了一个统一的 pipeline：
+
+![](https://pic3.zhimg.com/v2-8c7a626a571a823d84c9408fda3aead0_r.jpg)
+
+---
+
+## 3. 调度器设计
+
+上面这套方案能运转，有个前提：需要一个硬件调度器来实时决定"哪些 expert 的 micro-slice 走哪条 trajectory"。
+
+他们把这个调度器实现在 IO die 上，面积仅 **0.43 mm²（28nm 工艺）**，调度延迟在**亚微秒级别**，不会成为 bottleneck。
+
+![](https://picx.zhimg.com/v2-f33769a7ac026b491a1df21a054ca42d_r.jpg)
+
+"Virtualization"是调度器抽象层的关键概念 —— 无论 expert 在各芯粒上如何不均匀分布，调度器只需要保证 micro-slice 按规定的 trajectory 流动，底层实现细节对上层完全透明。
+
+![](https://pic1.zhimg.com/v2-d8200cefba78dd91a3f9c7ed670c01f2_r.jpg)
+
+---
+
+## 4. 实验效果
+
+测试了 4 个模型：Phi-3.5-MoE（16 experts）、Yuan2.0-M32（32 experts）、DeepSeek-MoE-16B（64 experts）、Qwen3-30B-A3B（128 experts），数据集覆盖 Wikitext-2、C4、WinoGrande。
+
+### 单层 latency
+
+![](https://pic3.zhimg.com/v2-b41e2e64b444563b4c237ad695b9127a_r.jpg)
+
+FSE-DP 在 16–1024 token 的 low-batch 范围内，单层 latency 均优于 EP 和 Hydra。
+
+### 端到端 throughput
+
+![](https://pic3.zhimg.com/v2-02b7b5177195c067e5a0e8f970c51ac4_r.jpg)
+
+**端到端 throughput 相比 state-of-the-art 基线，实现了 1.22×–2.00× 的提升。**
+
+### On-chip memory savings
+
+与 Expert Parallelism 相比，**节省了高达 78.8% 的 on-chip memory**。
+
+![](https://pic3.zhimg.com/v2-745d6ae30f703314385ec0e64733ec0c_r.jpg)
+
+### Ablation study
+
+![](https://pic3.zhimg.com/v2-9f80a439942ae919d4fbc693e3c85aa2_r.jpg)
+
+micro-slice streaming、paired-load、token buffering 三个模块各自都有贡献，叠加后达到最优。
+
+---
+
+## 5. 我的 take
+
+这篇工作有几个地方让我觉得很有意思：
+
+**1. 视角的转换很关键。** 之前大家把 D2D 通信当成 MoE 并行的"代价"来优化，这篇工作直接把它当成"流水线资源"来利用，思路上有个质的跳转。
+
+**2. 真正的硬件协同设计。** 光有算法不够，他们实际流片了（Figure 10 有芯片照片），在真实芯片上验证了整套方案，这在学术界还是比较稀缺的。
+
+![](https://pic3.zhimg.com/v2-c65d2ad85a63fe33f2dae0e42679f2ae_r.jpg)
+
+**3. 对 edge MoE 的意义。** 2.00× throughput + 78.8% memory savings，在资源受限的 edge 场景下，这个 combo 是实质性的提升，不是那种"提了 3%，但只在特定条件下"的 benchmark 游戏。
+
+当然，也有局限性：token buffering 会引入额外的 latency（在 request 层面），这对 latency-sensitive 的场景有影响；另外这套方案对 D2D 带宽有一定要求，不同代际芯片的迁移成本还不清楚。
+
+总体来说，**这是一篇把系统架构、调度算法、硬件实现做得比较扎实的 MoE 推理优化工作**，推荐做 LLM 系统和 edge 部署方向的同学认真看看。
+
+最后也王婆卖瓜一下我们自己在 moe 推理优化上的一篇工作，可以阅读这篇文章
+
+[DAC2026 | ExpertFlow：高效 MoE 推理系统，单卡部署省内存提速度](https://zhuanlan.zhihu.com/p/2010728514375144803)
+
+欢迎评论区交流，有问题也欢迎指出。
+
+
+---
+
+## 【论文分享】TokenDance 解决多 Agent LLM 推理的 KV Cache 冗余问题
+
+`link: http://zhuanlan.zhihu.com/p/2031034890666390988 · created: 1777016862`
+
+
+## **1. 前言：一个被忽视的大坑**
+
+想象这样一个场景：你在跑一个多 Agent 仿真，20 个 Agent 在互动，每轮结束后所有人把彼此的输出 All-Gather 一遍，然后各自基于这一轮的"公共信息"再生成下一轮的回应。
+
+听起来很自然，对吧？
+
+但作为一个结结实实在 LLM 推理框架里踩过坑的人，第一反应是：**KV Cache 要爆**。
+
+20 个 Agent，每人都有同样的公共输出 block，但因为各自的私有历史（private history）长度不一样，这些公共 block 在不同 prompt 里出现在不同位置——这就直接把 vLLM 的 prefix caching 废掉了，因为 prefix caching 要求共享内容必须在 prompt 开头，位置完全一致。
+
+最近看到了一篇来自 UCLA 的工作 **TokenDance**（arXiv 2604.03143），专门解决这个问题，思路挺清晰的，今天想和大家聊聊它解决了什么真问题、以及是怎么解的。
+
+---
+
+## 2. 背景：多 Agent All-Gather 的结构性冗余
+
+先交代一下背景。
+
+多 Agent 系统里有一类非常常见的通信模式叫 **All-Gather**：每轮推理结束后，所有 Agent 的输出都被广播给全体，下一轮每个 Agent 的 prompt 里都包含：
+
+* **O**：本轮所有 Agent 的输出（公共的）
+* **H**：自己的私有历史（私有的）
+
+如下图所示，公共输出 block O 在每个 Agent 的 prompt 里都出现，但位置不同，因为每个人的私有历史 H 长度不一样：
+
+![](https://pic3.zhimg.com/v2-8e8c8c05c8a91aaa651b84ab72218ef6_r.jpg)
+
+这就带来了一个核心问题：**所有 Agent 的 KV Cache 里都包含了大量结构相似的内容，但现有系统完全没有跨 Agent 复用。**
+
+vLLM 的 prefix caching 只能处理前缀完全一致的情况——只要 H 不同，O 的 KV Cache 就没法共享，每个 Agent 都得重新算一遍。20 个 Agent？算 20 遍，存 20 份，内存直接 OOM。
+
+---
+
+## 3. 现有方案为何不够用
+
+针对这个问题，有一类方案叫 **PIC（Position-Independent Caching）**——不依赖 token 在 prompt 里的绝对位置，而是通过旋转位置编码（RoPE）的特殊处理，让同一段内容的 KV Cache 可以在不同位置上复用。
+
+但 PIC 的问题在于：**它是 per-request 的。**
+
+每个 Agent 的请求独立进来，PIC 会对每个请求各自做一次 RoPE 旋转和重要位置选择（important-position selection）。N 个 Agent 同轮进来，就做 N 次，根本没有利用"这 N 个请求共享同一批 token"这个事实。
+
+如下图对比了 per-request PIC（上）和 TokenDance 的 collective reuse（下）：
+
+![](https://pic1.zhimg.com/v2-3a19d0080152a19166517a2e769f0f54_r.jpg)
+
+**这就是整个行业在多 Agent serving 上面临的核心矛盾**：公共内容明明存在，但跨 Agent 的复用机制不存在。
+
+---
+
+## 4. TokenDance：三板斧
+
+TokenDance 的整体架构如下：
+
+![](https://picx.zhimg.com/v2-8af99dc22028837a6298477a4c412cd1_r.jpg)
+
+三个核心模块，逐一拆解。
+
+---
+
+### 4.1 Round-Aware Prompt Interface：先让系统"看见"共享内容
+
+要复用，首先得让系统知道哪些 block 是共享的。
+
+问题是：传统 LLM serving 的 prompt 接口是 flat string，进来一串 token，系统不知道哪段是公共输出、哪段是私有历史。block boundary 的信息在 application 层就丢掉了。
+
+TokenDance 引入了一个 **round-aware prompt interface**，用特殊分隔符 `<TTSEP>` 显式标记不同 block 的边界。如下图：
+
+![](https://pica.zhimg.com/v2-0fd3221009d52c4ad1dc2b4f993c00e2_r.jpg)
+
+这个改动看起来很简单，但很关键——它让 runtime 能够在 block 粒度上识别共享内容，为后续的 collective reuse 和 diff-aware storage 奠定基础。
+
+---
+
+### 4.2 Collective KV Cache Reuse：把 N 次 PIC 变成 1 次
+
+识别到共享 block 之后，TokenDance 不再对每个 Agent 独立做 PIC，而是把一轮里所有 Agent 的请求分组，对公共 block **只做一次** RoPE 旋转和 important-position selection，然后把结果分发给所有 Agent。
+
+如下图对比了三种方式：
+
+* T1（vLLM 原始）：每个 Agent 从头算
+* T2（per-request PIC）：每个 Agent 各自做 PIC，N 个 Agent 做 N 次
+* T3（TokenDance collective）：整轮一起做，overhead 只付一次
+
+![](https://picx.zhimg.com/v2-719766c5204503f4333cb94933af9a67_r.jpg)
+
+实验结果显示，collective reuse 相比 serial PIC 最高有 **2.57x** 的 prefill 加速（10 agents，QPS=1）：
+
+![](https://pic1.zhimg.com/v2-e21a8c4f42d9b8c584da29f2aa8b9ac0_r.jpg)
+
+---
+
+### 4.3 Diff-Aware Storage：KV Cache 能压缩 11-17x
+
+collective reuse 之后，各 Agent 的 KV Cache 里，公共 block 对应的部分其实**高度相似**，只有 10-20% 的位置存在差异（因为 RoPE 之后不同 Agent 的相对位置略有不同，加上各自私有历史导致的 attention 差异）。
+
+TokenDance 用一个 **Master-Mirror 布局** 来压缩这个冗余：
+
+* 存一份完整的 **Master** KV Cache（针对共享内容）
+* 每个其他 Agent 只存一个稀疏的 **Diff**（差异部分）
+
+如下图：
+
+![](https://pica.zhimg.com/v2-039ba597935017f2ed27014b1e6b1b02_r.jpg)
+
+通俗说：从存 N 份完整 KV Cache，变成存 1 份 + (N-1) 份稀疏 diff。
+
+压缩比很可观：
+
+![](https://pic1.zhimg.com/v2-0bfa4957022766ae6e5d8332e9dcf300_r.jpg)
+
+7B 模型可以达到 **11-17x** 的 KV Cache 体积压缩；14B 模型因为每个 token 的 cache tensor 更大而 diff block 数量相近，所以压缩比更高。
+
+---
+
+### 4.4 Fused Diff Restore：还原的时候不多付一次内存开销
+
+一个自然的问题是：压缩成 diff 之后，推理时得把 Mirror 还原成完整 KV Cache，这个还原本身会不会带来 latency？
+
+TokenDance 的解法是 **Fused Diff Restore**——在 block 粒度上，直接在 SM（shared memory）里做 diff 修正，然后马上跑 attention，不需要先 materialize 一份完整的 KV Cache 再送给 attention kernel。
+
+如下图：
+
+![](https://pica.zhimg.com/v2-40c7f57d414cb73c9ad477293cc73ec4_r.jpg)
+
+实验显示，fused retrieval 比 dense restore（先完整还原再推理）快 **1.3-2.6x**：
+
+![](https://picx.zhimg.com/v2-72ff8adaac2692bf9745e485f07ee70f_r.jpg)
+
+---
+
+## 5. 整体实验效果
+
+在 GenerativeAgents 和 AgentSociety 两个 benchmark 上，用 Qwen2.5-7B 和 Qwen2.5-14B 测试，TokenDance 相比 vLLM（with prefix caching）的结果：
+
+* 在同等 latency SLO（1500ms）下，最多支持 **2.7x** 更多的并发 Agent
+* per-agent KV Cache 存储减少最多 **17.5x**
+* prefill 加速最高 **1.9x**
+
+如下图：
+
+![](https://pic2.zhimg.com/v2-8b74bbaf5e167784f0880910110a1f65_r.jpg)
+
+精度方面，TokenDance 与 vLLM（temperature=0）的输出在大多数场景下零divergence，少量差异来自底层 PIC 方法本身，不是 TokenDance 引入的：
+
+![](https://pica.zhimg.com/v2-e919f1e68e188faa49b5038ec27221c8_r.jpg)
+
+---
+
+## 6. 个人理解与评价
+
+这篇工作抓住的 insight 很准：**多 Agent 系统的 All-Gather 通信会产生结构性的 KV Cache 冗余，而这个冗余以前从来没有被系统层利用过。**
+
+几个我觉得做得比较细的点：
+
+1. **Round-aware prompt interface** 这个设计很务实。不是直接改 LLM 框架内部，而是在 application 和 runtime 中间加一层协议，改动侵入性小，容易接入现有多 Agent 框架（Camel、GenerativeAgents 等）。
+2. **Collective reuse 和 per-request PIC 的对比** 讲清楚了——不是说 PIC 没用，而是 PIC 在 multi-agent 场景下没有利用到 batch 结构，TokenDance 在这一层补了一刀。
+3. **Diff 压缩的 insight** 来自对实际 KV Cache 分布的测量——先验证了"reuse 之后 KV Cache 只有 10-20% 不同"，再设计压缩方案，而不是拍脑袋。工程上这种先 profiling 再设计的做法是对的。
+
+唯一的小问题是论文对 PIC 的具体变体（哪种 RoPE off-set 策略）描述得比较模糊，复现起来可能需要看代码细节。
+
+总体来说，这是一篇工程针对性很强的系统论文，解决的是多 Agent serving 落地时的实际痛点。如果你在搭多 Agent 仿真平台，或者在做 LLM serving 层的优化，这篇值得精读。
+
+---
+
+如有错误欢迎评论区指出，这块我也在持续学习中。
 
 
 ---

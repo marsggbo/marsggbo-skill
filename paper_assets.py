@@ -377,6 +377,175 @@ def _strategy_page_render(
     return assets
 
 
+# ─── Strategy 4: figure crop (caption-anchored) ───────────────────────────────
+
+_CAPTION_RE = re.compile(
+    r"^\s*(Figure|Fig\.?|Table|Algorithm|Alg\.?)\s*([0-9]+)\s*[:.\u2236]",
+    re.IGNORECASE,
+)
+
+
+def _strategy_figure_crop(
+    pdf_path: Path,
+    output_dir: Path,
+    dpi: int = 200,
+    flat: bool = False,
+    pad: float = 4.0,
+    min_height_pt: float = 30.0,
+) -> list[FigureAsset]:
+    """
+    Locate captions ("Figure N:" / "Table N:" / "Algorithm N:") in PDF text lines,
+    then crop the region immediately ABOVE each caption (same column / caption width).
+
+    Works for vector figures that pdf_embedded misses, and avoids whole-page renders.
+    Uses line-level bboxes so subfigure labels merged into the same block don't
+    inflate the caption rectangle.
+    """
+    doc = fitz.open(str(pdf_path))
+    figs_dir = output_dir if flat else output_dir / "assets"
+    figs_dir.mkdir(parents=True, exist_ok=True)
+
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    assets: list[FigureAsset] = []
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        page_rect = page.rect
+        try:
+            page_dict = page.get_text("dict")
+        except Exception:
+            continue
+
+        # Flatten into per-line records: (x0, y0, x1, y1, text)
+        lines: list[tuple[float, float, float, float, str]] = []
+        for block in page_dict.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for ln in block.get("lines", []):
+                spans = ln.get("spans", [])
+                if not spans:
+                    continue
+                txt = "".join(s.get("text", "") for s in spans)
+                bx0, by0, bx1, by1 = ln.get("bbox", (0, 0, 0, 0))
+                lines.append((bx0, by0, bx1, by1, txt))
+
+        # Find caption start lines
+        for idx, (lx0, ly0, lx1, ly1, ltxt) in enumerate(lines):
+            m = _CAPTION_RE.match(ltxt)
+            if not m:
+                continue
+
+            kind = m.group(1).lower().rstrip(".")
+            if kind.startswith("fig"):
+                category = "figure"
+            elif kind.startswith("alg"):
+                category = "algorithm"
+            else:
+                category = "table"
+            label_num = m.group(2)
+            label = f"{category.capitalize()} {label_num}"
+
+            # Caption x range: gather contiguous following lines that share roughly
+            # the same x-range AND form the caption paragraph (until a big y gap).
+            cap_x0, cap_x1 = lx0, lx1
+            cap_y0, cap_y1 = ly0, ly1
+            cap_text_parts = [ltxt]
+            prev_y1 = ly1
+            for j in range(idx + 1, len(lines)):
+                jx0, jy0, jx1, jy1, jtxt = lines[j]
+                # Caption must be on same column (overlapping x), and close in y.
+                if jx1 < lx0 - 2 or jx0 > lx1 + 2:
+                    break
+                if jy0 - prev_y1 > 6:
+                    break
+                # Stop if next line itself looks like a new caption / section header
+                if _CAPTION_RE.match(jtxt) or re.match(r"^\d+(\.\d+)*\s+[A-Z]", jtxt):
+                    break
+                cap_x0 = min(cap_x0, jx0)
+                cap_x1 = max(cap_x1, jx1)
+                cap_y1 = max(cap_y1, jy1)
+                cap_text_parts.append(jtxt)
+                prev_y1 = jy1
+
+            # Find nearest line ABOVE that overlaps caption x-range -> top boundary.
+            # Only treat lines that span a substantial fraction of caption width as
+            # real body-text boundaries. Short fragments (axis labels, "(a)", numbers)
+            # belong to the figure itself and must be ignored.
+            cap_w = max(1.0, cap_x1 - cap_x0)
+            top_limit = page_rect.y0 + 4
+            for ox0, oy0, ox1, oy1, otxt in lines:
+                if oy1 >= cap_y0 - 2:
+                    continue
+                if ox1 < cap_x0 - 2 or ox0 > cap_x1 + 2:
+                    continue
+                # length-based filter: ignore in-figure text fragments (narrow lines).
+                # Body text wraps to ~full column width; figure labels / axis ticks
+                # are narrow no matter how long the actual string is.
+                if (ox1 - ox0) / cap_w < 0.55:
+                    continue
+                if oy1 > top_limit:
+                    top_limit = oy1
+
+            crop = fitz.Rect(
+                max(page_rect.x0, cap_x0 - pad),
+                max(page_rect.y0, top_limit + 2),
+                min(page_rect.x1, cap_x1 + pad),
+                max(page_rect.y0, cap_y0 - 1),
+            )
+
+            # If region above is too thin (e.g. caption-below-content layouts for
+            # tables/algorithms), also check the area BELOW the caption.
+            if crop.height < min_height_pt or category in ("table", "algorithm"):
+                bottom_limit = page_rect.y1 - 4
+                for ox0, oy0, ox1, oy1, otxt in lines:
+                    if oy0 <= cap_y1 + 2:
+                        continue
+                    if ox1 < cap_x0 - 2 or ox0 > cap_x1 + 2:
+                        continue
+                    if (ox1 - ox0) / cap_w < 0.55:
+                        continue
+                    if oy0 < bottom_limit:
+                        bottom_limit = oy0
+                below = fitz.Rect(
+                    max(page_rect.x0, cap_x0 - pad),
+                    max(page_rect.y0, cap_y1 + 1),
+                    min(page_rect.x1, cap_x1 + pad),
+                    min(page_rect.y1, bottom_limit - 2),
+                )
+                if below.height > crop.height:
+                    crop = below
+
+            if crop.width < 20 or crop.height < min_height_pt:
+                continue
+
+            try:
+                pix = page.get_pixmap(matrix=mat, clip=crop, alpha=False)
+            except Exception:
+                continue
+
+            slug = label.lower().replace(" ", "")
+            dest = figs_dir / f"{slug}_p{page_num + 1}.png"
+            if dest.exists():
+                dest = figs_dir / f"{slug}_p{page_num + 1}_{len(assets):02d}.png"
+            pix.save(str(dest))
+
+            cap_clean = re.sub(r"\s+", " ", " ".join(cap_text_parts).strip())
+
+            assets.append(FigureAsset(
+                path=str(dest),
+                rel_path=str(dest.relative_to(output_dir)),
+                label=label,
+                caption=cap_clean,
+                category=category,
+                source="figure_crop",
+                page=page_num,
+                width=pix.width,
+                height=pix.height,
+            ))
+
+    return assets
+
+
 def _auto_detect_figure_pages(pdf_path: Path) -> list[int]:
     """
     Heuristically find pages that likely contain figures or tables.
@@ -478,11 +647,12 @@ def extract_assets(
 
     # ── Run strategies ────────────────────────────────────────────────────────
     strat_order = {
-        "auto":  ["html", "pdf", "pages"],
-        "html":  ["html"],
-        "pdf":   ["pdf"],
-        "pages": ["pages"],
-    }.get(strategy, ["html", "pdf", "pages"])
+        "auto":   ["html", "figures", "pdf", "pages"],
+        "html":   ["html"],
+        "pdf":    ["pdf"],
+        "pages":  ["pages"],
+        "figures": ["figures"],
+    }.get(strategy, ["html", "figures", "pdf", "pages"])
 
     for strat in strat_order:
         if strat == "html":
@@ -497,6 +667,13 @@ def extract_assets(
                     break
             except Exception:
                 continue
+
+        elif strat == "figures":
+            figs = _strategy_figure_crop(pdf_path, out, dpi=max(dpi, 180), flat=flat)
+            if figs:
+                figures = figs
+                strategy_used = "figure_crop"
+                break
 
         elif strat == "pdf":
             figs = _strategy_pdf_embedded(pdf_path, out, min_width, min_height, flat=flat)
@@ -565,8 +742,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Directory to save assets (default: ./paper_assets)",
     )
     p.add_argument(
-        "--strategy", choices=["auto", "html", "pdf", "pages"], default="auto",
-        help="Extraction strategy (default: auto tries html→pdf→pages)",
+        "--strategy", choices=["auto", "html", "pdf", "pages", "figures"], default="auto",
+        help="Extraction strategy (default: auto tries html→figures→pdf→pages)",
     )
     p.add_argument("--dpi", type=int, default=150, help="DPI for page renders (default: 150)")
     p.add_argument(
