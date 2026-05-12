@@ -307,10 +307,10 @@ source：arXiv URL、arXiv ID（如 2604.07144v1）、HTTP PDF URL、本地 PDF 
 
 选项：
   --output-dir DIR        资产保存目录（默认 ./paper_assets/）
-  --flat                  图片直接存到 output-dir，不建 figures/ pages/ 子目录
-  --strategy auto|html|pdf|pages
-                          提取策略（auto = html→pdf→pages 依次尝试）
-  --dpi N                 整页渲染分辨率（默认 150）
+  --flat                  图片直接存到 output-dir，不建 assets/ 子目录
+  --strategy auto|html|figures|pdf|pages
+                          提取策略（推荐 figures；auto 按 html→figures→pdf→pages 顺序）
+  --dpi N                 截图 DPI，figures 策略默认 200，建议 ≥220
   --min-width / --min-height N
                           过滤过小的嵌入图（默认 80px）
   --render-pages SPEC     额外渲染指定页，如 "3,5-8"（叠加在主策略上）
@@ -323,6 +323,12 @@ Python import：
   print(assets.summary())
   print(assets.md_snippets())  # 直接粘贴进 markdown 的图片引用
 ```
+
+**策略选择建议：**
+- `figures`（caption-anchored crop，v2）：**首选**。精确裁出每张图/表（含 caption），正确区分双栏布局，DPI 建议 ≥ 220。
+- `html`：arXiv HTML 版本图片质量最好，但不是所有论文都有 HTML 版。
+- `pages`：整页渲染，兜底方案，截图大但完整。
+- `auto`：依次 html → figures → pdf → pages，懒得想策略就用这个。
 
 脚本位置：`~/.claude/skills/marsggbo/paper_assets.py`
 
@@ -349,11 +355,25 @@ Python import：
 - 观点类：直接表态，不绕圈
 
 ### D. 论文/技术解读（必须配合"论文写作增强协议"使用）
-- 先运行 `paper_assets.py` 提取图表（见上方协议）
+- 先运行 `paper_assets.py --strategy figures --dpi 220` 提取图表（见上方协议）
 - "今天想聊聊这篇工作解决了什么真问题"
 - 背景 → 现有方案的痛点 → 我们的解法 → 效果
 - 所有数字来自原文，所有架构图/实验图嵌入对应段落
 - 引用具体数字（显存、速度倍数等）增加可信度
+
+**论文博客图片使用规范（v2，强制执行）：**
+
+1. **论文中所有图/表/算法伪代码都要出现**：paper_assets.py 提取出几张就用几张，按逻辑顺序穿插进正文，不能只挑 1-2 张。
+
+2. **每张图都必须有引入段和解读段**：图前说"为什么现在要看这张图"，图后说"这张图告诉我们什么"。不能孤零零地扔一张图。
+
+3. **详细解释每个概念，尤其是比较表格**：表格里有 N 行就要逐一解释——这个方法是什么意思、为什么这样设计、和其他方法有什么区别。不能只说"提出了 N 种方法"就过去了。
+
+4. **先直觉/例子，再公式**：对复杂概念先用"人话"打比方或举具体数字，再给公式。顺序是：直觉 → 具体例子（带数字）→ 公式，而不是公式扔出来然后解释。
+
+5. **caption 内容融入行文**：从 assets.json 读取的 caption 文字应拆开融进正文，让读者不看图也能理解图在说什么。
+
+6. **Algorithm 伪代码要逐步讲**：Algorithm 类型的 asset 和图表一样要插入，并逐行或逐块解释每一步在干什么，不能只贴图不说话。
 
 ---
 

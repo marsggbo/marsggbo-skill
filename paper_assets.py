@@ -377,12 +377,85 @@ def _strategy_page_render(
     return assets
 
 
-# ─── Strategy 4: figure crop (caption-anchored) ───────────────────────────────
+# ─── Strategy 4: figure crop (caption-anchored, v2) ──────────────────────────
 
 _CAPTION_RE = re.compile(
-    r"^\s*(Figure|Fig\.?|Table|Algorithm|Alg\.?)\s*([0-9]+)\s*[:.\u2236]",
+    r"^\s*(Figure|Fig\.?|Table|Algorithm|Alg\.?)\s*([0-9]+)\s*[:.\u2236]?",
     re.IGNORECASE,
 )
+
+
+def _detect_columns(
+    lines: list[tuple[float, float, float, float, str]],
+    page_rect,
+) -> list[tuple[float, float]]:
+    """
+    Detect 1- or 2-column layout from line bboxes.
+    Strategy: separate lines whose x-range lies clearly in left vs. right half.
+    - left-only : starts in left half (x0 < mid) AND ends before mid + 20 pt
+    - right-only: starts after mid - 20 pt AND x1 > mid
+    Full-width lines (spanning both halves) are ignored for column detection.
+    Require >= 2 lines in each half to call it two-column.
+    """
+    page_w = page_rect.width
+    mid = page_rect.x0 + page_w / 2
+    # Minimum line width: 12% of page (avoids tick marks, short labels)
+    min_w = page_w * 0.12
+
+    wide = [(lx0, lx1) for lx0, _, lx1, _, _ in lines if (lx1 - lx0) > min_w]
+    if not wide:
+        return [(page_rect.x0, page_rect.x1)]
+
+    # left-only: clearly in left half (doesn't cross far into right side)
+    left_only  = [(x0, x1) for x0, x1 in wide if x0 < mid and x1 < mid + 20]
+    # right-only: clearly in right half (doesn't start too far into left side)
+    right_only = [(x0, x1) for x0, x1 in wide if x0 > mid - 20 and x1 > mid]
+
+    if len(left_only) >= 2 and len(right_only) >= 2:
+        col_l = (min(x0 for x0, _ in left_only)  - 2,
+                 max(x1 for _, x1 in left_only)  + 4)
+        col_r = (min(x0 for x0, _ in right_only) - 4,
+                 max(x1 for _, x1 in right_only) + 2)
+        return [col_l, col_r]
+
+    # Single column fallback
+    return [(min(x0 for x0, _ in wide) - 2,
+             max(x1 for _, x1 in wide) + 2)]
+
+
+def _get_column(
+    x_center: float,
+    col_bounds: list[tuple[float, float]],
+    page_rect,
+) -> tuple[float, float]:
+    """
+    Return (x0, x1) of the column that contains x_center.
+    When only one "column" was detected (single-column fallback), use page
+    midpoint to split: captions clearly on one side stay in that half.
+    """
+    for c0, c1 in col_bounds:
+        if c0 - 10 <= x_center <= c1 + 10:
+            return c0, c1
+
+    # Fallback: if we have exactly one col entry (full-page single column)
+    # but the caption center is clearly to the left or right of midpoint,
+    # constrain crop to that half to avoid capturing both columns.
+    if len(col_bounds) == 1:
+        c0, c1 = col_bounds[0]
+        mid = page_rect.x0 + page_rect.width / 2
+        if x_center < mid - 20:
+            return c0, mid - 5          # left half only
+        elif x_center > mid + 20:
+            return mid + 5, c1          # right half only
+        return c0, c1                   # truly centred → full width
+
+    return col_bounds[0] if col_bounds else (page_rect.x0, page_rect.x1)
+
+
+def _overlaps_column(lx0: float, lx1: float, col_x0: float, col_x1: float) -> bool:
+    """True if the line bbox overlaps the column by at least 30%."""
+    overlap = min(lx1, col_x1) - max(lx0, col_x0)
+    return overlap / max(1.0, lx1 - lx0) > 0.30
 
 
 def _strategy_figure_crop(
@@ -390,16 +463,19 @@ def _strategy_figure_crop(
     output_dir: Path,
     dpi: int = 200,
     flat: bool = False,
-    pad: float = 4.0,
-    min_height_pt: float = 30.0,
+    pad: float = 6.0,
+    min_content_pt: float = 30.0,
 ) -> list[FigureAsset]:
     """
-    Locate captions ("Figure N:" / "Table N:" / "Algorithm N:") in PDF text lines,
-    then crop the region immediately ABOVE each caption (same column / caption width).
+    v2 — Robust caption-anchored crop with proper column detection.
 
-    Works for vector figures that pdf_embedded misses, and avoids whole-page renders.
-    Uses line-level bboxes so subfigure labels merged into the same block don't
-    inflate the caption rectangle.
+    Key improvements over v1:
+    - Crop x-range uses full COLUMN width (not narrow caption text width).
+    - Caption is INCLUDED in the crop (bottom = cap_y1 + pad).
+    - Body-text boundary filter threshold uses column width (40%) not caption width (55%).
+    - Tables/algorithms try content ABOVE the caption first, then BELOW.
+    - If content height is too small either way, fall back to a generous
+      full-column slice between surrounding body paragraphs.
     """
     doc = fitz.open(str(pdf_path))
     figs_dir = output_dir if flat else output_dir / "assets"
@@ -416,7 +492,7 @@ def _strategy_figure_crop(
         except Exception:
             continue
 
-        # Flatten into per-line records: (x0, y0, x1, y1, text)
+        # ── Collect all text lines ──────────────────────────────────────────
         lines: list[tuple[float, float, float, float, str]] = []
         for block in page_dict.get("blocks", []):
             if block.get("type") != 0:
@@ -425,97 +501,113 @@ def _strategy_figure_crop(
                 spans = ln.get("spans", [])
                 if not spans:
                     continue
-                txt = "".join(s.get("text", "") for s in spans)
+                txt = "".join(s.get("text", "") for s in spans).strip()
+                if not txt:
+                    continue
                 bx0, by0, bx1, by1 = ln.get("bbox", (0, 0, 0, 0))
                 lines.append((bx0, by0, bx1, by1, txt))
 
-        # Find caption start lines
+        # ── Detect column layout ────────────────────────────────────────────
+        col_bounds = _detect_columns(lines, page_rect)
+
+        # ── Process each caption ────────────────────────────────────────────
         for idx, (lx0, ly0, lx1, ly1, ltxt) in enumerate(lines):
             m = _CAPTION_RE.match(ltxt)
             if not m:
                 continue
 
             kind = m.group(1).lower().rstrip(".")
-            if kind.startswith("fig"):
-                category = "figure"
-            elif kind.startswith("alg"):
-                category = "algorithm"
-            else:
-                category = "table"
+            category = ("figure" if kind.startswith("fig")
+                        else "algorithm" if kind.startswith("alg")
+                        else "table")
             label_num = m.group(2)
             label = f"{category.capitalize()} {label_num}"
 
-            # Caption x range: gather contiguous following lines that share roughly
-            # the same x-range AND form the caption paragraph (until a big y gap).
-            cap_x0, cap_x1 = lx0, lx1
-            cap_y0, cap_y1 = ly0, ly1
-            cap_text_parts = [ltxt]
+            # ── Collect full multi-line caption ─────────────────────────────
+            cap_x0, cap_y0, cap_x1, cap_y1 = lx0, ly0, lx1, ly1
+            cap_parts = [ltxt]
             prev_y1 = ly1
             for j in range(idx + 1, len(lines)):
                 jx0, jy0, jx1, jy1, jtxt = lines[j]
-                # Caption must be on same column (overlapping x), and close in y.
-                if jx1 < lx0 - 2 or jx0 > lx1 + 2:
+                if jy0 - prev_y1 > 8:
                     break
-                if jy0 - prev_y1 > 6:
+                if _CAPTION_RE.match(jtxt):
                     break
-                # Stop if next line itself looks like a new caption / section header
-                if _CAPTION_RE.match(jtxt) or re.match(r"^\d+(\.\d+)*\s+[A-Z]", jtxt):
+                if re.match(r"^\d+(\.\d+)*\s+[A-Z]", jtxt):
+                    break
+                # Must overlap caption's x range
+                if jx1 < lx0 - 4 or jx0 > lx1 + 4:
                     break
                 cap_x0 = min(cap_x0, jx0)
                 cap_x1 = max(cap_x1, jx1)
-                cap_y1 = max(cap_y1, jy1)
-                cap_text_parts.append(jtxt)
+                cap_y1 = jy1
+                cap_parts.append(jtxt)
                 prev_y1 = jy1
+            cap_text = re.sub(r"\s+", " ", " ".join(cap_parts).strip())
 
-            # Find nearest line ABOVE that overlaps caption x-range -> top boundary.
-            # Only treat lines that span a substantial fraction of caption width as
-            # real body-text boundaries. Short fragments (axis labels, "(a)", numbers)
-            # belong to the figure itself and must be ignored.
-            cap_w = max(1.0, cap_x1 - cap_x0)
-            top_limit = page_rect.y0 + 4
-            for ox0, oy0, ox1, oy1, otxt in lines:
+            # ── Determine column x-range ────────────────────────────────────
+            cap_cx = (cap_x0 + cap_x1) / 2
+            col_x0, col_x1 = _get_column(cap_cx, col_bounds, page_rect)
+            col_w = max(1.0, col_x1 - col_x0)
+
+            # ── Find body-text boundary ABOVE caption ───────────────────────
+            # Body text = line spans >= 40% of column width (avoids axis labels,
+            # subfig letters, tick marks that belong to the figure itself).
+            top_y = page_rect.y0 + 4
+            for ox0, oy0, ox1, oy1, _ in lines:
                 if oy1 >= cap_y0 - 2:
                     continue
-                if ox1 < cap_x0 - 2 or ox0 > cap_x1 + 2:
+                if not _overlaps_column(ox0, ox1, col_x0, col_x1):
                     continue
-                # length-based filter: ignore in-figure text fragments (narrow lines).
-                # Body text wraps to ~full column width; figure labels / axis ticks
-                # are narrow no matter how long the actual string is.
-                if (ox1 - ox0) / cap_w < 0.55:
+                if (ox1 - ox0) / col_w < 0.40:
                     continue
-                if oy1 > top_limit:
-                    top_limit = oy1
+                if oy1 > top_y:
+                    top_y = oy1
 
-            crop = fitz.Rect(
-                max(page_rect.x0, cap_x0 - pad),
-                max(page_rect.y0, top_limit + 2),
-                min(page_rect.x1, cap_x1 + pad),
-                max(page_rect.y0, cap_y0 - 1),
-            )
+            # Crop for content ABOVE caption — includes caption at bottom
+            crop_above = fitz.Rect(
+                col_x0 - pad, top_y + 2,
+                col_x1 + pad, cap_y1 + pad,
+            ).intersect(page_rect)
 
-            # If region above is too thin (e.g. caption-below-content layouts for
-            # tables/algorithms), also check the area BELOW the caption.
-            if crop.height < min_height_pt or category in ("table", "algorithm"):
-                bottom_limit = page_rect.y1 - 4
-                for ox0, oy0, ox1, oy1, otxt in lines:
-                    if oy0 <= cap_y1 + 2:
-                        continue
-                    if ox1 < cap_x0 - 2 or ox0 > cap_x1 + 2:
-                        continue
-                    if (ox1 - ox0) / cap_w < 0.55:
-                        continue
-                    if oy0 < bottom_limit:
-                        bottom_limit = oy0
-                below = fitz.Rect(
-                    max(page_rect.x0, cap_x0 - pad),
-                    max(page_rect.y0, cap_y1 + 1),
-                    min(page_rect.x1, cap_x1 + pad),
-                    min(page_rect.y1, bottom_limit - 2),
-                )
-                if below.height > crop.height:
-                    crop = below
+            # ── Find body-text boundary BELOW caption ───────────────────────
+            bottom_y = page_rect.y1 - 4
+            for ox0, oy0, ox1, oy1, _ in lines:
+                if oy0 <= cap_y1 + 2:
+                    continue
+                if not _overlaps_column(ox0, ox1, col_x0, col_x1):
+                    continue
+                if (ox1 - ox0) / col_w < 0.40:
+                    continue
+                if oy0 < bottom_y:
+                    bottom_y = oy0
 
-            if crop.width < 20 or crop.height < min_height_pt:
+            # Crop for content BELOW caption — includes caption at top
+            crop_below = fitz.Rect(
+                col_x0 - pad, cap_y0 - pad,
+                col_x1 + pad, bottom_y - 2,
+            ).intersect(page_rect)
+
+            # ── Choose best crop ────────────────────────────────────────────
+            if category == "figure":
+                # Figures typically have caption below content
+                crop = crop_above if crop_above.height >= min_content_pt else crop_below
+            else:
+                # Tables / algorithms: caption can be above or below content
+                if crop_above.height >= min_content_pt and crop_above.height >= crop_below.height:
+                    crop = crop_above
+                elif crop_below.height >= min_content_pt:
+                    crop = crop_below
+                else:
+                    # Combine both (caption in middle)
+                    crop = fitz.Rect(
+                        min(crop_above.x0, crop_below.x0),
+                        min(crop_above.y0, crop_below.y0),
+                        max(crop_above.x1, crop_below.x1),
+                        max(crop_above.y1, crop_below.y1),
+                    ).intersect(page_rect)
+
+            if crop.width < 30 or crop.height < min_content_pt:
                 continue
 
             try:
@@ -529,13 +621,11 @@ def _strategy_figure_crop(
                 dest = figs_dir / f"{slug}_p{page_num + 1}_{len(assets):02d}.png"
             pix.save(str(dest))
 
-            cap_clean = re.sub(r"\s+", " ", " ".join(cap_text_parts).strip())
-
             assets.append(FigureAsset(
                 path=str(dest),
                 rel_path=str(dest.relative_to(output_dir)),
                 label=label,
-                caption=cap_clean,
+                caption=cap_text,
                 category=category,
                 source="figure_crop",
                 page=page_num,
