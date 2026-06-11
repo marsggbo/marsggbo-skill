@@ -170,9 +170,10 @@ OR 直接用加粗关键概念 + 正文展开，适合短文/回答。
 
 ### 第一步：创建论文目录
 
-确定 `<paper_slug>`：
-- arXiv paper：用 arXiv ID（下划线），如 `2603_27624`
-- 其他来源：用论文缩写（小写连字符），如 `cacheslide`
+确定 `<paper_slug>`，格式统一为 **`yyyymmdd-论文简称`**：
+- 日期用当天日期（8 位数字），如 `20260517`
+- 论文简称用方法名缩写或论文关键词（小写连字符），如 `cacheslide`、`expertflow`
+- 示例：`20260517-cacheslide`、`20260517-expertflow`
 
 ```bash
 mkdir -p ~/Desktop/posts/<paper_slug>/
@@ -181,7 +182,7 @@ mkdir -p ~/Desktop/posts/<paper_slug>/
 目录结构（执行完第二步后）：
 ```
 posts/
-  <paper_slug>/
+  <paper_slug>/              ← 格式：yyyymmdd-论文简称
     YYYY-MM-DD-<paper_slug>.md   ← 最终 markdown（含 Jekyll front matter）
     assets.json                  ← paper_assets 生成的 manifest
     assets/                      ← 图片子目录
@@ -218,7 +219,7 @@ posts/
 
 #### 4.1 文章开头格式（必须）
 
-文章第一行是 Jekyll YAML front matter，其次是正文标题，然后是原文引用链接：
+文章第一行是 Jekyll YAML front matter，其次是**书籍广告**，然后是正文标题和原文引用链接：
 
 ```markdown
 ---
@@ -227,6 +228,10 @@ title: "文章标题"
 date: YYYY-MM-DD
 tags: [LLM, 论文解读]
 ---
+
+> 插播：之前写的[《动手学 AutoML》](https://item.jd.com/14945889.html)终于出版了，从 NAS 到超参优化都有覆盖，适合想系统入门 AutoML 的同学。好了广告结束，现在进入正题。
+>
+> ![动手学AutoML书籍封面](/assets/img/book_cover_automl.png)
 
 # 文章标题
 
@@ -238,9 +243,30 @@ tags: [LLM, 论文解读]
 ...
 ```
 
+- **书籍广告（必须）**：紧跟 front matter 之后、正文 `# 标题` 之前。广告内容固定不变，每篇文章都加。图片路径固定为 `/assets/img/book_cover_automl.png`。
 - `date` 填写今天日期（从系统获取）
 - `tags` 根据论文主题填写，如 `[LLM, KV Cache, 论文解读]`
 - 原文引用块紧跟在正文 `# 标题` 之后，与章节之间用 `---` 分割
+
+#### 文章标题格式（必须）
+
+标题采用 **会议年份 | 方法名 + 解决问题** 的格式：
+
+```
+✅ 正确示例：
+"ASPLOS'26 | TokenFlow 让 LLM 推理 KV Cache 复用率翻倍"
+"FAST'26 | CacheSlide 解决了 SSD 缓存的写放大问题"
+"ICML'26 | ExpertFlow 让稀疏 MoE 推理不再 OOM"
+"ICLR'26 | 为什么你的 MoE 模型加载这么慢？"
+
+❌ 错误示例（过于学术/平淡）：
+"TokenFlow: Efficient KV Cache Reuse for LLM Inference"
+"论文解读：CacheSlide"
+```
+
+- 会议缩写 + 年份（如 `ASPLOS'26`、`FAST'26`、`ICML'26`、`ICLR'26`、`NeurIPS'25`）
+- 方法名或简称保留英文，后接中文解释解决了什么核心问题
+- 标题要有记忆点，突出解决的**核心矛盾**或**关键 insight**
 
 #### 4.2 图片路径：使用相对路径（本地）+ 上传时自动转换
 
@@ -282,7 +308,9 @@ alt text 用**简短的中文描述**（5-15 字），说明图的内容，不�
 
 #### 4.6 文件命名与保存路径
 
-文章保存为：`~/Desktop/posts/<paper_slug>/YYYY-MM-DD-<paper_slug>.md`
+- 文件夹名：`<paper_slug>`，格式为 `yyyymmdd-论文简称`，如 `20260517-cacheslide`
+- 文章保存为：`~/Desktop/posts/<paper_slug>/YYYY-MM-DD-<paper_slug>.md`
+- 示例：`~/Desktop/posts/20260517-cacheslide/2026-05-17-20260517-cacheslide.md`
 
 ### 第五步：自动上传到 GitHub Pages（写完文章后必须执行）
 
@@ -307,10 +335,10 @@ source：arXiv URL、arXiv ID（如 2604.07144v1）、HTTP PDF URL、本地 PDF 
 
 选项：
   --output-dir DIR        资产保存目录（默认 ./paper_assets/）
-  --flat                  图片直接存到 output-dir，不建 assets/ 子目录
-  --strategy auto|html|figures|pdf|pages
-                          提取策略（推荐 figures；auto 按 html→figures→pdf→pages 顺序）
-  --dpi N                 截图 DPI，figures 策略默认 200，建议 ≥220
+  --flat                  图片直接存到 output-dir，不建 figures/ pages/ 子目录
+  --strategy auto|html|pdf|pages
+                          提取策略（auto = html→pdf→pages 依次尝试）
+  --dpi N                 整页渲染分辨率（默认 150）
   --min-width / --min-height N
                           过滤过小的嵌入图（默认 80px）
   --render-pages SPEC     额外渲染指定页，如 "3,5-8"（叠加在主策略上）
@@ -323,12 +351,6 @@ Python import：
   print(assets.summary())
   print(assets.md_snippets())  # 直接粘贴进 markdown 的图片引用
 ```
-
-**策略选择建议：**
-- `figures`（caption-anchored crop，v2）：**首选**。精确裁出每张图/表（含 caption），正确区分双栏布局，DPI 建议 ≥ 220。
-- `html`：arXiv HTML 版本图片质量最好，但不是所有论文都有 HTML 版。
-- `pages`：整页渲染，兜底方案，截图大但完整。
-- `auto`：依次 html → figures → pdf → pages，懒得想策略就用这个。
 
 脚本位置：`~/.claude/skills/marsggbo/paper_assets.py`
 
@@ -355,25 +377,11 @@ Python import：
 - 观点类：直接表态，不绕圈
 
 ### D. 论文/技术解读（必须配合"论文写作增强协议"使用）
-- 先运行 `paper_assets.py --strategy figures --dpi 220` 提取图表（见上方协议）
+- 先运行 `paper_assets.py` 提取图表（见上方协议）
 - "今天想聊聊这篇工作解决了什么真问题"
 - 背景 → 现有方案的痛点 → 我们的解法 → 效果
 - 所有数字来自原文，所有架构图/实验图嵌入对应段落
 - 引用具体数字（显存、速度倍数等）增加可信度
-
-**论文博客图片使用规范（v2，强制执行）：**
-
-1. **论文中所有图/表/算法伪代码都要出现**：paper_assets.py 提取出几张就用几张，按逻辑顺序穿插进正文，不能只挑 1-2 张。
-
-2. **每张图都必须有引入段和解读段**：图前说"为什么现在要看这张图"，图后说"这张图告诉我们什么"。不能孤零零地扔一张图。
-
-3. **详细解释每个概念，尤其是比较表格**：表格里有 N 行就要逐一解释——这个方法是什么意思、为什么这样设计、和其他方法有什么区别。不能只说"提出了 N 种方法"就过去了。
-
-4. **先直觉/例子，再公式**：对复杂概念先用"人话"打比方或举具体数字，再给公式。顺序是：直觉 → 具体例子（带数字）→ 公式，而不是公式扔出来然后解释。
-
-5. **caption 内容融入行文**：从 assets.json 读取的 caption 文字应拆开融进正文，让读者不看图也能理解图在说什么。
-
-6. **Algorithm 伪代码要逐步讲**：Algorithm 类型的 asset 和图表一样要插入，并逐行或逐块解释每一步在干什么，不能只贴图不说话。
 
 ---
 
