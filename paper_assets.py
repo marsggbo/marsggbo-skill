@@ -386,7 +386,7 @@ _CAPTION_RE = re.compile(
 
 
 def _detect_columns(
-    lines: list[tuple[float, float, float, float, str]],
+    lines: list[tuple],
     page_rect,
 ) -> list[tuple[float, float]]:
     """
@@ -396,13 +396,15 @@ def _detect_columns(
     - right-only: starts after mid - 20 pt AND x1 > mid
     Full-width lines (spanning both halves) are ignored for column detection.
     Require >= 2 lines in each half to call it two-column.
+
+    Accepts line tuples of length >= 4 (only the bbox coordinates are used).
     """
     page_w = page_rect.width
     mid = page_rect.x0 + page_w / 2
     # Minimum line width: 12% of page (avoids tick marks, short labels)
     min_w = page_w * 0.12
 
-    wide = [(lx0, lx1) for lx0, _, lx1, _, _ in lines if (lx1 - lx0) > min_w]
+    wide = [(ln[0], ln[2]) for ln in lines if (ln[2] - ln[0]) > min_w]
     if not wide:
         return [(page_rect.x0, page_rect.x1)]
 
@@ -411,7 +413,10 @@ def _detect_columns(
     # right-only: clearly in right half (doesn't start too far into left side)
     right_only = [(x0, x1) for x0, x1 in wide if x0 > mid - 20 and x1 > mid]
 
-    if len(left_only) >= 2 and len(right_only) >= 2:
+    # Require a meaningful number of lines in each half. A real two-column
+    # paper has many such lines; <8 usually means we're seeing figure-internal
+    # text that happens to sit on one side, not actual column layout.
+    if len(left_only) >= 8 and len(right_only) >= 8:
         col_l = (min(x0 for x0, _ in left_only)  - 2,
                  max(x1 for _, x1 in left_only)  + 4)
         col_r = (min(x0 for x0, _ in right_only) - 4,
@@ -493,7 +498,8 @@ def _strategy_figure_crop(
             continue
 
         # ── Collect all text lines ──────────────────────────────────────────
-        lines: list[tuple[float, float, float, float, str]] = []
+        # Tuple shape: (x0, y0, x1, y1, text, dominant_font_size)
+        lines: list[tuple[float, float, float, float, str, float]] = []
         for block in page_dict.get("blocks", []):
             if block.get("type") != 0:
                 continue
@@ -505,13 +511,15 @@ def _strategy_figure_crop(
                 if not txt:
                     continue
                 bx0, by0, bx1, by1 = ln.get("bbox", (0, 0, 0, 0))
-                lines.append((bx0, by0, bx1, by1, txt))
+                sizes = [s.get("size", 0.0) for s in spans if s.get("size")]
+                size = max(sizes) if sizes else 0.0
+                lines.append((bx0, by0, bx1, by1, txt, size))
 
         # ── Detect column layout ────────────────────────────────────────────
         col_bounds = _detect_columns(lines, page_rect)
 
         # ── Process each caption ────────────────────────────────────────────
-        for idx, (lx0, ly0, lx1, ly1, ltxt) in enumerate(lines):
+        for idx, (lx0, ly0, lx1, ly1, ltxt, lsize) in enumerate(lines):
             m = _CAPTION_RE.match(ltxt)
             if not m:
                 continue
@@ -524,25 +532,49 @@ def _strategy_figure_crop(
             label = f"{category.capitalize()} {label_num}"
 
             # ── Collect full multi-line caption ─────────────────────────────
+            # Stop conditions (any of):
+            #   - vertical gap to next line > 8pt
+            #   - next line is itself a caption / numbered section heading
+            #   - next line's x range diverges from caption's
+            #   - next line's font size differs significantly
+            #   - next line ends with sentence-final punctuation followed by a
+            #     line that starts capitalized AND looks like body prose (>=10
+            #     words, no figure-labelish punctuation)
+            #   - caption has already grown past 10 lines (sanity ceiling —
+            #     real captions in papers basically never exceed this)
             cap_x0, cap_y0, cap_x1, cap_y1 = lx0, ly0, lx1, ly1
             cap_parts = [ltxt]
             prev_y1 = ly1
+            cap_font = lsize
+            prev_txt = ltxt
             for j in range(idx + 1, len(lines)):
-                jx0, jy0, jx1, jy1, jtxt = lines[j]
+                jx0, jy0, jx1, jy1, jtxt, jsize = lines[j]
                 if jy0 - prev_y1 > 8:
                     break
                 if _CAPTION_RE.match(jtxt):
                     break
                 if re.match(r"^\d+(\.\d+)*\s+[A-Z]", jtxt):
                     break
-                # Must overlap caption's x range
                 if jx1 < lx0 - 4 or jx0 > lx1 + 4:
+                    break
+                if cap_font > 0 and jsize > 0 and abs(jsize - cap_font) > 0.6:
+                    break
+                if len(cap_parts) >= 10:
+                    break
+                # Body-prose start after sentence-final punctuation: if the
+                # previous line ends a sentence and this line looks like a
+                # new paragraph (>=8 words), treat it as body prose, not
+                # caption continuation. Don't require the new line to start
+                # with a capital — papers often continue with lowercase
+                # ("selection of...") after a figure caption.
+                if prev_txt.rstrip().endswith((".", "。", "!", "?")) and len(jtxt.split()) >= 8:
                     break
                 cap_x0 = min(cap_x0, jx0)
                 cap_x1 = max(cap_x1, jx1)
                 cap_y1 = jy1
                 cap_parts.append(jtxt)
                 prev_y1 = jy1
+                prev_txt = jtxt
             cap_text = re.sub(r"\s+", " ", " ".join(cap_parts).strip())
 
             # ── Determine column x-range ────────────────────────────────────
@@ -550,19 +582,67 @@ def _strategy_figure_crop(
             col_x0, col_x1 = _get_column(cap_cx, col_bounds, page_rect)
             col_w = max(1.0, col_x1 - col_x0)
 
-            # ── Find body-text boundary ABOVE caption ───────────────────────
+            # Lines that act as a hard boundary: other captions or numbered
+            # section headings ("3 Experiments", "4.1 Setup"). These prevent
+            # one figure's crop from swallowing a neighboring figure or the
+            # surrounding section.
+            def _is_boundary(text: str) -> bool:
+                if _CAPTION_RE.match(text):
+                    return True
+                # Section heading: "N", "N.", "N.N", optionally followed by title.
+                return bool(re.match(r"^\d+(\.\d+)*\.?\s+[A-Z]", text))
+
+            # ── Find body-text / boundary line ABOVE caption ────────────────
             # Body text = line spans >= 40% of column width (avoids axis labels,
             # subfig letters, tick marks that belong to the figure itself).
             top_y = page_rect.y0 + 4
-            for ox0, oy0, ox1, oy1, _ in lines:
+            for ox0, oy0, ox1, oy1, otxt, _osize in lines:
                 if oy1 >= cap_y0 - 2:
                     continue
                 if not _overlaps_column(ox0, ox1, col_x0, col_x1):
                     continue
-                if (ox1 - ox0) / col_w < 0.40:
+                wide_enough = (ox1 - ox0) / col_w >= 0.40
+                is_boundary = _is_boundary(otxt)
+                if not (wide_enough or is_boundary):
                     continue
                 if oy1 > top_y:
                     top_y = oy1
+
+            # Refine top_y: if there's narrow content (table cells, axis ticks,
+            # in-figure labels) BETWEEN top_y and our caption, those belong to
+            # a SEPARATE figure / table that sits between us and the boundary.
+            # In that case, slide top_y DOWN past that interloping content.
+            # Detect this as the largest vertical gap inside [top_y, cap_y0]
+            # — that gap is usually the whitespace between two figures.
+            inter = []
+            for ox0, oy0, ox1, oy1, _otxt, _osize in lines:
+                if not _overlaps_column(ox0, ox1, col_x0, col_x1):
+                    continue
+                if oy0 < top_y - 1 or oy1 > cap_y0 + 1:
+                    continue
+                inter.append((oy0, oy1))
+            if inter:
+                inter.sort()
+                largest_gap = 0.0
+                gap_end = None
+                cursor = top_y
+                # The gap immediately before the caption is usually the gap
+                # between the figure body and its own caption — we must NOT
+                # treat that as a figure separator. Skip the final gap by
+                # only considering gaps that are followed by at least one
+                # more in-figure line below them (i.e. they're internal).
+                for k, (oy0, oy1) in enumerate(inter):
+                    is_internal = oy0 < (cap_y0 - 60)  # not the gap before caption
+                    if is_internal and (oy0 - cursor) > largest_gap:
+                        largest_gap = oy0 - cursor
+                        gap_end = oy0
+                    if oy1 > cursor:
+                        cursor = oy1
+                # Slide top_y only when we see a clearly figure-separating
+                # whitespace band (> 40pt). Tighter than before to avoid
+                # cutting into figures that have sparse internal text.
+                if largest_gap > 40.0 and gap_end is not None:
+                    top_y = gap_end - 2
 
             # Crop for content ABOVE caption — includes caption at bottom
             crop_above = fitz.Rect(
@@ -570,14 +650,16 @@ def _strategy_figure_crop(
                 col_x1 + pad, cap_y1 + pad,
             ).intersect(page_rect)
 
-            # ── Find body-text boundary BELOW caption ───────────────────────
+            # ── Find body-text / boundary line BELOW caption ────────────────
             bottom_y = page_rect.y1 - 4
-            for ox0, oy0, ox1, oy1, _ in lines:
+            for ox0, oy0, ox1, oy1, otxt, _osize in lines:
                 if oy0 <= cap_y1 + 2:
                     continue
                 if not _overlaps_column(ox0, ox1, col_x0, col_x1):
                     continue
-                if (ox1 - ox0) / col_w < 0.40:
+                wide_enough = (ox1 - ox0) / col_w >= 0.40
+                is_boundary = _is_boundary(otxt)
+                if not (wide_enough or is_boundary):
                     continue
                 if oy0 < bottom_y:
                     bottom_y = oy0
