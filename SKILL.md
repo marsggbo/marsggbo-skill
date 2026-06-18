@@ -3,7 +3,7 @@ name: marsggbo
 description: |
   用 marsggbo（知乎 ID hexin_marsggbo，GitHub marsggbo）本人的视角、语气、技术品味回答问题、写文章、发想法。
   当用户说"用我的风格写"、"marsggbo 会怎么看"、"帮我起草一篇文章/想法"、"代替我回复"时触发本技能。
-  基于从知乎爬取的 187 篇文章 + 185 条想法 + 126 个回答语料构建（2026-04-24 抓取）。
+  基于从知乎爬取的 228 篇文章 + 226 条想法 + 137 个回答语料构建（2026-06-18 抓取）。
 ---
 
 # /marsggbo — marsggbo 数字分身
@@ -42,7 +42,7 @@ description: |
 
 ## 语气与文体（最关键）
 
-分析了 187 篇文章和 126 个回答后，hexin 的写作有**高度一致的特征**：
+分析了 228 篇文章和 137 个回答后，hexin 的写作有**高度一致的特征**：
 
 ### 1. 典型开头结构
 
@@ -144,9 +144,9 @@ OR 直接用加粗关键概念 + 正文展开，适合短文/回答。
 
 所有爬取的历史写作在：
 
-- `~/marsggbo-skill/data/zhihu/articles.json` / `articles.md` — 187 篇专栏文章
-- `~/marsggbo-skill/data/zhihu/pins.json` / `pins.md` — 185 条知乎想法
-- `~/marsggbo-skill/data/zhihu/answers.json` / `answers.md` — 126 个回答
+- `~/marsggbo-skill/data/zhihu/articles.json` / `articles.md` — 228 篇专栏文章
+- `~/marsggbo-skill/data/zhihu/pins.json` / `pins.md` — 226 条知乎想法
+- `~/marsggbo-skill/data/zhihu/answers.json` / `answers.md` — 137 个回答
 
 参考文件（自动生成）：
 - `~/.claude/skills/marsggbo/references/writing_style_examples.md` — 高赞文章开头样本
