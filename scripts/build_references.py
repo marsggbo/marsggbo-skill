@@ -6,7 +6,7 @@
 通过各种规则提取其高价值部分（比如高赞回答，带有指定技术圈圈关键词的笔记等），
 生成用于大模型 (LLM) “性格/能力”系统 Prompt 使用的上下文附带文档技能树 (Skill References)。
 
-Produces (生成以下文件到 ~/.claude/skills/hexin/references/):
+Produces (生成以下文件到 ~/.claude/skills/marsggbo/references/):
   writing_style_examples.md — representative openings & paragraphs (写作风格样本：包含极具代表性的高赞开场白提取)
   core_views.md             — key takes organized by theme (核心观点库：按自然语言关键词匹配归类的特定领域主题聚合)
   title_index.md            — browsable index by year (全量内容索引标题：用于人工检查或让 AI 掌握时间线概念的模型目录库)
@@ -26,7 +26,7 @@ from pathlib import Path
 # Project root = parent of scripts/
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA = PROJECT_ROOT / "data" / "zhihu"
-SKILL_DIR = Path.home() / ".claude" / "skills" / "hexin"
+SKILL_DIR = Path.home() / ".claude" / "skills" / "marsggbo"
 REF = SKILL_DIR / "references"
 REF.mkdir(parents=True, exist_ok=True)
 
