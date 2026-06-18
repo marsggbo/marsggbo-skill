@@ -1,10 +1,314 @@
 [
   {
+    "id": "2050535362133599430",
+    "url": "https://www.zhihu.com/pin/2050535362133599430",
+    "created": 1781665733,
+    "text": "巴西「主权大模型」“翻车”：当模型可以随便融合，怎么证明它偷了你的权重？ | 巴西里约热内卢市政发布的开源大模型Rio 3.5 Open 397B，号称自主研发，性能吊打其他模型，结果被扒出大概率是直接融合别人的模型权重。这引出了一个关键问题：当模型融合变得容易，「这个模型到底是不是你的」，要怎么证明？ 为了解决「融合之后怎么追溯版权」，RouteMark工作被提出。其核心发现是，融合后每个expert依然对它「原始训练领域」的输入最敏感，router会大概率把对应任务的输入派给它。这种「任务对齐的路由行为」非常稳，不易被篡改。 RouteMark的方法很简单：用固定「探针数据」喂入merged MoE，记录router的路由logits，为每个expert构造两个互补的指纹——路由强度指纹和路由偏好指纹。通过计算指纹相似度，就能精确识别被盗用的expert。 效果上，RouteMark在各种参数级和结构级篡改下表现稳健。比如参数置换后，其相似度仍为1.000，而基于权重的方法则接近0。路由行为是一个比权重、比激活都更稳、更可靠的归属信号。 当然，RouteMark也有边界，比如目前主要在白盒/灰盒设定下验证，黑盒场景、LLM的MoE融合以及对抗自适应攻击等更硬的骨头，还等着人去啃。 巴西「主权大模型」“翻车”：当模型可以随便融合，怎么证明它偷了你的权重？",
+    "like_count": 2,
+    "comment_count": 0
+  },
+  {
+    "id": "2050170687793451269",
+    "url": "https://www.zhihu.com/pin/2050170687793451269",
+    "created": 1781578788,
+    "text": "进阶篇 | 不靠人工设计，让遗传算法自己进化出 SOTA 的 LLM 剪枝指标 | LLM剪枝的核心在于设计一个剪枝指标来给权重打分，过去这由人工完成，如Magnitude、Wanda等方法。现在，可以把“寻找最优剪枝指标”转化为一个符号回归问题，用进化算法（遗传编程）来自动搜索数学表达式。算法将表达式编码为树，通过变异、交叉和基于剪枝后模型困惑度的选择来进化。最终，进化出的公式（Pruner-Zero）在LLaMA全系列上表现优于主流人工方法，且无需更新权重。这展现了AutoML将“专家设计”自动化的潜力，其底层“选择-变异-保留”的机器可应用于多种搜索空间。 进阶篇 | 不靠人工设计，让遗传算法自己进化出 SOTA 的 LLM 剪枝指标",
+    "like_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "2049819425864519839",
+    "url": "https://www.zhihu.com/pin/2049819425864519839",
+    "created": 1781495076,
+    "text": "说人话：一文搞懂现在火热的 LLM agent 自进化原理 | 最近 LLM agent「自进化」特别火，逻辑是让 agent 自己生成变体，在任务上跑一遍，谁表现好就留下，再继续改，一轮轮迭代下去。但第一反应是——这不就是进化算法吗？这套「选择—变异—保留」的循环，在 AutoML、尤其是神经架构搜索领域，已被反复打磨快十年。区别只是搜索对象：以前搜网络结构，现在搜 agent 的 prompt 和工具链。 进化算法的核心是模仿生物进化，让一群解自己卷出最好的那个。它与梯度下降不同，完全不要求目标可微，就是「生成一堆候选 → 打分 → 淘汰差的 → 在好的身上做变异 → 再来一轮」。这也是为什么它在 NAS、在今天的 agent 自进化里都吃得开——因为这些场景的「好坏」根本写不出一个可微的 loss。 理解的关键在于翻译：个体 → 一个 agent 配置，种群 → 一批不同的 agent，适应度 → agent 在任务集上的得分，变异 → 随机改一改它的 prompt 或工具，选择 → 保留表现好的那几个。一轮进化循环包括种群初始化、适应度评估、选择、交叉与变异、种群更新和终止判断。 难点在于怎么「变异」而不搞坏结构，以及处理多目标权衡。变异需要在「探索新结构」和「不破坏现有结构」间找平衡；真实场景往往要同时优化多个目标，这时「最优解」是一条帕累托前沿，可用 NSGA-II 等经典算法处理。 LLM agent「自进化」不是新魔法，其底层骨架就是进化搜索那套打磨了近十年的东西。选择、变异、交叉、多目标权衡、超网共享——这些 NAS 里反复验证过的工具，正被原样搬到 agent 上，只是搜索空间从「网络结构」换成了「prompt 和工具链」。 说人话：一文搞懂现在火热的 LLM agent 自进化原理 #AI​ #Agent #Agent自进化 #算法（书籍）",
+    "like_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "2049597204701110277",
+    "url": "https://www.zhihu.com/pin/2049597204701110277",
+    "created": 1781442067,
+    "text": "说人话：AI 这么火，为什么最后是卖内存的韩国海力士赚翻了？ | AI说穿了就是个\"猜下一个字\"的机器，它的本体是一个有几千亿\"未知数\"的大方程，猜一个字就要算一遍，全是天文数字级别的乘加，所以离不开几千核一起算的GPU。 而这几千亿个未知数（外加越聊越长的记忆）大到一张卡都装不下、还得越聊越占。 可显卡算得再快，内存又大又快地喂不上也白搭。 而能又大又快喂饱AI的好内存（HBM），全世界就三家能造——海力士正是跑在最前面那一个。 所以海力士这波涨，是实实在在地卡在了\"内存\"这个又关键、又稀缺的环节上。 说人话：AI 这么火，为什么最后是卖内存的韩国海力士赚翻了？",
+    "like_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "2048721459820902183",
+    "url": "https://www.zhihu.com/pin/2048721459820902183",
+    "created": 1781233266,
+    "text": "为什么你的多智能体系统越加 agent 越慢？DeLM 用去中心化解了这个矛盾 | 你有没有发现，多 agent 系统加着加着就变慢了？直觉上，多个 agent 并行干活应该更快，但现实往往相反：子任务越多，系统反而越慢、越绕、越贵。 这个问题被 Stanford 的 DeLM 归因到一个东西上——中心化调度（centralized orchestration）。现在主流的 MAS 都有一个主 agent 负责拆任务、派活、收集结果，所有的协调决策都要经过它来路由。当子任务规模增长时，这个主 agent 就成了绕不过去的瓶颈，本质上还是串行。 DeLM 的解法是：把“中心调度”换成“共享内存 + 任务队列”。它让 agent 通过一个**共享的、经过校验的上下文（shared verified context）**异步地协调，没有中心 agent 来 merge、过滤、再分发。 这套设计在 SWE-bench Verified 和 LongBench-v2 两个差异极大的任务上都拿到了最好的平均表现，同时把每个任务的成本砍掉了大约一半。 总的来说，DeLM 把“多 agent 越加越慢”的现象，精确归因到了中心化通信，并给出了一个干净的解法。 为什么你的多智能体系统越加 agent 越慢？DeLM 用去中心化解了这个矛盾",
+    "like_count": 1,
+    "comment_count": 0
+  },
+  {
+    "id": "2048720234698257423",
+    "url": "https://www.zhihu.com/pin/2048720234698257423",
+    "created": 1781232974,
+    "text": "当 AI 开始造自己：Anthropic 递归自我改进报告深度解读 | AI 造自己不是科幻。Anthropic 在 2026 年 6 月发了一篇博客，标题直白——When AI builds itself。文中展示了一件事：AI 已经在加速 AI 自身的开发，且趋势在加速。 外部评测显示，AI 处理长任务的能力翻倍周期从 7 个月缩短到 4 个月，如果趋势不停，2027 年 AI 就能处理人类需要数周完成的任务。 Anthropic 的内部数据更惊人：超过 80% 的 merged 代码是 Claude 写的；Claude 写的代码质量在 2026 年中已大致与人类持平，预计年内会超过；在“给定目标、优化执行”的维度上，Claude 已做到 52 倍加速，远超人类。 关于未来，Anthropic 描述了三条路径，并认为他们目前处于“持续复合加速，但人类保持方向设定权”的阶段，但“完全递归自我改进”并非不可能。 全文最核心的矛盾是：如果模型能改进自己，那人类怎么验证改进后的模型仍然是安全的？每一代模型都比上一代更强，验证难度也在增加。 当 AI 开始造自己：Anthropic 递归自我改进报告深度解读",
+    "like_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "2048719037677441522",
+    "url": "https://www.zhihu.com/pin/2048719037677441522",
+    "created": 1781232687,
+    "text": "NF-CoT：当 LLM 的思维链不再是文字，而是连续概率流 | 你有没有想过一个问题：大模型在“思考”的时候，为什么非得一个字一个字把推理过程说出来？Chain-of-Thought（CoT）确实让模型变聪明了，但代价也很离谱——每一步推理都必须变成人话才能继续。 NF-CoT 给了一个很漂亮的解：用 Normalizing Flow 在 LLM 内部建模连续思维链的概率分布，既有精确的 likelihood，又能像普通 token 一样从左到右采样，还能复用 KV cache。 它把 LLM 的 backbone 本身当作 deep autoregressive flow 的一部分，在连续思维位置，NF head 输出高斯参数；在文本位置，LM head 输出 token logits。 核心优势是连续思维有精确的 log-likelihood，这意味着可以直接对 latent 推理路径做 policy gradient 优化。实验表明，latent-space RL 不会导致 pass@k collapse，多样性被保留。 代码推理任务上比 LaDiR 强 7%，推理速度快 1.92 倍。64 个 latent token 平均编码 385 个文本 token 的 CoT，有效压缩率约 6.0×。 NF-CoT：当 LLM 的思维链不再是文字，而是连续概率流",
+    "like_count": 2,
+    "comment_count": 0
+  },
+  {
+    "id": "2048718105451435947",
+    "url": "https://www.zhihu.com/pin/2048718105451435947",
+    "created": 1781232460,
+    "text": "Transformer 真的需要三个投影矩阵吗？Q-K=V 让 KV Cache 直接砍半 | 你有没有想过，Transformer 里每个 attention head 都要算 Q、K、V 三个投影，这三个真的缺一不可吗？K 和 V 需要全量缓存，这玩意儿在长上下文场景下是真正的显存杀手。 作者系统性地测试了三种“省矩阵”的方案，核心发现是：不是所有投影共享都能带来推理加速，只有共享 K 和 V 才能直接转化为 KV Cache 的减少。 为什么 K=V 能 work？作者发现训练好的标准模型里，K 和 V 投影矩阵本身就高度相似，强制让它们共享一个投影矩阵，质量损失自然很小。 实验验证，Q-K=V 方案在 1.2B 模型上只带来 2.48% 的 perplexity 退化，却换来 50% 的 KV Cache 缩减，且下游任务准确率几乎不掉点。 投影共享和 GQA/MQA 是正交的优化轴，两者叠加可以把 cache 压到只剩 3.1%，对大规模生产模型部署极具吸引力。 Transformer 真的需要三个投影矩阵吗？Q-K=V 让 KV Cache 直接砍半 #多模态数据库 #多模态数据处理 #Transformer架构",
+    "like_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "2048420631243502301",
+    "url": "https://www.zhihu.com/pin/2048420631243502301",
+    "created": 1781161538,
+    "text": "Self-Harness：让 Agent 自己改自己的 harness，pass rate 最高翻倍 | LLM Agent 的 harness（如 system prompt、工具配置等）对性能影响巨大，但目前全靠人肉工程，难以规模化且无法通用。Self-Harness 提出新思路：让 Agent 自己改自己的 harness，通过一个三步迭代循环实现：首先从执行失败的痕迹中挖掘反复出现的失败模式；接着用同一个模型基于这些模式，提出多个并行的、有针对性的 harness 修改候选；最后通过保守的回归测试来验证和采纳有效的修改。实验证明，该方法能让不同模型进化出完全不同的 harness，针对性解决各自的“坏习惯”，例如让健忘的模型学会先创建输出文件，或让容易自毁的模型增加错误恢复机制。这标志着 harness 从静态设计走向动态演化，是 Agent 工程化的重要趋势。 Self-Harness：让 Agent 自己改自己的 harness，pass rate 最高翻倍",
+    "like_count": 1,
+    "comment_count": 0
+  },
+  {
+    "id": "2048416992412152545",
+    "url": "https://www.zhihu.com/pin/2048416992412152545",
+    "created": 1781232219,
+    "text": "Mirage：把世界模型的 3D 记忆搬进 Latent Space，快 10 倍还省 55 倍显存 | 世界模型是能根据动作预测未来观察的系统，维护持久3D空间表示是关键。此前RGB点云方案存在瓶颈：video diffusion model在latent space工作，但空间记忆在pixel space，每步都需“latent→pixel→latent”来回折腾，既慢又损信息。Mirage的核心idea很自然：既然diffusion backbone消费的是latent，空间记忆为何不直接存latent？其Latent Spatial Memory存的是latent feature vector，与backbone直接对接。记忆构建在latent分辨率进行，读取时通过一次latent分辨率的投影得到conditioning signal，不涉及任何pixel空间操作。实验显示，Mirage在3D一致性等指标上领先，且端到端生成速度比RGB方案快10.57倍，3D cache显存占用少55倍，这源于表示层面的结构性改进。 Mirage：把世界模型的 3D 记忆搬进 Latent Space，快 10 倍还省 55 倍显存",
+    "like_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "2048416987294984026",
+    "url": "https://www.zhihu.com/pin/2048416987294984026",
+    "created": 1781160667,
+    "text": "Mirage：把世界模型的 3D 记忆搬进 Latent Space，快 10 倍还省 55 倍显存 | 世界模型是能根据动作预测未来观察的系统，维护持久3D空间表示是关键。此前RGB点云方案存在瓶颈：video diffusion model在latent space工作，但空间记忆在pixel space，每步都需“latent→pixel→latent”来回折腾，既慢又损信息。Mirage的核心idea很自然：既然diffusion backbone消费的是latent，空间记忆为何不直接存latent？其Latent Spatial Memory存的是latent feature vector，与backbone直接对接。记忆构建在latent分辨率进行，读取时通过一次latent分辨率的投影得到conditioning signal，不涉及任何pixel空间操作。实验显示，Mirage在3D一致性等指标上领先，且端到端生成速度比RGB方案快10.57倍，3D cache显存占用少55倍，这源于表示层面的结构性改进。 Mirage：把世界模型的 3D 记忆搬进 Latent Space，快 10 倍还省 55 倍显存",
+    "like_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "2048414477775790393",
+    "url": "https://www.zhihu.com/pin/2048414477775790393",
+    "created": 1781160074,
+    "text": "Frontier：LLM 推理仿真器，端到端误差从 51.7% 降到 2.6% | 部署大型 MoE 模型前，能否先“模拟跑一遍”？合理的配置组合轻松超过 1000 种，在真实集群上扫描成本极高。Frontier 这个仿真器正面解决了这个问题。 现有仿真器存在两大问题：架构不完整，无法建模 PDD/AFD 等 disaggregated serving 架构；仿真精度不够，误差甚至会导致错误决策。 Frontier 的核心设计对应解决了这些问题。它引入 role-specific cluster worker 抽象来支持 disaggregated 架构，将跨集群依赖作为显式事件建模。同时，通过 Runtime Adapter 机制精准捕捉 CUDA Graph 等优化特性，并将算子分为三类进行精准建模。 实验验证显示，Frontier 将端到端误差从对比方法的 51.7% 压到了 2.6%，在多种测试场景下保持高精度。这使得团队能在 CPU 上快速探索海量配置，避免高昂的试错成本。 工具可用于探索 Pareto 前沿、进行异构 GPU 成本优化等复杂决策，为 LLM 推理部署提供了强大的仿真能力。 Frontier：LLM 推理仿真器，端到端误差从 51.7% 降到 2.6%",
+    "like_count": 6,
+    "comment_count": 0
+  },
+  {
+    "id": "2046160315826565731",
+    "url": "https://www.zhihu.com/pin/2046160315826565731",
+    "created": 1780622707,
+    "text": "《动手学AutoML》手把手教你实现自动机器学习 | #AutoML #机器学习 #AI入门 #手把手教学 #程序员学习 本书分为四个部分，共 11 章。 . 第一部分 基础篇（第 1、2 章）介绍 AutoML 的理论基础与技术背景，包括机器学习建模流程、AutoML 的系统定义、优化目标、演进趋势与典型系统框架与平台。该部分为后续各章打下完整的认知基础。 . 第二部分 进阶篇（第 35 章）聚焦 AutoML 中的神经架构搜索，系统梳理搜索空间构建方式、常见搜索策略（进化算法、贝叶斯优化、可微分搜索等），以及模型评估与约束优化方法，是实现深度学习结构自动化的关键技术模块。 #优化 #AI工具链 . 第三部分 应用篇（第 69 章）扩展 AutoML 技术在模型组件、数据策略和大语言模型中的高阶应用，包括损失函数和激活函数搜索、数据增强与代理数据集搜索、大语言模型压缩与融合、LLM-Agent 与 AutoML 的融合机制，是理解当前技术前沿的重要部分。 . 第四部分 实战篇（第 10、11 章）以可运行的代码项目为例，展示如何从零实现一个 NAS 系统，以及如何实现可微分搜索、进化压缩、LLM 剪枝等典型任务，帮助读者完成从原型构建到工程落地的关键跳跃。 本书的主要特色包括： . 结构清晰，覆盖全面：技术内容从原理到实践、从传统到前沿，覆盖 AutoML 的主流研究方向与应用路径。 . 实战导向，代码支持：每个实战项目均提供代码实现说明，并可配套访问示例仓库，便于读者上手实践。 . 技术语言，避免堆砌：坚持简明理性原则，不以流行术语堆砌内容，强调工程价值与技术落地可行性。 . 前沿同步，持续可扩展：内容涵盖新的 LLM 相关优化技术，保持与实际应用趋势同步。 配套资源说明：本书配套代码、参考资料与实验脚本将通过 GitHub 仓库一持续更新，读者可通过书中提供的网址获取。读者也可以根据章节关键词进一步扩展阅读和实验，提升工程落地能力。 #大模型 #机器学习 #人工智能",
+    "like_count": 2,
+    "comment_count": 0
+  },
+  {
+    "id": "2045801134636413370",
+    "url": "https://www.zhihu.com/pin/2045801134636413370",
+    "created": 1780537016,
+    "text": "我们的书《动手学 AutoML》出版啦！从 NAS 到大模型优化，系统讲透这套方法论 | 我们团队写的《动手学 AutoML：从 NAS 到大语言模型优化实战》出版了。这本书覆盖了从经典 AutoML 方法到 LLM 时代应用的完整技术链路。AutoML 的核心思路——定义搜索空间、设计评估策略、自动化迭代优化——正以新面貌出现在前沿工作中，例如 Agent 自动进化、大模型压缩等。这本书教你用算法自动找到“最优配置”的系统性方法，每个核心方法都配有可运行代码。如果你需要系统性的中文学习资料，这本书就是那个回答。 我们的书《动手学 AutoML》出版啦！从 NAS 到大模型优化，系统讲透这套方法论 #NAS #AutoML #大模型优化 #机器学习 #模型优化",
+    "like_count": 3,
+    "comment_count": 0
+  },
+  {
+    "id": "2045618779590227077",
+    "url": "https://www.zhihu.com/pin/2045618779590227077",
+    "created": 1781232255,
+    "text": "我们的书《动手学 AutoML》出版啦！从 NAS 到大模型优化，系统讲透这套方法论 | 我们团队写的《动手学 AutoML：从 NAS 到大语言模型优化实战》终于出版了。这本书覆盖了从经典 AutoML 方法到 LLM 时代应用的完整技术链路。 每次有人问我“AutoML 是不是过时了”，我都觉得挺有意思——你仔细看看现在最火的那些工作，底下用的搜索和优化逻辑，和 AutoML 当年研究的东西其实是一脉相承的。 可以说，AutoML 的方法论正在被越来越多的新方向所借鉴和延续。 这本书教你用算法自动找到“最优配置”的系统性方法，每个核心方法都配有可运行代码。 只要你的工作涉及“从大量可能性中找到最好的那个”，这本书讲的方法论就和你相关。 我们的书《动手学 AutoML》出版啦！从 NAS 到大模型优化，系统讲透这套方法论",
+    "like_count": 4,
+    "comment_count": 2
+  },
+  {
+    "id": "2041855448169592758",
+    "url": "https://www.zhihu.com/pin/2041855448169592758",
+    "created": 1779596306,
+    "text": "[想法的图片]",
+    "like_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "2040337583306171283",
+    "url": "https://www.zhihu.com/pin/2040337583306171283",
+    "created": 1779234387,
+    "text": "开源小火苗 徽章佩戴留念，期待在知乎继续前行，探索无尽可能。 #开源小火苗",
+    "like_count": 1,
+    "comment_count": 0
+  },
+  {
+    "id": "2040095437391194083",
+    "url": "https://www.zhihu.com/pin/2040095437391194083",
+    "created": 1779176723,
+    "text": "LLM Agent Memory综述：从RAG,KV Cache到参数，100+论文演进与真实取舍 | LLM Agent Memory 的现状是：几乎所有团队都说自己“加了 memory”，但实现方式各异，有人在做向量库检索，有人在做 KV cache eviction，有人在做 LoRA 持续学习——表面同名，底层完全不是一个问题。 因此，这篇综述的核心是把 memory 还原成一个可拆分的系统问题，从两个正交维度切入：**表示层 (Representation)**（信息以什么形式存在）和 **管理层 (Management)**（信息怎么建、怎么改、怎么取）。一旦接受这个统一视角，很多看似不相关的工作就可以互相对话了。 具体来看，不同层级的 memory 各有特点。**Token memory** 写入成本低但查询贵，**KV cache** 写入成本中等但维护成本高，**Parameter memory** 写入极贵但查询几乎为零。这与计算机的存储层次规律一致。 未来的关键方向在于**跨层 Memory Routing 与联合调度**，实现类似操作系统的分层管理。最终，一个健壮的 LLM agent 系统一定是多层 memory 的组合。 最大的启发是：**LLM memory 不是一个功能模块的设计问题，而是一个完整的存储系统设计问题**——带着所有存储系统该有的层次、调度、一致性和生命周期管理。 LLM Agent Memory 全景拆解：从 RAG 到 KV Cache 到参数写入，100+ 篇工作的方法演进与真实取舍",
+    "like_count": 15,
+    "comment_count": 0
+  },
+  {
+    "id": "2040092171567637627",
+    "url": "https://www.zhihu.com/pin/2040092171567637627",
+    "created": 1779175880,
+    "text": "LLMRouterBench：当所有 routing 方法被拉到同一起跑线，结果有些尴尬 | LLM routing 的核心想法是，每来一个 query 就智能选一个最合适的模型，因为模型之间存在互补性——没有任何一个模型在所有任务上都是最好的。 然而，当把所有主流 routing 方法拉到同一个模型池、同一数据集和标准下，关键发现是：这些方法的表现几乎一样，差距只在 1-2 个点之内。 这说明目前 routing 方法能学到的，主要是粗粒度的 domain structure，而不是 fine-grained 的 instance-level 判断。 证据就是这些方法的表现都非常接近 Dataset Oracle，本质上只是在做 task classification，不是真正的 per-query routing。 因此，虽然模型互补性真实存在，但当前的 routing mechanism 远未足够好去利用它，巨大的性能差距全是研究机会。 LLMRouterBench：当所有 routing 方法被拉到同一起跑线，结果有些尴尬",
+    "like_count": 8,
+    "comment_count": 1
+  },
+  {
+    "id": "2040044988285834757",
+    "url": "https://www.zhihu.com/pin/2040044988285834757",
+    "created": 1779164629,
+    "text": "EuroSys'26 | TokenFlow：让 LLM 流式输出真正「流」起来 | 用过 ChatGPT 或 AI 对话产品的人都有体验：文字像打字机一样「流」出来。这种「流式输出」是现代 LLM 交互的标配，但有时流并不稳定——等很久才出第一个字（TTFT 高），或文字时快时慢（TBT 不稳）。这篇论文 TokenFlow 要彻底解决这个问题。 LLM 流式服务的核心矛盾在于两个指标：TTFT 和 TBT。它们天生矛盾，尤其在大量请求同时涌入时。主流框架采用先来先服务策略，结果排队请求的 TTFT 飙升，而正在处理的请求生成速度远超用户阅读速度，浪费算力。 TokenFlow 的关键洞察是：LLM 生成速度远快于用户阅读速度。这意味着服务端可提前生成一批 token 存入 buffer，用户慢慢消费。只要 buffer 不空，用户体验就流畅。这给了系统「喘息空间」——可暂停正在跑的请求，先处理新请求，只要 buffer 里还有 token，用户不会察觉异常。 TokenFlow 系统设计核心是 Buffer-Aware 抢占式调度器和 Proactive KV Cache 管理器。调度器通过追踪每个请求的 buffer 余量和用户消费速率，动态决定何时暂停哪个请求，在「稳住老用户」和「快速响应新用户」间找到平衡。Proactive KV Cache 管理采用 Write-Through 策略，提前将 KV cache 同步到 CPU，使抢占操作近乎零开销。 实验表明，TokenFlow 在多种硬件和模型上，有效吞吐量平均提升超 45%，平均 TTFT 降低超 52%。它让「流式输出」真正流起来，其思路对做 LLM serving 很有参考价值——从整个 request burst 角度看待资源分配和调度策略。 EuroSys'26 | TokenFlow：让 LLM 流式输出真正「流」起来",
+    "like_count": 2,
+    "comment_count": 0
+  },
+  {
+    "id": "2039714113161535513",
+    "url": "https://www.zhihu.com/pin/2039714113161535513",
+    "created": 1779085750,
+    "text": "EuroSys'26 | IBP 用无损 bit 压缩缓解 PCIe 瓶颈 | ML workload 慢，很多时候并不是 GPU 算不动，而是数据到不了 GPU。GNN training 的 node features、DLRM 的 embedding tables、LLM long-context inference 的 KVCache，经常大到 GPU HBM 放不下，系统只能把数据放在 CPU memory 或 disk，再通过 PCIe 搬到 GPU。 IBP 这篇 EuroSys 2026 的工作关注的就是这个问题：用 lossless compression 减少 CPU-to-GPU transfer。它的核心观察是，很多 ML 数据在 bit level 上有低熵结构，比如 floating-point 的 sign bit、exponent bits 在大量 tensors 之间高度一致，这些跨 tensor 不变的 bits 可以删掉。 IBP 的取舍很明确：牺牲一点理论压缩率，换取极低 metadata、warp-level decompression、GPU-initiated aligned transfer。这使得它在 GNN、DLRM、LLM 各类 workload 上都有收益，加速主要来自 PCIe transfer 的优化，没有额外的 compute overhead。 这个思路对 LLM inference 特别有意思。现在 KVCache 优化有很多 lossy 方向，但 production 里有时候你就是不想动模型语义，lossless 方法虽然收益可能不如 aggressive quantization，但落地阻力小很多。 这篇工作提醒我们一个很朴素的事实：GPU 系统优化不只是算得快，还要搬得聪明。 EuroSys'26 | IBP 用无损 bit 压缩缓解 PCIe 瓶颈，GNN/DLRM/LLM 推理都能用",
+    "like_count": 5,
+    "comment_count": 0
+  },
+  {
+    "id": "2039688195617592145",
+    "url": "https://www.zhihu.com/pin/2039688195617592145",
+    "created": 1779079561,
+    "text": "EuroSys'26 | PARD 提前丢掉注定超时的请求，goodput 最高提升 176% | 在 latency-sensitive inference pipeline 里，drop request 的直觉经常会错。因为有些请求即使不丢，也已经注定超时；它们继续占用 GPU，只会拖累后面的请求，最后大家一起 miss SLO。 PARD 的核心观点很直接：请求不是越晚丢越好。有些请求应该提前丢，而且要丢对集合。 PARD 把 request dropping 从被动止血变成主动调度。它会基于 end-to-end latency 分解和 runtime distribution，更早、更准地丢掉注定没价值的请求。 结果显示，PARD 不是“更激进地丢请求”，而是更早、更准地丢掉注定没价值的请求，所以最后总 drop rate 反而更低。在 latency-sensitive serving 里，goodput 最大化不是尽量不丢请求，而是尽量不把 GPU 浪费在注定无效的请求上。 EuroSys'26 | PARD 提前丢掉注定超时的请求，goodput 最高提升 176%",
+    "like_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "2039687273671833309",
+    "url": "https://www.zhihu.com/pin/2039687273671833309",
+    "created": 1779079355,
+    "text": "EuroSys26 | MFS 把整个 model family 融进一套嵌套模型 | MFS 这篇 EuroSys 2026 的工作想解决 LLM provider 总喜欢提供一整个 model family 的问题，因为从 serving 系统视角看，每个模型都要单独加载参数、单独维护 KVCache、单独 batching，GPU 无法很好共享。 它的核心想法是：不要同时 serve 一个 family 里的多个独立模型，而是把小模型“沉淀”到大模型的中间层里，形成一个 multi-tiered model，这个过程叫 Knowledge Precipitation。 具体来说，是从 family 中最大的 pre-trained model 出发，按 layer/head 切分出多个 nested tiers 并联合训练，使小 tier 被显式训练成一个可用的小模型，且所有 tier 嵌套共享参数。 这样带来的好处是：参数可以共享，batching 可以跨 tier 做，KVCache 也可以跨 tier 复用，从而实现 tier-level batching、intermediate feature 和 KVCache sharing。 实验表明，MFS 能减少 56.1% end-to-end token generation latency，并降低 47.8% GPU memory footprint，其价值在于把 model family serving 的问题重新定义，为系统优化开辟了新空间。 EuroSys26 | MFS 把整个 model family 融进一套嵌套模型，KVCache 跨 tier 直接共享",
+    "like_count": 3,
+    "comment_count": 0
+  },
+  {
+    "id": "2039396017523667202",
+    "url": "https://www.zhihu.com/pin/2039396017523667202",
+    "created": 1779009921,
+    "text": "Fast26 | SolidAttention内存不够SSD来凑。笔记本也能跑128k上下文 LLM | 内存不够，SSD来凑。但怎么凑，里面有很多讲究。现在主流的笔记本在128k上下文的LLM推理时，KV cache连装都装不下，本地部署方案基本默认你的内存够用，而大多数人的机器其实根本不够用。 SolidAttention的核心思路是协同设计（co-design）稀疏attention算法和SSD存储管理，让数据访问粒度对齐SSD特性。它通过KV Consolidator将K和V交织存储以翻倍I/O带宽，利用Speculative Prefetcher根据上一层选择预测并预取KV块，并借助SSD-aware Scheduler进行精细化任务调度以重叠计算和I/O。 实验表明，在真实笔记本上，SolidAttention能在精度损失≤2%的情况下，将KV cache内存占用降低约98%，吞吐量损失仅为≤11%。 Fast26 | SolidAttention 内存不够，SSD 来凑。笔记本也能跑 128k 上下文 LLM #内存占用 #内存效率提升 #内存计算",
+    "like_count": 5,
+    "comment_count": 0
+  },
+  {
+    "id": "2039393860284060960",
+    "url": "https://www.zhihu.com/pin/2039393860284060960",
+    "created": 1779009406,
+    "text": "Eurosys26 | LLMFolder用编译器常量折叠的思路压缩 LLM,FFN 参数砍了80% | LLM 太大导致部署成本高，主流剪枝方法在高压缩比下精度损失严重。 作者受编译器「常量折叠」启发，提出不丢权重而合并权重的思路，以缓解 FFN 层 I/O 瓶颈。 针对 GELU 非线性问题，LLMFolder 利用 pre-activation 分布集中的特性，用分段线性近似并设计在线预测器，对 outlier 回退原始计算。 实验显示，FFN 参数压缩 80%，精度远超剪枝方法，与量化、剪枝组合可实现 92.5% 压缩且仅损失 4.4% 精度。 这项跨领域工作通过「合并权重」而非「丢弃权重」，在保持精度的同时显著提升推理效率。 Eurosys26 | LLMFolder用编译器「常量折叠」的思路压缩 LLM,把 FFN 参数砍了80%",
+    "like_count": 12,
+    "comment_count": 0
+  },
+  {
+    "id": "2038942103305179566",
+    "url": "https://www.zhihu.com/pin/2038942103305179566",
+    "created": 1778901687,
+    "text": "Fast26 | LLM 推理启动慢？华为用一个可编程 Page Cache把模型加载砍了 79% | 你有没有遇到过这种情况：一个 LLM 推理服务，业务流量一上来，需要紧急扩容，但新起一个实例，光是模型加载就要等一两分钟，有时甚至更长？这不是什么小概率踩坑，这是 MaaS（Model-as-a-Service）场景下普遍存在的痛点。 瓶颈卡在了软件层——具体来说，是 Linux 内核的 page cache 策略。 华为提出的 PPC（Programmable Page Cache） 框架 + MAIO（Model-Accelerated I/O） 缓存策略，其核心洞见是：同一个 LLM 推理服务实例，每次启动时的 I/O 序列是完全一致的。 基于这个观察，MAIO 在 framework init 阶段就能提前知道后面 model loading 要读什么，实现了可中断的、高并发的精确 prefetch 和 XPU affinity loading，并利用 I/O 模板精确感知哪些数据“用完就不会再用”，用 BAR（Burn-After-Reading）驱逐彻底避免 cache thrashing。 最终实现模型加载时延降低 79%，在内存受限场景下比其他方案快最多 74%，在弹性部署场景下 inference throughput 提升 36%。 Fast26 | LLM 推理启动慢？华为用一个「可编程 Page Cache」把模型加载砍了 79% #分布系统 #分布式架构 #系统框架",
+    "like_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "2038939568112673658",
+    "url": "https://www.zhihu.com/pin/2038939568112673658",
+    "created": 1778901091,
+    "text": "Fast26 | KV Cache 的两层存储(内存+SSD)到底卡在哪？ | 在多轮对话的LLM应用中，KV缓存的重复计算开销巨大，冗余计算占比高达93.1%。常规的两层存储方案（host memory + SSD）因计算引擎与存储完全互不知情，导致延迟高3.8倍、吞吐量跌半。 Bidaw的核心思路是让计算引擎和存储双向感知。一方面，通过I/O感知的调度策略，避免因SSD慢请求阻塞GPU；另一方面，利用模型回答长度预测下次KV访问时间，指导淘汰策略，显著提升了host memory命中率。 此外，通过选择缓存计算代价更低、体积更小的中间张量，而非直接缓存KV张量，能在相同存储空间内容纳更多用户数据。实验表明，Bidaw将响应延迟最高降低了3.58倍，吞吐量提升了1.43到1.83倍，且系统开销极低。 Fast26 | KV Cache 的两层存储(内存+SSD)到底卡在哪？ #数据映射 #高并发系统 #高并发",
+    "like_count": 56,
+    "comment_count": 0
+  },
+  {
+    "id": "2038729182067308305",
+    "url": "https://www.zhihu.com/pin/2038729182067308305",
+    "created": 1778850914,
+    "text": "Eurosys26 | FineMoE如何用「细粒度」打破MoE推理的显存-延迟死局 | MoE 模型推理时，大量 expert 参数在 GPU 显存中闲置，形成显存浪费。现有卸载方案多在粗粒度的 request 级别预测 expert 激活，导致预测不准，陷入显存与延迟的取舍困境。 FineMoE 的核心在于细粒度：它设计了 iteration 级别的 expert map 数据结构，记录每一层 gate 网络的完整概率分布，而非简单的 hit count。这使预测更准确。 系统采用双路搜索：prefill 初期用语义 embedding 匹配相似 prompt 的历史 expert map；之后则利用已生成的 expert 激活轨迹进行搜索。根据匹配相似度，系统动态调整预取的 expert 数量。 所有搜索与预取操作通过异步架构执行，不阻塞推理主流程，额外延迟极低。实验表明，FineMoE 在显著节省显存的同时，大幅降低了推理延迟，并提升了 expert 命中率。 Eurosys26 | FineMoE如何用「细粒度」打破MoE推理的显存-延迟死局",
+    "like_count": 21,
+    "comment_count": 2
+  },
+  {
+    "id": "2037529470345662698",
+    "url": "https://www.zhihu.com/pin/2037529470345662698",
+    "created": 1778564887,
+    "text": "ICML25 Workshop | PiKV 处理MoE 推理的 KV Cache 问题 | MoE模型的稀疏激活是其关键优势，将FFN拆成多个专家，每次只激活部分，理论上可压缩计算量。然而实际推理中，显存占用和延迟问题依然突出，根源在于KV Cache的管理仍是密集的。 KV Cache在自回归生成中用于存储历史token的Key和Value以避免重复计算。对于MoE模型，即使专家计算稀疏，每个token的KV仍需全量存储和同步，这抵消了稀疏计算带来的收益。 PiKV系统旨在解决此矛盾，其核心思路是让KV Cache的管理也感知专家的稀疏性。系统包含四个协同模块：按专家分片存储KV、考虑缓存命中代价的路由层、写入前压缩KV的压缩层，以及基于效用分数管理缓存页的调度层。 其中，路由层在标准MoE选择专家的基础上，额外引入缓存未命中惩罚，引导选择缓存命中率高的专家，本质上实现了局部性感知调度。而分片存储将不同token的KV按专家分散到多个GPU，显著减少了单GPU的存储冗余。 实验表明，PiKV能大幅节省显存并提升推理速度。这项工作将MoE的稀疏性从计算层传导至存储层，随着大模型部署规模扩大，此类优化对突破内存与通信瓶颈至关重要。 ICML25 Workshop | PiKV 处理MoE 推理的 KV Cache 问题",
+    "like_count": 2,
+    "comment_count": 0
+  },
+  {
+    "id": "2037524192690705305",
+    "url": "https://www.zhihu.com/pin/2037524192690705305",
+    "created": 1778563628,
+    "text": "ISCA26 | DySHARP 直接在交换机里做计算，干掉 50% 冗余 MoE 训练通信流量 | MoE最大的问题之一是通信开销，在DeepSeek-V3的实测里占了MoE layer执行时间的70.4%。通信模式是“动态”的，而NVLS只支持“静态”的。 DySHARP提出了两个技术：Dynamic Multimem Addressing让交换机支持动态通信，削减冗余流量；Token-Centric Kernel Fusion让Dispatch和Combine并发执行。 核心洞察是：in-switch computing减的是单向流量，天生不对称；kernel fusion让两个方向并发，把互补的非对称流量叠加，才能真正转化成整体带宽利用率提升。 实验在模拟的GH200 NVL32上跑，端到端加速vs DeepEP最高达2.31×。 这项工作把in-switch computing从静态collective扩展到动态MoE通信，是个很有价值的first step。 ISCA26 | DySHARP 直接在交换机里做计算，干掉 50% 冗余 MoE 训练通信流量",
+    "like_count": 38,
+    "comment_count": 0
+  },
+  {
+    "id": "2037521250982048962",
+    "url": "https://www.zhihu.com/pin/2037521250982048962",
+    "created": 1778562929,
+    "text": "Google 训练一个「会管技能库」的 AI——SkillOS 让 agent 真正越用越强 | 现有LLM agent系统通常是一次性的，用完即走，无法从历史交互中积累知识。要让agent真正“越用越强”，核心在于self-evolution，能将经验抽象成结构化的skill（技能）供未来复用。但难点在于skill curation——如何自动管理这些技能（增、删、改）。 SkillOS通过解耦Executor（冻结，负责执行任务）和Curator（可训练，负责管理技能库）来解决此问题。其核心贡献是一套RL训练配方：使用Grouped Task Streams（将相关任务聚类成组）和Composite Rewards（综合后续任务成功率等信号），将延迟反馈转化为可用学习信号。 实验表明，经过RL训练的Curator（如基于Qwen3-8B）在多项任务上全面超越基线，甚至优于由更强模型（如Gemini-2.5-Pro）直接担任的Curator，因为它学会了为特定Executor“量身定制”技能。技能库本身也在进化，内容从泛泛而谈逐渐涌现出更具体、通用的高层策略。 这项工作方向正确且工程扎实，将self-evolving agent从“每次从头开始”推进到了“能从经验中持续提炼”。 Google 训练一个「会管技能库」的 AI——SkillOS 让 agent 真正越用越强 #得到AI学习圈 #生成式深度学习 #深度生成学习",
+    "like_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "2036842978581410906",
+    "url": "https://www.zhihu.com/pin/2036842978581410906",
+    "created": 1778401217,
+    "text": "ICML25｜ EPIC：KV Cache 复用的「编译-链接」范式（附可运行代码复现） | EPIC通过让KV cache实现“位置无关”，解决了RAG等场景中chunk复用因RoPE位置编码错位而失效的问题。其核心算法LegoLink简单有效：只重算每个chunk开头的k个token（第一个chunk除外），就能消除因位置错位导致的attention sink效应。这好比编译链接，chunk独立编译（缓存KV），使用时拼接并选择性重算少量token来链接。实验表明，仅重算少数开头token（如k=2）就能将精度损失控制在7%以内，同时大幅降低TTFT。这种静态方案比动态选择重算token的方案更高效，对长上下文推理和RAG系统性能提升有重要价值。 ICML25 | EPIC：KV Cache 复用的「编译-链接」范式（附可运行代码复现）",
+    "like_count": 2,
+    "comment_count": 0
+  },
+  {
+    "id": "2036838964250797492",
+    "url": "https://www.zhihu.com/pin/2036838964250797492",
+    "created": 1778400258,
+    "text": "NeurIPS 2024 | Read-ME 把 Dense LLM 变成 MoE 还能推理提速 | 部署 MoE 模型如 Mixtral-8x7B 时，常发现 GPU 显存占用与密集模型相差无几，延迟也未明显下降。这是因为 MoE 架构的推理优势被「全量加载 + 低效调度」的系统设计所抵消，模型架构与系统策略脱节。 Read-ME 论文从算法和系统两侧同时动刀，提出了一套协同设计框架。它发现相邻层之间的 expert 选择高度相关，layer-wise router 大量在做重复工作，因此用一个轻量的 pre-gating router 在推理开始就预测所有层的 expert 选择。 这一解耦设计使系统能进行细粒度专家预取、基于 Belady 算法的最优缓存替换，以及专家感知的批处理。系统在组建 batch 时就知道每个 token 要用哪些 expert，能把激活相同 expert 的 token 打包，大幅减少每个 batch 里 unique expert 的数量，提高计算利用率。 实验表明，Read-ME 用仅 1B tokens 的微调代价，在模型质量上超过了使用更多 tokens 的基线，同时在端到端延迟和尾延迟上均有改善。这套 algorithm-system co-design 的思路，为解决 MoE 推理落地难题提供了一个完整的闭环方案。 NeurIPS 2024 | Read-ME 把 Dense LLM 变成 MoE 还能推理提速 #LLM（大型语言模型）",
+    "like_count": 3,
+    "comment_count": 0
+  },
+  {
+    "id": "2033508747960698850",
+    "url": "https://www.zhihu.com/pin/2033508747960698850",
+    "created": 1777606266,
+    "text": "[想法的图片]",
+    "like_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "2032882889331828499",
+    "url": "https://www.zhihu.com/pin/2032882889331828499",
+    "created": 1777457050,
+    "text": "说人话理解 RoPE：从 sin/cos 位置编码到旋转矩阵，一次讲清楚 | Attention 本身是置换不变的，需要人为注入位置信息。好的位置编码应让 query 和 key 的内积只依赖相对位置差。 Sinusoidal 编码中，sin 和 cos 必须配对使用，因为内积利用恒等式才能消去绝对位置。 每两个维度一组且频率不同，是为了避免不同位置编码碰撞，并覆盖各种距离范围。 RoPE 直接对 Q 和 K 施加旋转，内积自然包含角度差，精确只依赖相对位置。 代码将向量前后切半配对，是一种等价实现，比奇偶间隔更简洁，数学性质一致。 说人话理解 RoPE：从 sin/cos 位置编码到旋转矩阵，一次讲清楚",
+    "like_count": 19,
+    "comment_count": 0
+  },
+  {
+    "id": "2032224643751396353",
+    "url": "https://www.zhihu.com/pin/2032224643751396353",
+    "created": 1777300112,
+    "text": "多 Agent 协作不需要说「人话」？LatentMAS 让 LLM 在隐空间里直接协作 | 多 Agent 系统（MAS）中，Agent 之间的通信通常依赖自然语言，导致信息瓶颈、延迟和错误放大。Princeton、UIUC 和 Stanford 的团队提出 LatentMAS，通过直接传递 hidden states，跳过文本中间环节，实现高效协作。LatentMAS 使用 KV cache 传递“思维”，减少 token 消耗，提高推理速度和准确性。实验结果显示，LatentMAS 在多个基准测试中显著优于传统文本通信方法。 多 Agent 协作不需要说「人话」？LatentMAS 让 LLM 在隐空间里直接协作",
+    "like_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "2032219235523482398",
+    "url": "https://www.zhihu.com/pin/2032219235523482398",
+    "created": 1777298822,
+    "text": "KV Cache 也能「语义共享」？SemShareKV 用 LSH 做到了 | 当两个用户几乎同时向 LLM 提问，语义相似但措辞不同的 prompt 导致 KV cache 重复计算，成为推理吞吐量的核心瓶颈。SemShareKV 通过 LSH（Locality-Sensitive Hashing）在 token embedding 级别做模糊匹配，实现语义相似 prompt 的 KV cache 共享。实验结果显示，这种方法在多个摘要数据集上几乎无损，最高可提升 6.25 倍推理速度，节省 42% 显存。但 LSH 匹配本身有开销，且对动态 prompt 场景的泛化能力需进一步验证。 KV Cache 也能「语义共享」？SemShareKV 用 LSH 做到了",
+    "like_count": 9,
+    "comment_count": 0
+  },
+  {
+    "id": "2032028189040584023",
+    "url": "https://www.zhihu.com/pin/2032028189040584023",
+    "created": 1777253284,
+    "text": "Neurips25 | KVCOMM：让多 Agent 系统的 KV Cache 真正“通起来” | 多 agent 系统中，每个 agent 收到上游消息后需重新 prefill，导致 TTFT 高。KVCOMM 通过“context-aware offset”对齐不同 prefix 引入的偏差，实现 KV cache 复用。实验表明，KVCOMM 在精度不降的前提下显著加速，特别是在长 prompt 场景下效果更佳。Anchor pool 设计利用历史样本预测当前 KV 偏移，有效解决了 multi-agent 系统的效率问题。代码已开源，适合在多 agent 系统中应用。 Neurips25 | KVCOMM：让多 Agent 系统的 KV Cache 真正“通起来”，TTFT 直接砍掉 7.8 倍",
+    "like_count": 25,
+    "comment_count": 0
+  },
+  {
     "id": "2031751761719993041",
     "url": "https://www.zhihu.com/pin/2031751761719993041",
     "created": 1777187368,
     "text": "NSDI26 | DroidSpeak让不同 LLM 之间共享 KV Cache | DroidSpeak 解决了多模型间的 KV Cache 共享问题。在多 Agent 系统中，不同模型处理相同输入前缀时，重复计算严重。DroidSpeak 通过 offline profiling 找到最优的连续层组来重算，其余层直接复用，显著降低了 prefill 成本。实验结果显示，DroidSpeak 在延迟和精度上均有显著提升，适用于多种模型和数据集。 NSDI26 | DroidSpeak让不同 LLM 之间共享 KV Cache",
-    "like_count": 0,
+    "like_count": 7,
     "comment_count": 0
   },
   {
@@ -12,7 +316,7 @@
     "url": "https://www.zhihu.com/pin/2031740184975382142",
     "created": 1777184709,
     "text": "FAST 2026 CacheSlide KV Cache复用：解决 Agent 推理的位置漂移问题 | CacheSlide 是上海交通大学和华为云合作提出的解决方案，专门针对 Agent 场景下的 KV Cache 复用问题。现有的 PDC 和 PIC 方案各有缺陷，PDC 要求固定绝对位置，PIC 引入位置漂移问题。CacheSlide 提出 RPDC（Relative-Position-Dependent Caching），通过 CCPE、Weighted Correction Attention 和 SLIDE 三个核心组件，解决了这些问题。实验结果显示，CacheSlide 在效率和精度上均优于其他方案，尤其是在并行推理和 Beam Search 下表现更佳。 KV Cache 复用的第三条路：FAST 2026 CacheSlide 是怎么解决 Agent 推理的位置漂移问题的 #LLM（大型语言模型） #KV缓存 #论文",
-    "like_count": 4,
+    "like_count": 18,
     "comment_count": 0
   },
   {
@@ -20,7 +324,7 @@
     "url": "https://www.zhihu.com/pin/2031044335584662541",
     "created": 1777018704,
     "text": "MoE 推理的内存墙，被一块多芯粒芯片打穿了？ | Expert Streaming 是一种从芯片架构角度解决 MoE 推理内存瓶颈的方法。MoE 模型中，尽管每次 forward 只激活少量 expert，但仍需将所有 expert 权重加载到 on-chip memory，导致显存不足。FSE-DP（Fully Sharded Expert Data Parallelism）通过 micro-slice streaming、多芯粒全分片并行和 paired-load + token buffering 等技术，实现了高效的专家权重传输和计算，显著减少了 on-chip memory 占用，提升了推理性能。实验结果显示，FSE-DP 在低 batch size 下的单层 latency 和端到端 throughput 均优于现有方法。 MoE 推理的内存墙，被一块多芯粒芯片打穿了？ #分布式cun #高性能分布式系统 #分布式系统",
-    "like_count": 14,
+    "like_count": 33,
     "comment_count": 0
   },
   {

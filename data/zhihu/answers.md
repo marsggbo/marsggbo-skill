@@ -1,6 +1,2269 @@
 # hexin — answers
 
-Total: 128
+Total: 137
+
+
+---
+
+## 模拟计算芯片能帮助LLM的边缘部署吗？
+
+`link: https://www.zhihu.com/question/646605657/answer/2048411283993671118 · created: 1781159307`
+
+
+> 原文：[Frontier: Towards Comprehensive and Accurate LLM Inference Simulation](https://link.zhihu.com/?target=https%3A//arxiv.org/abs/2605.21312)
+
+---
+
+## 1. 前言
+
+你有没有想过，在决定用 PDD 还是 co-location 部署一个 200B 的 MoE 模型之前，能不能先"模拟跑一遍"？
+
+不是假设，是真实的问题。一个 200B 参数的 MoE 模型，合理的配置组合（parallelism 策略 + 批大小 + 架构选型）轻松超过 1000 种。在 64-GPU H100 集群上，扫 100 个配置就要花 12,800–25,600 GPU-hours，成本高达 **$180,000**。没有哪个团队能负担得起这个开销，大多数人的选择是"用个保守的默认配置凑合"，结果是**白白损失了 3–5× 的吞吐量**。
+
+所以 inference simulator 这个方向一直有人做。但做好很难。
+
+这篇来自香港中文大学 + StepFun 的工作——Frontier——正面硬刚了这个问题，给出了目前来看最系统的答案：端到端误差从对比方法的 **51.7% 压到了 2.6%**，还能模拟 1K+ GPU 的集群，跑在普通 CPU 上。
+
+---
+
+## 2. 现有仿真器差在哪？
+
+先交代下背景：现有做 LLM inference simulation 的代表工作有四个——Vidur（微软）、AIConfigurator（NVIDIA）、LLMServingSim 2.0、APEX。
+
+他们的问题集中在两点。
+
+**问题一：架构不完整。**
+
+现有仿真器大多是围绕"一组同质化的单体 replica"来建模的——每个 replica 跑完整的模型路径，调度状态自包含，本地循环执行。这套抽象对传统 co-location serving 够用，但在 disaggregated serving（PDD/AFD）面前就崩了。
+
+PDD（Prefill-Decode Disaggregation）把 prefill 和 decode 拆到两组 GPU 上，KV cache 要跨集群传；AFD（Attention-FFN Disaggregation）进一步把 decode 阶段的 attention 和 FFN 分到不同硬件池。这种架构下，事件图本身就变了——请求要穿越多个 role-specific cluster，KV cache 传输是显式的因果边，MoE EP 引入了 routing 依赖的同步。
+
+你没法"加一个 latency term"来给单体仿真器打补丁，这是架构层面的不匹配。
+
+**问题二：仿真精度不够，会让你选错配置。**
+
+更离谱的是，现有仿真器的精度差到可以让你做出错误决策。
+
+如下图，现有方法对 CUDA Graph 的建模是缺失的。CUDA Graph 会把 decode 的 TPOT 降低 32%–47%（co-location）或 37%–60%（PDD），但同时会因为 batch size 对齐产生 padding overhead，增加 22%–58% 的无效 token 计算。这两个效果耦合在一起，**任何标量 speedup factor 都无法同时捕捉**，但 AIConfigurator 直接忽略了 CUDA Graph 建模。
+
+![](https://picx.zhimg.com/v2-abbcf2ff03341866dca8a6c240a32c60_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='608' height='292'></svg>)
+
+CUDA Graph 对 TPOT 的影响（Frontier 实测）
+
+更严重的是保真度问题。以算子为例：Vidur 用 token count 作为 FlashAttention 的 runtime 预测特征，误差 p50/p95 达到 **55.4%/376.1%**。对于 MoE 的 GroupedGEMM，Vidur 直接没有建模。内存建模同样差：用"总显存减去模型权重"估算 KV cache budget 的方法（analytical 法），会高估 8.1%–27.2% 的可用 KV cache，进而虚报 23.6%–32.4% 的解码吞吐量。下图直接展示了这两个问题的量化结果：
+
+![](https://picx.zhimg.com/v2-a5fde987d8705ce378bf1440a8e45ee5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='584' height='327'></svg>)
+
+简化建模导致的保真度缺口：attention 算子中位误差 22.3%，KV budget 被高估 8.1%–27.2%
+
+这两个误差不是独立的——KV cache 算多了，调度器能接的请求多了，实际 GPU 却装不下，于是发生 preemption，delay 被放大，TPOT 实测比仿真高出一大截。下图是最终结果：
+
+![](https://picx.zhimg.com/v2-915dcb882d31afec96a82e765584a479_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='616' height='468'></svg>)
+
+仿真器选了个看似最优的配置，部署到 vLLM 之后 SLA 直接炸了
+
+仿真器（APEX）选出了一个"最优配置"，但因为算子 runtime 和 KV cache budget 预测过于乐观，这个配置在实际 vLLM 上运行时超出了 SLA 边界。**仿真本来是为了帮你避免踩坑，结果踩坑踩得更准。**
+
+这就是 Frontier 要解决的问题。
+
+---
+
+## 3. Frontier 怎么做的
+
+Frontier 的整体架构分四个模块：
+
+![](https://pic1.zhimg.com/v2-71bd9fb662494ff14ae4027deb005d31_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='541' height='679'></svg>)
+
+Frontier 系统架构（四平面设计）
+
+① **Workload &amp; Config**：描述仿真场景（模型、serving 架构、parallelism、workload 类型）；② **Fidelity Plane**：提供经过校准的算子 runtime、通信开销、KV cache budget 预测；③ **Control Plane**：把 serving 配置编译成可运行的仿真拓扑，处理 disaggregated 架构的跨集群依赖；④ **Execution Plane**：驱动每个 replica 内部的调度-批处理-执行循环，支持 runtime adapter 注入各种优化特性。
+
+核心设计有三点，分别对应两个根本问题。
+
+### 3.1 Control Plane：disaggregated 抽象
+
+这是解决"架构不完整"的关键。Frontier 放弃了单体 replica 抽象，引入 **role-specific cluster worker** 的概念。每种 serving 架构对应不同的 role 集合：
+
+* Co-location：单一集群 C，同时处理 prefill 和 decode
+* PDD：prefill 集群 P + decode 集群 D，二者通过 KV cache 传输同步
+* AFD：prefill 集群 P + attention 集群 A + FFN 集群 F，decode 阶段 A→F→A 每层激活传一次
+
+跨集群的依赖（KV cache transfer、activation transfer、MoE EP 同步）都作为显式事件建模到 DES 事件图里。每次 prefill 完成，触发 KVCacheTransferStart 事件，decode cluster 在 Transfer End 后才能接管请求——排队延迟和同步都从事件图里自然涌现，不是靠"加个 latency 系数"糊的。
+
+对于 reasoning/agent/RL rollout 这类有状态的 workload，Frontier 引入了 **stateful request 抽象**：每个请求可以携带思考轮数、每轮的 tool call 延迟、每轮的 prefill/decode token 计划，在推理结束前持续在集群内重入调度。
+
+### 3.2 Execution Plane：Runtime Adapter 机制
+
+为了把 CUDA Graph、speculative decoding、prefix caching 这些优化建进来，Frontier 设计了 **Runtime Adapter** 抽象——每个 adapter 只改调度循环中一个明确划定的切片：
+
+* **CUDA Graph adapter**：decode batch 按 capture bins（{1,2,4,8,16,32,64}）向上对齐，把 padding 后的 batch 大小报给 Fidelity Plane，同时切换到 kernel-only（无 launch overhead）的计时模式。padding 引入的额外 token、graph 去掉的 launch overhead，两个效果同时被捕捉到。
+* **Speculative decoding adapter**：per-request 维护 planned/verified/accepted/committed token count，MTP 的 draft→verify→commit 循环跟普通 decode work 共享 batch，不同请求可以有不同的 speculative depth 和不同的 acceptance outcome——tail latency 的来源在这里。
+
+这种 adapter 机制的好处是：优化特性不需要硬编码进 simulation core，可以独立开发、独立测试。
+
+### 3.3 Fidelity Plane：三类算子，精准建模
+
+现有方法用 token count 作为所有算子的 proxy feature，这是保真度差的根本原因。Frontier 把算子分成三类，分别用不同的预测策略：
+
+* **Token-count operators**（GEMM、elementwise、norm）：runtime 主要取决于 TP slice 里的 token 数，线性回归或小 random forest 就够了。
+* **Sequence-dependent operators**（attention）：runtime 和 batch 内各请求的序列长度分布强相关，不只是总 token 数。Frontier 用 random forest，feature 包含 batch size、total tokens、prefill/decode 长度的 min/max/分位数。这就能捕捉到 chunked prefill 下的非线性行为。
+* **Routing-dependent operators**（MoE GroupedGEMM）：runtime 和 token-to-expert 路由分布有关。feature 加入了 load balance 统计（variance、max of expert token counts）、expert selection ratio 等。
+
+内存建模方面，Frontier 做了一次 dummy profile run（用假权重初始化模型，跑一次 forward，读 PyTorch allocator snapshot），得到三个分量：权重内存、torch peak 增量（activation scratch）、non-torch residency（NCCL workspace 等）。KV cache budget = 总显存预算 - 权重 - profiled non-KV overhead。这比"总显存减权重"精准得多。
+
+---
+
+## 4. 实验结果
+
+### 4.0 论文怎么证明 Frontier 可信？
+
+在看具体数字之前，先说清楚这篇论文的验证思路——这是判断"结论能不能信"的关键。
+
+Frontier 的验证分三层，从底层到顶层依次累积：
+
+**第一层：算子级 microbenchmark。** 在真实 H800 GPU（BF16 + FP8）上，profiling 各类算子（GEMM、attention、GroupedGEMM、all-reduce）在不同 batch size、序列长度、并行配置下的实际 runtime，和 Frontier 的预测值对比。这一层的目的是隔离其他因素，单独验证 Fidelity Plane 的建模是否准确。
+
+**第二层：组件级验证。** 单独测试各 runtime adapter 是否正确建模了对应的优化效果——CUDA Graph adapter 在不同 workload 下对 TPOT 的缩减比例是否和 vLLM 实测一致，prefix cache 的 block 命中率曲线是否跟踪准确，KV cache budget 和 profiling 实测值的偏差是多少。
+
+**第三层：端到端 testbed 对比。** 这是最关键的一层。用 16 张 H800 搭真实 vLLM 集群，跑真实请求流，把 vLLM 的 TTFT/TPOT/throughput/E2E makespan 作为 ground truth，和 Frontier 仿真结果逐点对比。覆盖两种模型（dense + MoE）× 两种架构（co-location + PDD）× 四种 workload 模式，共 64 个 case。
+
+这个设计的合理之处在于：如果第一层准，第三层就应该准；如果第三层有系统性偏差，能回溯到第一层定位原因。这比"只报端到端误差"更有说服力，因为每一层的误差来源是可以分开解释的。
+
+### 4.1 算子和内存精度
+
+先看算子级精度。在 H800 BF16 下，Frontier 的 attention p50/p95 误差是 **3.5%/14.2%**，Vidur 同样数据下是 **55.4%/376.1%**。FP8 下 Frontier p95 进一步降到 8.8%，而 Vidur 根本不支持 FP8。
+
+KV cache budget 方面，Frontier 在所有 4 种并行配置下把初始 block 数量的误差控制在 **1.89% 以内**；analytical 方法（"总减权重"）高估 14.10%–39.73%。
+
+### 4.2 端到端仿真精度
+
+这是最关键的数字：
+
+![](https://pic1.zhimg.com/v2-36eccc03f3a61bdb906f047f5f1f454e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1271' height='422'></svg>)
+
+端到端精度对比（16 卡 H800 testbed）
+
+在 16 卡 H800 testbed 上，跨 dense（Llama3.1-8B）和 MoE（Qwen3-30B MoE）、co-location 和 PDD、四种 workload pattern（prefill-heavy、decode-heavy、balanced、SharedGPT）：
+
+* **Co-location**：Frontier 在 32 个 case 里跟 vLLM 误差 &lt; 9.37%；Vidur 最差到 45.5%；AIConfigurator 在 decode-heavy 下 E2E makespan 误差飙到 170.0%。
+* **PDD**：Frontier 32 个 case 全部在 10.99% 以内，29 个在 9% 以内；AIConfigurator 在 dense 和 MoE 的 decode-heavy 下 E2E 误差都达到 200%（architecture level 的崩塌，没有 KV cache transfer dependency 建模，任何 scalar 修正都救不了）；Vidur 和 APEX 直接不支持 PDD。
+* **AFD**：在 Step3-316B 上，Frontier 把 TPOT 控制在 6.4% 以内、throughput 在 7.0% 以内。没有其他仿真器能跑 AFD。
+
+和 SOTA 对比（AIConfigurator）：SharedGPT trace 下，E2E latency 误差从 **44.9% → 6.4%**（co-location），**51.7% → 2.6%**（disaggregation）。
+
+---
+
+## 5. 用来干什么
+
+这才是这篇工作真正有意思的地方——四个 use case，**没有一个是之前的仿真器能复现的**。
+
+### 5.1 Pareto frontier 探索
+
+256 卡 H800，部署 Llama-3.3-70B，对比 co-location/PDD/AFD。合理的配置空间有 483,536 种，扣掉 OOM 的还剩 496 个满足 SLA 的。
+
+Frontier 扫完之后给出了三条 Pareto 曲线：
+
+![](https://pic1.zhimg.com/v2-c76cde2c725c9471456e0eb45a73190d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='614' height='337'></svg>)
+
+三种架构的 throughput-generation speed Pareto 曲线
+
+结论：**SLA 松（TTFT ≤ 3000ms）时，PDD 最优**（137.4K toks/s）；**SLA 紧（TTFT ≤ 500ms）时，AFD 反而更好**（116.2K toks/s，PDD 在这个约束下只能做到 100.7K）。
+
+如果没有仿真器，就只能在"松 SLA 下 PDD 看起来更好"这个错误结论上停下来。
+
+### 5.2 异构 GPU 分配
+
+1024 卡集群（H800 + H20 混用，H800 3.49/h, H20 1.59/h），部署 Qwen3-235B-A22B。结论很实际：
+
+* **便宜不代表合适**：把 H20 放在 compute-bound 的 FFN role 上，性价比不升反降（CE &lt; 1.08，被 Gate 1 过滤掉了）；
+* **对的 role 才能省钱**：PDD 下把 D role 换成 H20（P:D=1:1），省了 37% 的成本，性价比提升 33%，SLA 也守住了；AFD 下把 attention cluster 换成 H20，省 16%，CE 提升 12%。
+
+### 5.3 RL Rollout 动态 parallelism 切换
+
+4000 条 trajectory 的 burst，5% 是 heavy tail。
+
+* **Layout A**（DP=32,PP=16,TP=2）：高 DP，适合 burst；
+* **Layout B**（DP=8,PP=16,TP=8）：宽 TP，适合 tail 阶段 per-trajectory decode；
+* 动态策略：burst 阶段用 A，active trajectory &lt; 10% 时切换到 B。
+
+结果：makespan 从 528.8s → 259.1s，decode throughput **提升 2.04×**。
+
+---
+
+## 6. 讨论
+
+先说我认为这篇工作好的地方。
+
+最本质的贡献是把"disaggregated serving 仿真"这件事做到了工程层面可用。PDD 在工业界（DistServe、Mooncake）已经是标配，AFD 也在 MegaScale-Infer 里被验证过，但现有仿真器在这块全是空白。Frontier 填的这个空，不是"做了个能跑的 prototype"，而是误差在 10% 以内的 decision-grade 仿真。
+
+三类算子的分类（token-count / sequence-dependent / routing-dependent）也挺扎实，是从真实的 kernel 行为出发做的归纳，不是拍脑袋分的。CUDA Graph 的双效果建模（padding + launch overhead 各自独立捕捉）这个细节我觉得做得对，这个坑确实不好踩。
+
+然后谈谈我对"这个仿真器到底可不可信"这个问题的看法——毕竟验证方法设计得再合理，也有它覆盖不到的地方。
+
+**大规模准确性没有 ground truth。** 论文端到端验证用的是 16 卡 H800。但 use case 部分拿去用的是 256 卡（Pareto 探索）和 1024 卡（异构 GPU 分配）。两者之间差了 16–64×，这中间的 gap 完全没有实测验证。论文的隐含假设是算子级和端到端误差在更大规模下保持稳定，但大规模下集合通信的 congestion 模式、跨集群的 scheduling 交互、rack-level 的 incast 效应——这些在 16 卡上几乎观察不到，却可能在真实的 1K GPU 集群上出现。文中对此没有任何量化分析。
+
+**校准数据对硬件和框架版本敏感。** Frontier 的算子预测模型是用 H800 BF16/FP8 profiling 数据训练的。换到 H100、A100、或者 AMD MI300x——calibration 数据直接作废，需要重新采集。更新 vLLM 版本同理：v0.10.2 之后 vLLM 持续迭代调度逻辑，CUDA Graph 的 capture bins 也可能改动。论文没有说清楚 recalibration 的成本和频率，这对长期使用是个实际问题。
+
+**MoE GroupedGEMM 的 p95 误差仍然非平凡。** Frontier 的 GroupedGEMM 预测 p50/p95 是 4.4%/17.2%。对于 GroupedGEMM 占主导的大规模 MoE（比如 Qwen3-235B-A22B），p95 17% 的单算子误差叠加多层之后对尾延迟的影响有多大？论文没有单独分析这个误差传播链。
+
+**workload 分布是个盲点。** 实验用的四种 workload 模式都是事先固定分布的。但生产流量是非平稳的：早高峰和夜间流量特征不同，用户行为随应用演进变化。Frontier 能处理给定 trace 的仿真，但对分布 shift 有多鲁棒——完全没有讨论。
+
+综合来看，Frontier 的验证在现有仿真器里是最扎实的，三层验证结构（算子→组件→端到端）也是正确的思路。但"16 卡 → 1K 卡"这个尺度 gap 是我目前最不放心的地方。如果有机会在更大规模的 testbed 上做一次 validation，说服力会强得多。
+
+对于做 LLM serving 研究、需要快速探索部署配置空间的团队来说，这工具是有用的：在 CPU 上跑仿真，误差 &lt; 10%，不用花 $180,000 扫集群。代码还没有开源（截稿时），等出来值得拉下来配合真实 profiling 数据用用。
+
+---
+
+> 如果有用，欢迎评论区交流，或者指出理解有偏差的地方。
+
+
+---
+
+## const常量折叠？
+
+`link: https://www.zhihu.com/question/25583301/answer/2039393750548493611 · created: 1779009360`
+
+
+## 用编译器「常量折叠」的思路压缩 LLM？这篇 EuroSys 2026 的工作把 FFN 参数砍了 80%
+
+> 原文：[LLMFolder: Revisiting Constant Folding in Large Language Models](https://link.zhihu.com/?target=https%3A//dl.acm.org/doi/10.1145/3767295.3769339)（EuroSys 2026） 作者：Gansen Hu, Zhaoguo Wang, Wei Huang, Jinglin Wei, Haibo Chen（上交 IPADS 实验室）
+
+---
+
+## 1. 前言
+
+今天想和大家聊一篇角度很新颖的工作——LLMFolder，来自上交 IPADS 实验室，发在 EuroSys 2026。
+
+这篇论文的出发点是个很自然的问题：LLM 太大了，部署成本高。缓解这个问题的主流手段是**剪枝（pruning）**——把不重要的权重去掉。但剪枝有个大坑：**压缩比一高，精度掉得很厉害**。比如压缩到 80%，accuracy 可能就已经难以接受了。
+
+作者换了个角度：既然剪枝是"选择性地丢掉权重"，能不能换一种**不丢权重、而是把权重合并**的思路？
+
+这个思路的灵感来自编译器里的经典优化：**常量折叠（Constant Folding）**。
+
+先看一张图感受一下背景：LLM 推理的时间花在哪里？
+
+![](https://pica.zhimg.com/v2-fca6cbf8d3e753e233c006d2fa55a02b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='634' height='319'></svg>)
+
+图(b)是一块 RTX 4090 上的理论时间分解：**FFN 的 I/O 占了 78.2%**，而实际计算（FFN Compute）只有 1.6%。LLM 推理是一个极度内存带宽受限的任务，FFN 权重的 I/O 是最大瓶颈。减少 FFN 参数量 = 直接减少 I/O 压力。
+
+---
+
+## 2. 背景：编译器里的常量折叠是什么？
+
+先解释下什么是常量折叠，这是这篇论文核心 insight 的出发点。
+
+在编译器优化里，常量折叠是指：**把对常量的计算在编译期就预先算好，运行期直接用结果**。
+
+最简单的例子：
+
+```
+x = 2 + 3      // 编译期就能算出 x = 5，不需要运行时再算
+y = x * 2      // y = 10，同样可以预计算
+```
+
+更重要的是对线性函数的折叠：如果 f(x) = Ax + b 和 g(x) = Cx + d 都是线性变换，那么：
+
+![\\g(f(x)) = C(Ax + b) + d = (CA)x + (Cb + d)](https://www.zhihu.com/equation?tex=%5C%5Cg%28f%28x%29%29+%3D+C%28Ax+%2B+b%29+%2B+d+%3D+%28CA%29x+%2B+%28Cb+%2B+d%29)
+
+两个矩阵乘法可以合并成一个！参数量直接减半。
+
+现在把这个思路搬到 Transformer 的 FFN 层上。
+
+---
+
+## 3. 为什么 FFN 可以「折叠」？
+
+先看一下常量折叠应用到 FFN 的直观图示：
+
+![](https://picx.zhimg.com/v2-24b5d2b4cbdcd44cf6c7af844dcf656f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='620' height='327'></svg>)
+
+Transformer FFN 层的结构是：
+
+![\\\text{FFN}(x) = W_2 \cdot \sigma(W_1 x + b_1) + b_2](https://www.zhihu.com/equation?tex=%5C%5C%5Ctext%7BFFN%7D%28x%29+%3D+W_2+%5Ccdot+%5Csigma%28W_1+x+%2B+b_1%29+%2B+b_2)
+
+其中 ![\sigma](https://www.zhihu.com/equation?tex=%5Csigma) 是激活函数，![W_1 \in \mathbb{R}^{4d \times d}](https://www.zhihu.com/equation?tex=W_1+%5Cin+%5Cmathbb%7BR%7D%5E%7B4d+%5Ctimes+d%7D)，![W_2 \in \mathbb{R}^{d \times 4d}](https://www.zhihu.com/equation?tex=W_2+%5Cin+%5Cmathbb%7BR%7D%5E%7Bd+%5Ctimes+4d%7D)。
+
+如果激活函数 ![\sigma](https://www.zhihu.com/equation?tex=%5Csigma) 是**线性的**（比如直接是恒等映射），那么：
+
+![\\\text{FFN}(x) = W_2(W_1 x + b_1) + b_2 = \underbrace{(W_2 W_1)}_{\text{折叠后的} W_\text{fold}} x + \underbrace{(W_2 b_1 + b_2)}_{b_\text{fold}}](https://www.zhihu.com/equation?tex=%5C%5C%5Ctext%7BFFN%7D%28x%29+%3D+W_2%28W_1+x+%2B+b_1%29+%2B+b_2+%3D+%5Cunderbrace%7B%28W_2+W_1%29%7D_%7B%5Ctext%7B%E6%8A%98%E5%8F%A0%E5%90%8E%E7%9A%84%7D+W_%5Ctext%7Bfold%7D%7D+x+%2B+%5Cunderbrace%7B%28W_2+b_1+%2B+b_2%29%7D_%7Bb_%5Ctext%7Bfold%7D%7D)
+
+原来需要存 ![W_1](https://www.zhihu.com/equation?tex=W_1)（![4d \times d](https://www.zhihu.com/equation?tex=4d+%5Ctimes+d)）和 ![W_2](https://www.zhihu.com/equation?tex=W_2)（![d \times 4d](https://www.zhihu.com/equation?tex=d+%5Ctimes+4d)），参数量 ![8d^2](https://www.zhihu.com/equation?tex=8d%5E2)；折叠后只需要存 ![W_\text{fold}](https://www.zhihu.com/equation?tex=W_%5Ctext%7Bfold%7D)（![d \times d](https://www.zhihu.com/equation?tex=d+%5Ctimes+d)），参数量 ![d^2](https://www.zhihu.com/equation?tex=d%5E2)，直接砍掉 **87.5%**！
+
+这就是常量折叠思路应用到 LLM 的核心逻辑。
+
+---
+
+## 4. 核心挑战：GELU 不是线性的
+
+问题来了——现代 LLM 基本都用 GELU（或者 SwiGLU）这类**非线性**激活函数，不能直接套常量折叠。
+
+GELU 的定义是：
+
+![\\\text{GELU}(x) = x \cdot \Phi(x)](https://www.zhihu.com/equation?tex=%5C%5C%5Ctext%7BGELU%7D%28x%29+%3D+x+%5Ccdot+%5CPhi%28x%29)
+
+其中 ![\Phi(x)](https://www.zhihu.com/equation?tex=%5CPhi%28x%29) 是标准正态分布的 CDF，这是光滑的非线性函数。有了非线性，![\sigma(W_1 x)](https://www.zhihu.com/equation?tex=%5Csigma%28W_1+x%29) 就没法和 ![W_2](https://www.zhihu.com/equation?tex=W_2) 合并了。
+
+![](https://pica.zhimg.com/v2-53b9d44341a4ad1d18e7eab7df6c9695_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='620' height='234'></svg>)
+
+从图中可以看到：在输入接近 0 的区间，GELU 曲线确实接近线性；但在大正值区域增长率与线性不同，在负值区域则会压制到接近 0。这个「部分接近线性」的特性是 LLMFolder 能成立的关键直觉。
+
+那怎么办？
+
+---
+
+## 5. LLMFolder 的解法：分段线性近似 + 在线回退
+
+LLMFolder 的核心思路是：**观察 GELU 的输入分布，在高频出现的输入范围内，用线性函数近似 GELU**。
+
+从实践中观察到：Transformer 的 pre-activation 值大多集中在一个相对固定的数值范围内（绝大部分值不是极端大或极端小的 outlier）。
+
+![](https://picx.zhimg.com/v2-b2ac6ff25fd4146ede2c645b943da12b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='620' height='309'></svg>)
+
+上图是不同模型的 pre-activation 分布密度图。可以看到绝大多数输入值集中在一个相对窄的范围内（分布峰值明显，尾部很轻），这为线性近似提供了统计基础。
+
+在这个「常见范围」内，GELU 的曲线近似于一条直线：
+
+![\\\text{GELU}(z) \approx \alpha z + \beta \quad \text{（对于高频输入范围内的 } z \text{）}](https://www.zhihu.com/equation?tex=%5C%5C%5Ctext%7BGELU%7D%28z%29+%5Capprox+%5Calpha+z+%2B+%5Cbeta+%5Cquad+%5Ctext%7B%EF%BC%88%E5%AF%B9%E4%BA%8E%E9%AB%98%E9%A2%91%E8%BE%93%E5%85%A5%E8%8C%83%E5%9B%B4%E5%86%85%E7%9A%84+%7D+z+%5Ctext%7B%EF%BC%89%7D)
+
+有了这个线性近似，FFN 就可以折叠了：
+
+![\\\text{FFN}(x) \approx W_2 \cdot (\alpha W_1 x + \beta \mathbf{1}) + b_2 = (\alpha W_2 W_1) x + (W_2 \beta \mathbf{1} + b_2) = W_\text{fold} x + b_\text{fold}](https://www.zhihu.com/equation?tex=%5C%5C%5Ctext%7BFFN%7D%28x%29+%5Capprox+W_2+%5Ccdot+%28%5Calpha+W_1+x+%2B+%5Cbeta+%5Cmathbf%7B1%7D%29+%2B+b_2+%3D+%28%5Calpha+W_2+W_1%29+x+%2B+%28W_2+%5Cbeta+%5Cmathbf%7B1%7D+%2B+b_2%29+%3D+W_%5Ctext%7Bfold%7D+x+%2B+b_%5Ctext%7Bfold%7D)
+
+对于**绝大部分 token**：只需要加载 ![W_\text{fold}](https://www.zhihu.com/equation?tex=W_%5Ctext%7Bfold%7D)（参数量 ![d^2](https://www.zhihu.com/equation?tex=d%5E2)），不需要加载 ![W_1](https://www.zhihu.com/equation?tex=W_1) 和 ![W_2](https://www.zhihu.com/equation?tex=W_2)（参数量 ![8d^2](https://www.zhihu.com/equation?tex=8d%5E2)）。
+
+但对于少数落在「常见范围」以外的 **outlier 输入**，线性近似误差太大，不能用。
+
+下面是 LLMFolder 的整体架构：
+
+![](https://picx.zhimg.com/v2-8e1da1f124f24d65173782cc9a33687b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='620' height='380'></svg>)
+
+离线阶段：用标定数据集计算激活函数的线性范围，生成折叠矩阵和在线预测器。在线阶段：推理时先用 Speculative Approximation 走折叠路径，如果输入不在范围内则触发 Result Fixing（fallback）。
+
+LLMFolder 引入了一个**在线预测器（Online Predictor）**：
+
+* 在 inference 时，lightweight predictor 检测当前 token 的 pre-activation 是否落在常见范围内
+* 如果是：走折叠路径（快，参数少）
+* 如果是 outlier：fall back，临时加载原始 ![W_1](https://www.zhihu.com/equation?tex=W_1)、![W_2](https://www.zhihu.com/equation?tex=W_2)，用原始 GELU 计算
+
+这个设计的关键点：
+
+* **折叠是离线完成的**：训练后将 ![W_1](https://www.zhihu.com/equation?tex=W_1)、![W_2](https://www.zhihu.com/equation?tex=W_2) 折叠成 ![W_\text{fold}](https://www.zhihu.com/equation?tex=W_%5Ctext%7Bfold%7D)，部署时只存 ![W_\text{fold}](https://www.zhihu.com/equation?tex=W_%5Ctext%7Bfold%7D)
+* **原始权重按需加载**：对于 outlier token，才需要从存储加载原始权重（这是少数情况）
+* **predictor 开销极小**：只需判断输入是否在范围内，不影响主路径
+
+图中直观展示了「推测近似」流程：先用折叠权重计算结果，再检查哪些 neuron 的输入实际上超出了线性范围，对这些 neuron 用原始权重修正结果（Result Fixing）。这样大多数 token 只需访问压缩后的 ![W_\text{fold}](https://www.zhihu.com/equation?tex=W_%5Ctext%7Bfold%7D)，内存带宽节省显著。
+
+---
+
+## 6. 与 Pruning 的本质区别
+
+LLMFolder 经常被拿来和 pruning 比较，但两者的思路截然不同：
+
+**Pruning**：直接把部分权重置零或移除。高压缩比时，模型"能力"实实在在地少了，精度掉是必然的。
+
+**LLMFolder**：权重不丢，而是重新组织——把两个矩阵"合并"成一个，信息量没有损失（对线性激活而言是精确等价，对 GELU 近似情况下是高频输入范围内的精确近似 + outlier 的精确 fallback）。
+
+这是本质差异，也是 LLMFolder 在精度上大幅领先 pruning 的根本原因。
+
+---
+
+## 7. 实验设置
+
+实验在多个 7B 级别模型上进行（论文测了 Llama 系列等模型），对比基线包括：
+
+* **原始模型**（无压缩）
+* **SOTA 剪枝方法**（如 SparseGPT、Wanda 等）
+* **量化方法**
+
+实验平台：使用了 vLLM 和 HuggingFace 两套推理栈，分别评估 end-to-end 性能。
+
+评估维度：
+
+* FFN 参数压缩比
+* 下游任务 accuracy（与 SOTA pruning 对比）
+* end-to-end 推理加速比
+* 与量化/剪枝组合后的联合效果
+
+---
+
+## 8. 实验结果分析
+
+### 8.1 FFN 参数压缩：80%
+
+LLMFolder 在 FFN 层实现了 **80% 参数压缩**，接近理论上限（线性激活下 87.5%）。对于一个 7B 的 Llama 模型，这意味着显存占用和内存带宽需求大幅下降。
+
+### 8.2 精度 vs 剪枝方法：领先高达 65%
+
+**这是最亮眼的数据**。在同等压缩比下，LLMFolder 的 accuracy 比 SOTA 剪枝方法高 **最多 65%**。
+
+![](https://picx.zhimg.com/v2-4f77c2f5205280f65520191a6d00f21f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='620' height='298'></svg>)
+
+图中横轴是压缩比，纵轴是 Perplexity（越低越好）。蓝色方块是 LLMFolder，在 0.1~0.8 的压缩比区间内 perplexity 几乎平稳，而其他方法（GPTQ、AWQ 等）在高压缩比时急剧劣化。Table 3 有更完整的数字对比：
+
+![](https://picx.zhimg.com/v2-55d02f9a62e6be58076ac1aa39c6b2e3_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='688'></svg>)
+
+本质原因：
+
+* Pruning 以高压缩比运行时，丢失的权重信息无法恢复，精度崩塌
+* LLMFolder 的折叠操作对高频输入是精确的（线性近似误差小），outlier 有 fallback 兜底，精度损失被控制在很小的范围
+
+### 8.3 与量化+剪枝组合：92.5% 参数压缩，仅 4.4% 精度损失
+
+更惊艳的是：把 LLMFolder 和量化（Quantization）、剪枝（Pruning）三者组合起来，对 7B 模型实现了 **92.5% 参数压缩**，而 average accuracy 只损失了 **4.4%**。
+
+论文专门强调：**单独用量化或单独用剪枝，或者两者组合，都无法同时实现这个压缩率和精度**。LLMFolder 打开了一个新的组合空间。
+
+### 8.4 端到端推理加速
+
+* **vLLM**：1.6× 加速，10.9% accuracy 损失
+* **HuggingFace**：1.4× 加速，同样是 10.9% accuracy 损失
+
+vLLM 比 HuggingFace 加速更多，原因是 vLLM 的 continuous batching 对内存带宽更敏感，参数量减少带来的 memory-bandwidth 收益在 vLLM 上放大更明显。
+
+![](https://pica.zhimg.com/v2-83637e74ecb53862cb427112c41df1cc_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='620' height='766'></svg>)
+
+图(a)：随着 FFN 压缩比提高，FFN 层加速比线性增长，最高约 1.86×；E2E 加速在压缩比 0.7~0.8 时达到约 1.5×。图(b)：HBM 内存访问量随压缩比单调下降，Wikitext2/C4/PTB 三个数据集表现一致，说明折叠效果与 calibration dataset 的选择无关。图(c)：batch size 增大后 E2E 加速比有所下降，但 batch=1 时仍有 1.28× 加速。
+
+对于大模型（如 Falcon-40B），加速更为显著：
+
+压缩比 70% 时，Falcon-40B 推理加速可达 **6.97×**！大模型在单卡上内存带宽更紧张，LLMFolder 的 I/O 节省带来的收益倍增。
+
+另外，实际访问的原始权重比例随压缩比降低：
+
+![](https://pic1.zhimg.com/v2-d7c5a5392244f6f4807b1cea515fbd0b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='620' height='254'></svg>)
+
+压缩比 80% 时，推理实际访问的原始权重只剩不到 10%——说明大部分 token 都走了折叠路径，fallback 比例极低。
+
+1.6× 加速 + 10.9% 精度代价，这个比值在需要高 throughput 的实际部署场景里相当有吸引力，尤其是对时延不敏感、更在意 cost 的 batch inference 场景。
+
+---
+
+## 9. 个人 take
+
+这篇论文让我觉得眼前一亮的点：**跨领域 analogy 用得非常漂亮**。
+
+常量折叠是编译器里几十年前的经典优化，把它迁移到 LLM 权重压缩这个场景，思路非常简洁——不是"丢掉权重"而是"合并权重"。对模型语义的破坏远小于剪枝，这也直接解释了精度为什么大幅领先。
+
+**GELU 的线性近似是这篇工作成立的关键假设**。其实这个假设并不显然——pre-activation 分布的「高频区间」到底有多宽？如果模型的 pre-activation 分布不集中（比如在极端 fine-tune 后），线性近似是否还能成立？论文里对这个分布做了充分的 empirical 验证（虽然我这里没有原图），但这个假设在不同模型、不同任务上的鲁棒性值得持续关注。
+
+**在线 predictor 的设计也是个 tricky 的地方**。Predictor 本身要轻量（否则 overhead 反而把加速吃掉），但也要准确（预测错了 outlier 会导致精度损失）。这里有一个 precision-recall 的 tradeoff：如果太保守（把很多正常值也判断为 outlier，走 fallback），加速比会下降；如果太激进（把 outlier 误判为正常值），精度会损失。
+
+**与量化结合的 92.5% 压缩率是最重要的实用贡献**。三种技术的正交性是真的强：量化减少每个参数的比特数，剪枝减少参数数量，LLMFolder 减少需要激活路径上的参数量，三者作用维度不同，可以叠加。
+
+当然也有值得关注的局限：
+
+* 目前只针对 FFN 层（Attention 层的 Q/K/V/O 矩阵没有处理）——但 FFN 占 LLM 参数的大头，所以影响够大
+* Outlier fallback 的延迟：如果某个 batch 里 outlier token 比例高，实际加速比会下降，worst case performance 值得关注
+* SwiGLU（现在最流行的激活）的处理：SwiGLU 引入了 gate 机制，折叠逻辑更复杂，论文里的处理方式值得仔细看
+
+总体来说，这是一篇**思路新颖、技术扎实、数字好看**的工作，"从编译器借一把刀来砍 LLM 参数"这个角度本身就值得一读。
+
+
+---
+
+## Attention mechanism目前有什么缺点和改进空间？
+
+`link: https://www.zhihu.com/question/305644438/answer/2039386344347153119 · created: 1779007594`
+
+
+> 原文：[SolidAttention: Low-Latency SSD-based Serving on Memory-Constrained PCs](https://link.zhihu.com/?target=https%3A//www.usenix.org/system/files/fast26-zheng.pdf)（FAST 2026，上海交通大学 IPADS 实验室）
+
+---
+
+## 1. 前言
+
+你有没有想过，在自己的笔记本上本地跑一个长上下文的 LLM，体验一下"私有 AI 助手"到底是什么感觉？
+
+这个想法很美好，现实很骨感。
+
+现在主流的笔记本——就是那种配个 16GB 内存、8GB 显存的标配机器——在面对 128k token 上下文时，连 KV cache 都装不下。一个 8B 参数的模型，光 KV cache 就需要 **16GB 内存**，比模型权重本身多 4 倍多。
+
+所以现在的本地部署方案（llama.cpp、Ollama 这些）基本默认你的内存够用，但大多数人的机器其实根本不够用。
+
+今天想和大家聊聊 FAST 2026 的这篇工作——**SolidAttention**。他们的思路是：内存不够，SSD 来凑。但怎么凑，里面有很多讲究。
+
+---
+
+## 2. 核心矛盾：KV Cache 的内存危机
+
+先交代下背景。
+
+LLM 的 autoregressive decode 阶段，每生成一个 token，都需要把之前所有 token 的 Key 和 Value 矩阵拿出来做 attention。为了不重复计算，就把这些 K/V 缓存下来，这就是 KV cache。
+
+问题在于，**KV cache 随着序列长度线性增长**。如下图左，Llama-3.1-8B（INT4 量化权重）在 128k context 下，KV cache 需要 16GB，是模型权重的 4 倍多。而右图说明了 SSD 的特性：读取单元越大，带宽越高。4KB 小块随机读约 1GB/s，1MB 以上大块读能到 6GB/s——相差 6 倍。
+
+![](https://pic1.zhimg.com/v2-d6c7d946409cc8f1cd0f536a214fcd74_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='768' height='340'></svg>)
+
+KV Cache 内存增长和 SSD 带宽特性
+
+更难受的是，市面上大部分笔记本只有 8-16GB 内存、6-8GB 显存。在这种机器上，128k context 不是说"慢一点"，是直接装不下。
+
+**那量化 KV cache 行不行？**
+
+INT4 量化之后效果很差——KV cache 里有很多异常值（outlier），激进量化直接把精度打烂了（Qwen-2.5-7B 的精度从 71.39% 暴跌到 18.63%）。
+
+**那把 KV cache 卸载到 SSD 呢？**
+
+这个方向是对的，但之前的工作（比如 FlexGen）有一个核心假设：系统里有足够多的并发请求，让 SSD 加载数据的时候，GPU 还有别的请求可以算。
+
+如下图，高并发场景（上）：Request 1 在等 KV cache 的时候，GPU 可以跑 Request 2 的 FFN——I/O 延迟被"藏住"了。低并发场景（下）：只有一个请求，KV cache 加载期间 GPU 完全空转（GPU Idle），SSD 等 GPU 算完也在空转（SSD Idle）。
+
+![](https://picx.zhimg.com/v2-d7bdea6b327f4de3416bdc67a2fc92df_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='760' height='388'></svg>)
+
+高并发 vs 低并发场景下的 SSD 访问延迟
+
+笔记本本地推理的场景，**根本就没有并发**。只有你一个人在用，batch size=1。SSD 加载数据的时候，GPU 只能干等。加载 1k token 的 KV cache（128MB）大约需要 40ms，这能占一次 decode step 将近一半的时间。
+
+---
+
+## 3. 问题的根源：SSD 和稀疏 Attention 天生相克
+
+现有 SSD offloading + attention sparsity 方案的毛病，不只是"并发不够"这一个。
+
+**更深层的矛盾是：动态稀疏 attention 的访问模式，和 SSD 的特性天生相克。**
+
+动态稀疏 attention 每个 decode step 都要根据当前 query，动态选出需要的 KV 块，加载进来。这些块是**按 token 粒度选的**，单块可能只有几 KB，产生大量细粒度随机 I/O，SSD 带宽利用率极低。
+
+SolidAttention 的核心 insight：**要把稀疏 attention 算法和 SSD 存储管理协同设计（co-design）**，让数据访问的粒度对齐 SSD 的特性，同时精细编排计算和 I/O 的重叠。
+
+---
+
+## 4. SolidAttention 整体架构
+
+三个核心挑战，三个解决模块：
+
+* **挑战 1**：如何在不牺牲精度的情况下，把细粒度访问变成粗粒度访问？→ **KV Consolidator**
+* **挑战 2**：动态 attention 在算完才知道需要哪些块，来不及提前加载，怎么办？→ **Speculative Prefetcher**
+* **挑战 3**：内存受限时，GPU 读数据和 SSD 预取数据可能发生冲突，怎么安全调度？→ **SSD-aware Scheduler**
+
+如下图，SolidAttention 系统架构：整个 KV cache 存在 SSD 里，decode 时按需动态加载到 GPU VRAM。三个模块协同工作，把 I/O 延迟尽量藏在计算背后。
+
+![](https://picx.zhimg.com/v2-cf1c0cc15fe7d7e51f45fe3afd808804_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='552' height='385'></svg>)
+
+SolidAttention 系统架构
+
+**Block-wise 注意力稀疏**。SolidAttention 把 KV cache 按 context 长度切成三类 block。如下图，用当前 query Q 和每个 block 的 representative vector（代表向量）做相似度计算，选出 Top-K 个 block 参与 attention 计算：
+
+* **Init Block**（绿色）：固定覆盖开头几个 token，处理 attention sink 现象
+* **Local Block**（蓝色）：滑动窗口，覆盖最近生成的 token
+* **Selected Block**（棕色）：每次 decode 时动态选出的高相关 block
+
+![](https://picx.zhimg.com/v2-6b34b0df4d4109878b3737b01aa17dee_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='642' height='510'></svg>)
+
+Block-wise 动态稀疏 Attention 的分块和选择流程
+
+类比理解：把整本书按段落分好，每次提问不是把整本书都翻一遍，而是先看每段的"摘要"（representative vector），只把最相关的几段拿出来精读（attention 计算）。大幅减少了需要从 SSD 加载的 KV cache 量
+
+---
+
+## 5. KV Consolidator：让 K 和 V "手拉手"走，翻倍带宽
+
+**问题**：Block 越大，SSD 读的粒度越大，带宽利用率越高——但每个 block 的 representative vector 要概括更多 token，精度会下降。
+
+如下图，block size 从 32 增大到 256，两个模型的 recall rate 都明显下降，从约 90% 跌到约 60%：
+
+![](https://picx.zhimg.com/v2-c1307218a81bf2516097b09e86db23c1_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='623' height='276'></svg>)
+
+Block Size 对 Recall Rate 的影响
+
+所以 SolidAttention 选用 block size=32，精度损失很小。但 32 token 的 block 在 SSD 上读起来还是太碎了——怎么在不增大 block 的情况下提高传输粒度？
+
+**解法**：把 K 和 V 交织在一起，把每次 I/O 的传输单元翻倍。
+
+K 和 V 的形状完全一样（都是 N×H 的矩阵）。如下图：
+
+* **Typical**（上）：K 和 V 分开存、分开读，同一块 block 要读两次 SSD
+* **Interleaved**（下）：按 token 粒度交织，K₁V₁K₂V₂...，一次 SSD 读把 K 和 V 都搬过来
+
+![](https://picx.zhimg.com/v2-806121f2cc014fffbbcc6382f8f8e2b5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='635' height='250'></svg>)
+
+分离存储 vs 交织存储的 KV cache I/O 对比
+
+传输单元翻倍，I/O 次数减半，SSD 带宽利用率 double。**精度完全不受影响**——每个 block 里的 token 数量没变，representative vector 质量不变。
+
+**工程实现**：如下图，对比两种 projection 计算方式：
+
+![](https://picx.zhimg.com/v2-9def67c11f66563510e3f9f344f7ca50_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='640' height='369'></svg>)
+
+分离权重 vs 拼接权重的 projection 计算
+
+在模型初始化时把 K projection 和 V projection 的权重矩阵预先拼接成一个矩阵（Weight K+V），用一次矩阵乘法直接生成交织的 K/V 输出，避免运行时 reshape 开销。attention kernel 里用 stride=2H 的访问模式来逻辑上分开 K 和 V，实测延迟开销 ≤2%。
+
+---
+
+## 6. Speculative Prefetcher：历史会重演，让 SSD 提前读
+
+**问题**：每一层选哪些 KV block，是根据这一层的 query 计算出来的。在计算这一层 attention 之前，下一层要哪些 block 根本不知道。
+
+等到上一层算完再去 SSD 读，就产生了 **blocking latency**——GPU 干等 SSD。
+
+**突破口：相邻层之间的 block 选择结果高度相似。**
+
+如下图，在 LongBench 的 8 个 benchmark 上统计，跨层的 block 选择相似度平均在 **75%~90%** 之间，两个模型都一致：
+
+![](https://pic1.zhimg.com/v2-a1951f11d925d65d790d89cd5c71e7ee_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='648' height='280'></svg>)
+
+跨层 Block 选择相似度（Llama-3.1-8B 和 Qwen-2.5-7B）
+
+直觉也说得通：模型在处理同一个输入时，不同层关注的 context 区域往往差不多（比如处理代码补全，每层都在关注函数定义那几个 token）。
+
+有了这个观察，就可以做 **speculative prefetching**：用上一层的选择结果预测下一层需要哪些 block，提前发起 I/O。如下图：
+
+* **(a) 预取命中**：上一层选的块 {1,3}，提前加载到 DRAM，下一层实际也选 {1,3}，直接用
+* **(b) 预取失误**：预取了块 6，但实际需要的是块 3，把块 3 直接覆写上去，不需要重排序
+
+![](https://pica.zhimg.com/v2-53547e8b839e35baf38a28aefd1ba1e3_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='606' height='203'></svg>)
+
+Speculative Prefetch 的命中和 miss 处理
+
+整个单层的数据流时间线如下图。可以看到，SSD 预取（蓝色箭头）是在上一层的 FFN 计算期间就提前开始了：
+
+![](https://picx.zhimg.com/v2-3ff52c5d6e9102ae61359c6e31e0dc23_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='768' height='378'></svg>)
+
+单层 LLM decode 的数据流时间线
+
+时间线解读（以 Layer 1 为例）：
+
+* **t₁→t₂**：Layer 0 的 FFN 运行期间，SolidAttention 就开始 prefetch Layer 1 需要的 KV 块（VRAM←SSD）
+* **t₂→t₃**：Layer 1 执行 token selection（select），确认命中 {a,c}，miss 了 {b}（橙色虚线框）
+* **t₃→t₄**：补传 miss 的块 {b}，同时 GPU 算当前 token 的 kv proj，新 KV pair 写到 DRAM
+* **t₄→t₅**：Layer 1 self-attention 计算，同时异步 prefetch Layer 2 的 KV 块（DRAM←SSD）
+* **FFN 期间**：把 DRAM 里预取的数据传到 VRAM，同时把 Layer 1 新 KV pair 写回 SSD
+
+GPU、CPU、SSD 几乎全程都在忙，没有大段空闲。
+
+---
+
+## 7. SSD-aware Scheduler：DAG 调度，同步点复用
+
+**问题**：内存受限时，同一块 DRAM 缓冲区既要给 GPU 提供数据，又要接收 SSD 预取来的数据。Naive 实现是等所有 I/O 完成 GPU 再开始算——GPU 和 SSD 串行，效率极低。
+
+如下图，三种调度方案对比（一层 attention module 的完整时间线）：
+
+![](https://pica.zhimg.com/v2-8c7316456d67e8e90383fc390dbe6e0a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='646' height='780'></svg>)
+
+三种调度方案的时间线对比
+
+* **(a) 不用 attention sparsity**：没有 select/load 步骤，但 GPU 和 SSD 之间有多个 Sync 等待点
+* **(b) Naive + attention sparsity**：有 5 个 Sync 点，大量 GPU 空等，是最慢的方案
+* **(c) SSD-aware schedule**（SolidAttention）：只有 3 个 Sync 点，GPU 计算和 SSD I/O 大量重叠，关键路径更短
+
+**两个核心设计**：
+
+**1. 微任务分解 + 细粒度重叠**
+
+把 attention module 分解成微任务：q proj → kv proj → select → prefetch → load → attention → store
+
+用 DAG（有向无环图）建模任务依赖关系。调度器找出关键路径，优先执行关键路径上的任务。非关键任务（比如写回新 KV 到 SSD）在不影响关键路径的情况下尽量并行。
+
+**2. 同步点复用**
+
+多个 microtask 共享一个同步点，减少 CPU-GPU 之间的握手频率。例如：把"等待 selected block 加载完成"和"等待 init/local block 加载完成"两个同步点合并成一个。少同步 = 少停顿 = 更快。
+
+---
+
+## 8. 实验：到底快了多少？
+
+### 8.1 实验设置
+
+两台真实笔记本：
+
+* **CUDA 后端**：Intel Ultra 9 185H + RTX 4070 Laptop GPU（8GB VRAM）+ 64GB DDR5 + 1TB Samsung 990 PRO PCIe 4.0 SSD
+* **SYCL 后端**：Intel Ultra 7 255H + Intel Arc 140T 集成显卡 + 64GB DDR5 + 同款 SSD
+
+测试模型：Llama-3.2-3B、Llama-3.1-8B、Qwen-2.5-7B（权重 INT4，KV cache FP16），DRAM 限制 16GB，batch size=1。
+
+### 8.2 端到端性能
+
+如下图，CUDA 后端三个模型在不同 context 长度下的推理速度（token/s）：
+
+![](https://pic1.zhimg.com/v2-f727f809a09daf7f6687d4248ac3e8bd_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1040' height='255'></svg>)
+
+CUDA 后端端到端推理速度
+
+如下图，SYCL 后端（集成显卡）的性能：
+
+![](https://pica.zhimg.com/v2-0252250a5010cb4dec57fc57ac1a1e1a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1033' height='260'></svg>)
+
+SYCL 后端端到端推理速度
+
+关键数字汇总：
+
+| 对比 | 加速比 |
+| --- | --- |
+| CUDA + 128k，vs Offload+Sparse（3个模型） | 2.4×、2.8×、3.1× |
+| CUDA + 16k，vs FlexGen | 58.9× |
+| SYCL + 128k，vs Offload+Sparse | 1.9×~2.5× |
+
+FlexGen 在 batch=1 的情况下惨不忍睹——大量 page fault 触发的细粒度 SSD 随机访问，带宽浪费严重，没有并发可以隐藏 I/O 延迟。
+
+### 8.3 内存占用
+
+SolidAttention 只在 DRAM 里保留一层 1k token 的 KV cache buffer，其余全在 SSD：
+
+![](https://pica.zhimg.com/v2-b77ca94035cf8dbf548861d88b978fc9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='621' height='218'></svg>)
+
+KV Cache 内存占用对比
+
+KV cache 内存占用比 llama.cpp 降低 **62×（约 98%）**，三个模型全都一样。
+
+### 8.4 精度
+
+如下图，Table 1 对比精度，Figure 16 展示投机预取的 blocking latency 降低效果：
+
+![](https://pica.zhimg.com/v2-5c20033d3f707cfd4c765ae233141e3f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='310'></svg>)
+
+精度对比（Table 1）和投机预取效果（Figure 16）
+
+精度方面：
+
+* **INT4 KV 量化（Quant）**：Qwen-2.5-7B 从 71.39% → 18.63%，直接废了
+* **SolidAttention**：各项 benchmark 精度与原始模型差距 ≤2%
+
+投机预取的 blocking latency 降低：
+
+* SYCL 后端：**3.1×**
+* CUDA 后端：**3.9×**
+
+CUDA 收益更大是因为 RTX 4070 算得快，对 I/O blocking 更敏感。
+
+### 8.5 和纯内存方案对比
+
+SolidAttention 把 KV cache 全部卸到 SSD，但和纯内存推理（InDRAM）差多少？
+
+![](https://pic1.zhimg.com/v2-4dad4fde00b66d3b32f305d3ebab544d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='653' height='294'></svg>)
+
+SolidAttention vs 纯内存推理速度对比（SYCL）
+
+结果：仅 ≤**11%** 的吞吐量损失。把 KV cache 从内存搬到 SSD，速度几乎不变，但内存节省了 98%。
+
+### 8.6 消融实验
+
+如下图，左：KV 交织 vs 不交织的 attention 延迟对比；右：调度方案的逐步叠加效果：
+
+![](https://picx.zhimg.com/v2-8dba82fe1db4ea5924c1d9068cadbfa6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='638' height='247'></svg>)
+
+消融实验：KV交织和SSD-aware调度的效果
+
+三个模块的独立贡献：
+
+| 模块 | 效果 |
+| --- | --- |
+| KV Consolidator（交织） | attention 延迟降低 22% |
+| SSD-aware Scheduler（细粒度 overlap） | 性能提升 25% |
+| 同步点复用 | attention 延迟再降 22% |
+
+---
+
+## 9. 总结
+
+SolidAttention 这篇工作的切入点很准：
+
+1. **确认了一个核心矛盾**：动态稀疏 attention 和 SSD 特性天生不匹配，细粒度随机 I/O 导致 SSD 带宽严重浪费
+2. **co-design 思路**：不把 attention 算法和存储系统看作两个独立的问题，而是协同设计，让数据访问粒度对齐 SSD 特性
+3. **三个技术点都很实在**：KV 交织（纯工程技巧，不影响精度）、投机预取（利用跨层选择相似性）、DAG 调度（精细化计算/I/O 重叠）
+
+工程完成度也不错：CUDA + SYCL 双后端，约 25k 行代码，在真实笔记本上跑出了这些数字。
+
+对做本地推理的同学来说，这个工作提供了一种不量化 KV cache 就能大幅降低内存占用的路子。现在还是研究原型，能不能接进 llama.cpp/Ollama 主线还是个问题，但思路是对的。
+
+
+---
+
+## web端加载大模型现在有什么好方法吗？
+
+`link: https://www.zhihu.com/question/264699392/answer/2038941358321350628 · created: 1778901501`
+
+
+> 原文：[Accelerating Model Loading in LLM Inference by Programmable Page Cache](https://link.zhihu.com/?target=https%3A//www.usenix.org/system/files/fast26-liu-yubo.pdf)（USENIX FAST 2026）
+
+---
+
+## 1. 前言
+
+你有没有遇到过这种情况：一个 LLM 推理服务，业务流量一上来，需要紧急扩容，但新起一个实例，光是模型加载就要等一两分钟，有时甚至更长？
+
+这不是什么小概率踩坑，这是 MaaS（Model-as-a-Service）场景下普遍存在的痛点。Qwen2.5-72B 这类大模型，光文件就 130+ GB，加载到 NPU/GPU 上是个实实在在的 I/O 密集操作。论文里测了一组数据：**模型加载的开销占推理服务整个启动时延的 50% 以上**，这还是算上了容器初始化、KV cache 初始化的情况。
+
+更细思极恐的是：SSD 的理论最大带宽是 5.93 GB/s，但实测过程中**平均带宽只有 1.05 GB/s**，只用了约 **17%**！SSD 在那儿闲着，但模型就是加载不快。
+
+这是整个行业在 LLM 大规模部署上面临的核心矛盾之一：存储硬件的性能远没有被充分利用，瓶颈卡在了软件层——具体来说，是 Linux 内核的 **page cache 策略**。
+
+这篇来自华为的论文（发表在 FAST 2026）就是专门冲着这个问题去的。他们提出了 **PPC（Programmable Page Cache）** 框架 + **MAIO（Model-Accelerated I/O）** 缓存策略，最终实现模型加载时延降低 **79%**，在弹性部署场景下 inference throughput 提升 **36%**。
+
+---
+
+## 2. 背景：为什么是 page cache？
+
+先交代下背景。
+
+LLM 推理服务启动分三个阶段：
+
+1. **Framework Init**：容器初始化、推理框架启动
+2. **Model Loading**：从 SSD 文件系统把模型权重逐 tensor 加载到 XPU（NPU/GPU）
+3. **Service Start**：KV cache 初始化、推理服务就绪
+
+瓶颈在 Model Loading 阶段。模型文件存在 SSD 上，通过内核文件系统读取，数据先进 **page cache（内存）**，再传到 XPU 显存。
+
+内核默认的 page cache 策略对通用场景设计，对模型加载这种特殊 I/O 场景非常不友好：
+
+**观察一：prefetch 机制无法充分利用 SSD 并发带宽**
+
+如下图，可以很清晰地看到 SSD 带宽利用率的变化曲线——峰值能到 5.93 GB/s，均值只有 1.05 GB/s，足足差了 5.64x。原因是内核的 prefetch 策略受限于 kworker 线程数量，SSD 本身的高并发能力根本发挥不出来。另外，prefetch 的时机也不对，在 framework init 阶段（这段时间 CPU 在忙别的，I/O 本来可以提前做）根本没有 prefetch。
+
+![](https://pica.zhimg.com/v2-9391e4c428aedd8b8c70356a9158caff_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='625' height='401'></svg>)
+
+SSD 带宽利用率vs时间
+
+**观察二：prefetch 的精度很低，大量无效数据被预取**
+
+内核 page cache 只会对同一文件内相邻偏移的数据做顺序预取，完全感知不到模型加载的实际 I/O 顺序——不同 tensor parallelism 配置下，每个 XPU worker 的读取顺序是不一样的。预取了不该预取的数据，反而挤占了内存。
+
+**观察三：eviction 策略在内存受限场景下引发 cache thrashing**
+
+当可用内存不够放下整个模型时（比如只给模型加载留了 64GB 内存），内核用 LRU 驱逐页面，但完全不知道哪些数据"用了就不会再用"，导致后面要用的数据被驱逐，引发 cache thrashing，加载反而更慢。
+
+---
+
+## 3. 现有方案的问题：性能好但兼容性差
+
+行业里不是没有人尝试优化这个问题。ServerlessLLM 通过改造推理框架的 model loading 逻辑来做 pipeline prefetch；BlitzScale 利用 NVLink/RDMA 实现多机间模型共享。
+
+但这些方案有个共同问题：**为了性能牺牲了兼容性**。
+
+* 依赖特定推理框架（比如只支持 vLLM，不支持 Transformers）
+* 依赖特定硬件（NVLink、HCCS 等互连硬件）
+* 需要修改内核，而内核升级在生产集群里是几年才能完成的大工程
+* 需要转换模型格式，额外存储开销
+
+华为的出发点是：在 MaaS 生产环境里，你不能假设所有节点都是同款硬件，也不能随意改推理框架。**必须做到高性能、高兼容性两手都要抓**。
+
+---
+
+## 4. 解法：PPC + MAIO
+
+### 4.1 PPC：可编程 Page Cache 框架
+
+PPC 的核心思路是——**在不修改内核、不改推理框架的前提下，让用户可以自定义 page cache 策略**。
+
+如下图，有几种控制 page cache 的技术路线：
+
+| 方案 | 是否非侵入 | 灵活性 | 轻量性 |
+| --- | --- | --- | --- |
+| FUSE-based（RFUSE、XFUSE） | ✓ | ✓ | ✗（overhead 高） |
+| eBPF-based（PageFlex、FetchBPF） | ✗（需要改内核） | ✗（策略复杂度受限） | ✓ |
+| fadvise（内核原生） | ✗ | ✗（无法深度协作前端 I/O） | ✓ |
+| PPC（本文） | ✓ | ✓ | ✓ |
+
+![](https://picx.zhimg.com/v2-de10357e701bdb4a0abb8b7f248753a2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='625' height='288'></svg>)
+
+PPC 方案对比
+
+PPC 分两个核心组件：
+
+**RFS（Routing File System）**：基于 stacked filesystem 机制（类似 OverlayFS），在不修改底层文件系统的情况下，通过重写 VFS 接口来拦截 I/O 操作。当应用发起文件读取，RFS 检查 page cache 是否命中：命中则直接返回；miss 则通过 **UPC（Userspace Procedure Call）** 把事件异步发送到用户态，同时调用底层文件系统的原生读取流程——整个过程**非阻塞**。
+
+**CPRT（Cache Policy Runtime）**：运行在用户态的策略执行引擎。它维护一个线程池，监听 RFS 发来的 I/O miss 事件，解析事件信息（文件、偏移、长度、PID），然后调用用户自定义的 prefetch/evict 函数。用户只需要编译一个动态链接库，通过 `reg_policy` 注册进来就行，策略可以随时热切换。
+
+![](https://picx.zhimg.com/v2-07d86b5e11dccbbe64ffd8f2d97b0086_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='625' height='438'></svg>)
+
+PPC 架构与 RFS 实现
+
+这个设计非常干净：PPC 作为一个独立内核模块存在，不需要修改现有内核模块，对前端 I/O 性能影响极小（实测引入的额外 overhead 只有 3.7%6.4%，而 RFUSE 有 14%15%）。
+
+### 4.2 MAIO：面向模型加载的 I/O 策略
+
+有了 PPC 这个编程框架，接下来就是设计具体的缓存策略 MAIO。
+
+MAIO 的核心洞见是：**同一个 LLM 推理服务实例，每次启动时的 I/O 序列是完全一致的**。模型、tensor parallelism 配置确定之后，每个 XPU worker 按照固定顺序读取固定的 tensor 文件分片，这是可以预测的。
+
+基于这个观察，MAIO 做了三件事：
+
+**① I/O 模板生成（第一次启动时）**
+
+MAIO 通过 PPC 的 miss 事件机制，透明地追踪每个 XPU worker 的 I/O 序列，生成一个 **I/O 模板文件**。这个模板记录了每个 XPU worker 按时间顺序读取的文件路径、偏移、长度。模板存储极度紧凑——即使是 DeepSeek-R1-671B（662B 参数，双节点 16 NPU），I/O 模板也只有 **545KB**。
+
+**② 基于模板的精确 prefetch + XPU afﬁnity loading**
+
+有了 I/O 模板，MAIO 在 framework init 阶段就能提前知道后面 model loading 要读什么、哪个 XPU worker 要用。它实现了**可中断的 prefetch**：维护一个高并发线程池充分利用 SSD 的并发能力，当内存不足时可以立即中断当前 prefetch，避免资源浪费。
+
+更关键的是 **XPU afﬁnity loading**：prefetch 的数据会直接放到目标 XPU 所在的 NUMA node 的内存里，减少 host-to-device 传输的跨 NUMA 开销。
+
+**③ BAR（Burn-After-Reading）驱逐**
+
+这是 MAIO 在内存受限场景的杀手锏。传统 LRU 驱逐策略不知道哪些数据"用完就不会再用"；MAIO 利用 I/O 模板，**精确知道哪些数据已经被对应的 XPU worker 消费完了**，可以立即将其标记为可回收，为后续 prefetch 腾出空间，彻底避免 cache thrashing。
+
+如下图是 MAIO 的整体执行流程：
+
+![](https://picx.zhimg.com/v2-3ac263fa83dcfb248667db7406ca89b3_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='625' height='476'></svg>)
+
+MAIO 整体实现
+
+---
+
+## 5. 实验设置
+
+实验平台：4 个 48 核 Kunpeng 920 CPUs，**8 个 Ascend 910B2 NPUs**，1TB DRAM，3.75TB SSD。软件栈：vLLM-Ascend 0.9.2，PyTorch 2.5.1，Linux kernel 5.10。推理服务部署为容器，默认跑在 4 个 NPU 上。
+
+测试模型：Qwen2.5-7B/32B/72B，Llama-7B/70B。
+
+对比基线：
+
+* **Native**：原始内核 page cache 策略，模型存 SSD
+* **PreCache**：直接把整个模型预缓存进内存（高性能但吃内存）
+* **EagerLoad**：第一次 I/O miss 时触发全量 prefetch，无 eviction 优化
+* **SLLM-NPU**：ServerlessLLM 的 NPU 适配版本（不兼容方案代表）
+
+两种内存场景：充足内存（无限制）vs 内存受限（64GB 限制，用 cgroup 控制）
+
+---
+
+## 6. 实验结果分析
+
+### 6.1 模型加载时延
+
+如下图：
+
+![](https://picx.zhimg.com/v2-072dabe695d334eea1e570709ff39855_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='323'></svg>)
+
+各模型加载时延对比
+
+**充足内存场景（上图 a）**：
+
+* MAIO vs Native：**最多快 79%**
+* MAIO vs EagerLoad：最多快 32%（EagerLoad 没有精确 prefetch，不知道 XPU afﬁnity）
+* MAIO vs PreCache：最多快 37%（PreCache 没有 XPU afﬁnity 感知）
+* MAIO vs SLLM-NPU（不兼容方案）：大模型场景还要快 17%！原因是 MAIO 在 framework init 阶段就开始 prefetch，而 SLLM-NPU 只在 model loading 阶段才做，错过了大量可以利用的带宽窗口。
+
+**内存受限场景（上图 b）**：
+
+* MAIO vs 其他所有方案：**最多快 74%**
+* PreCache 和 EagerLoad 在这个场景下几乎没有优势，甚至比 Native 更差——原因是它们的盲目 prefetch 触发了 kernel 原生 eviction，产生严重 cache thrashing。
+* MAIO 的 BAR eviction 精确感知了 I/O 位置，evict 已用数据，只 prefetch 接下来要用的，彻底绕开了 cache thrashing。
+
+### 6.2 推理服务总启动时延
+
+![](https://picx.zhimg.com/v2-963115bdb1b78e834f50a81f514d3f1a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='290'></svg>)
+
+推理服务总启动时延
+
+充足内存场景下，MAIO 比 Native **降低最多 38%** 的总启动时延；内存受限场景下，比其他所有方案**降低最多 51%**。
+
+### 6.3 SSD 带宽利用情况
+
+如下图：
+
+![](https://picx.zhimg.com/v2-c7e91aaf3e5cdf5e5c6688dd709df435_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='388'></svg>)
+
+SSD 带宽利用率
+
+上图直观展示了 MAIO 和其他方案的 SSD 带宽利用曲线：MAIO 在 framework init 阶段就开始高并发 prefetch，几乎打满了 SSD 带宽，到 model loading 阶段大部分数据都已经 cache 命中了。而 Native 只在 model loading 阶段才有 I/O，还跑不满带宽。
+
+### 6.4 MAIO 各组件消融分析
+
+如下图：
+
+![](https://pic1.zhimg.com/v2-75682725708c7dc23c16f3d07d7dbb6d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='625' height='351'></svg>)
+
+MAIO 组件消融实验
+
+充足内存场景：interruptible prefetch（Base+P）贡献了 **65%+** 的降幅，XPU afﬁnity loading（+A）再砍 8.5%，BAR eviction（+E）影响不大（因为内存够用，eviction 不是瓶颈）。
+
+内存受限场景：三个组件各有显著作用，BAR eviction 在这里的贡献达到 **19%~23%**，是内存受限场景的关键设计。
+
+### 6.5 弹性部署端到端 throughput
+
+在弹性部署场景（Qwen2.5-72B → Llama-70B → Qwen2.5-72B 循环，不同空闲时间间隔），MAIO 的 token throughput 比 Native **最多提升 36%**。这个场景最贴近实际 MaaS 生产环境——模型频繁热换，快速加载直接影响整体算力效率。
+
+### 6.6 真实业务验证：DeepSeek-R1-671B
+
+华为在自家 Intelligence BooM 平台上部署 DeepSeek-R1-671B（662B 参数，双节点，16 NPUs），验证了 MAIO 的实际效果：
+
+* 原始直接加载：**649 秒**
+* MAIO 优化后：**452 秒**（降低约 30%）
+* 有趣的对比：把模型整个 cache 进 DRAM 的时延是 **561 秒**，MAIO 比全量内存缓存还快！
+
+原因在于 MAIO 的 XPU afﬁnity loading 加速了 host-to-device 传输，而全量 DRAM 缓存方案缺乏这个优化。
+
+---
+
+## 7. 讨论
+
+这篇论文技术上挺扎实的，几个点值得关注：
+
+**选了一个被忽视的优化角度**。大家做模型加载优化都在改推理框架、改硬件互联，这篇直接从 OS page cache 层入手，而且不修改内核、不改推理框架，兼容性是真的强。在生产集群里这种约束现实存在，所以这个出发点很有价值。
+
+**I/O 模板这个 insight 简洁有力**。"同一推理服务的 I/O 序列是确定性可重复的"——这个观察直接打通了精确 prefetch 的可能性，模板生成完全透明，只有第一次启动时有开销，后续使用几乎零代价（DeepSeek-R1-671B 模板才 545KB）。
+
+**XPU afﬁnity loading 是个容易被忽视的细节**。很多人优化 prefetch 只关注带宽，但数据放在哪个 NUMA node 的内存里影响很大，这个细节被单独提出来并做了消融实验，说明作者是真的在生产环境里踩过坑。
+
+**BAR eviction 在内存受限场景是关键**。内存受限是现实部署中常见的约束，特别是大模型多实例共存时。传统方法在这里直接翻车（cache thrashing），MAIO 的 BAR 策略实现了"用完即扔"，精准控制内存水位。
+
+当然也有些局限：目前 RFS 是只读的，只支持 model loading 这类读场景；I/O 模板依赖推理服务规格不变，一旦 tensor parallelism 改变就需要重新生成。不过这些在 MaaS 场景里算是可接受的约束。
+
+
+---
+
+## GPT模型如何优化kv-cache对芯片影响的问题？
+
+`link: https://www.zhihu.com/question/648630053/answer/2038938758620434794 · created: 1778900881`
+
+
+> 原文：[Bidaw: Enhancing Key-Value Caching for Interactive LLM Serving via Bidirectional Computation–Storage Awareness](https://link.zhihu.com/?target=https%3A//www.usenix.org/system/files/fast26-hu-shipeng.pdf)
+
+---
+
+## **1. 前言**
+
+你有没有想过，像 Replika、Duolingo 这类依赖多轮对话的 LLM 应用，在底层到底有多"重"？
+
+用户问一句话，LLM 要回一段话。下一轮用户再问，LLM 不仅要理解新问题，还要"记住"之前说过的所有内容——这个"记住"在工程上的实现，就是把历史轮次产生的 **KV tensor** 全部加载进 GPU 重新计算。
+
+问题来了：GPU 显存就那么大，每轮对话产生的 KV 不可能一直堆在 GPU 里。所以业界的常规做法是，把历史 KV 缓存在一个**两层存储**（host memory + SSD）里，下次用到的时候再从存储里 load 进来。
+
+听起来很合理对吧？但现实是——**用了两层存储之后，latency 能高出 3.8×，throughput 能跌掉一半。**
+
+这篇来自 FAST'26 的工作（清华大学团队）提出了 Bidaw，核心洞察是：现有方案里，**compute engine 和两层存储完全互不知情**，一个 I/O 盲调度 + 一个不懂对话规律的 eviction，凑在一起把性能搞塌了。
+
+---
+
+## **2. 背景：多轮对话的 KV 缓存有多贵？**
+
+先交代下背景。
+
+多轮对话的 LLM serving，每一轮的计算都需要用到前面所有轮次的 KV tensor（Key 和 Value 矩阵）。如果这些 KV 不缓存，每次都要重算，开销是指数级上涨的。论文里用真实工业 workload 测了一下：
+
+> **平均每个用户有 22.4 轮对话，冗余计算占到总计算量的 93.1%！**
+
+就是说，绝大多数 GPU 算力都在做无效的重复工作。
+
+为了解决这个问题，有两类方向：
+
+* **分布式内存池**（如基于 RDMA 的方案）：性能好，但需要专用硬件，成本高，很多垂直领域的公司根本部署不起
+* **本地两层存储**（host memory + SSD）：容量大、成本低，CachedAttention 和 FlashGen 是这条路上的代表工作
+
+下图是两层存储的基本架构——GPU 做计算，KV 从 host memory（快层）或 SSD（慢层）里 load 进来：
+
+![](https://pic1.zhimg.com/v2-d425965d86778c09fc72d291fcedc783_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='795' height='477'></svg>)
+
+但问题是，**这条路上的性能实际上被卡死了**。
+
+论文在同一个 workload 上跑了一组对比实验：CachedAttention 和 FlashGen 的 response latency 比"理想情况下所有 KV 都放在 host memory 里"高出 **3.8×**，throughput 低 **2.0×**。
+
+这个 gap 不小，足以让人怀疑两层存储这条路是否走得通。
+
+---
+
+## **3. 根因分析：compute 和 storage 各自为政**
+
+论文花了大量篇幅刻画真实 workload 的特征，找出了**两个根本问题**，都指向同一个根因：**compute engine 和两层存储完全不通信。**
+
+### 3.1 KV 加载时间差异极大
+
+不同请求的历史对话长度差异非常大，加上 host memory 和 SSD 之间带宽差了好几个量级，导致 KV loading time 的**变异系数（CV）高于 90%**。
+
+![](https://pic1.zhimg.com/v2-ecc1747207d4097c50a5b4616da13290_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='795' height='423'></svg>)
+
+现有的 I/O-oblivious 调度策略（FCFS）完全无视这件事。一个历史很长、KV 在 SSD 里的请求被排到最前面，GPU 就干等着——后面那些 KV 在 host memory 里、几十毫秒就能 load 完的请求，也只能傻等。这就是所谓的\*\*请求阻塞（request blocking）\*\*问题。
+
+### 3.2 KV 访问时间局部性极差，命中率惨不忍睹
+
+多轮对话有个特性：用户问完一个问题，得等模型回答，然后再思考下一个问题。这个时间窗口里，服务系统会处理大量其他用户的请求。
+
+论文引入了"加权重用距离"（weighted reuse distance）——即两次访问同一用户 KV 之间，其他 KV 的总访问量。结果发现：**80% 的 KV 访问的加权重用距离超过了 host memory 的容量（200GB）**。
+
+![](https://picx.zhimg.com/v2-11d8ee5520a3240ccae133abced56b15_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='795' height='382'></svg>)
+
+换句话说，两次访问之间已经有太多其他用户的 KV 进来又出去了，传统的 LRU/FIFO 根本没法利用这种局部性。结果就是：即使 host memory 能容纳 40.1% 的 KV，命中率也只有大约 **20%**，大量请求的 KV 要从慢速 SSD 里 load。
+
+这也是整个行业在两层 KV 存储上**面临的核心矛盾**：容量层和性能层的带宽鸿沟本来就存在，再加上调度和 eviction 都不考虑对话语义，性能就彻底垮了。
+
+---
+
+## **4. Bidaw：双向感知的 KV 缓存**
+
+Bidaw 的核心思路很直接：**让 compute engine 和 storage 互相知道对方在干什么**。
+
+* Compute engine 侧：调度时感知 KV 的 I/O latency，避免 blocking
+* Storage 侧：利用模型回答的长度来预测下次 KV 被访问的时间，指导 eviction
+
+下图是 Bidaw 的系统架构：
+
+![](https://picx.zhimg.com/v2-43d247c2b78f602eaf5b48ed67732f16_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='816' height='700'></svg>)
+
+### 4.1 I/O-aware 请求调度：双队列 + Disk-HRRN
+
+**双队列分离**
+
+Bidaw 把请求按 KV 所在存储层分成两个队列：
+
+* **Ready Queue**：KV 在 host memory 里，可以直接调度上 GPU
+* **Preparing Queue**：KV 在 SSD 里，正在 load 中，load 完才会升到 ready queue
+
+GPU 只调度 ready queue 里的请求，preparing queue 里的请求在 SSD I/O 完成后才升队。这样，不会因为一个 SSD I/O 慢的请求挡住一堆快请求。
+
+下图对比了 I/O-oblivious 和 I/O-aware 调度的效果——同样 5 个请求到来，I/O-aware 策略让 req3/4/5（KV 在 host memory）先跑起来，req1/2 在 SSD load 的同时 GPU 不空转：
+
+![](https://picx.zhimg.com/v2-54f5e5005cb707119e9065e91c3d35c8_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='816' height='670'></svg>)
+
+**Disk-HRRN 优先级策略**
+
+Preparing queue 里的请求在 SSD 上发 I/O 也有先后顺序。直觉上应该优先 load 小 KV（load 快，早点升到 ready queue），但纯粹按大小来会饿死大 KV 请求。
+
+Bidaw 借鉴了 HRRN 调度算法（Highest Response Ratio Next），设计了一个 disk-HRRN：
+
+![\\\text{Response Ratio} = 1 + \frac{\text{Request waiting time}}{\text{KV size}}](https://www.zhihu.com/equation?tex=%5C%5C%5Ctext%7BResponse+Ratio%7D+%3D+1+%2B+%5Cfrac%7B%5Ctext%7BRequest+waiting+time%7D%7D%7B%5Ctext%7BKV+size%7D%7D)
+
+等待时间越长，优先级越高；KV 越小，优先级越高。这样既能快速处理小请求，又不会让大请求一直饿着。
+
+### 4.2 基于模型回答长度的 KV Eviction 策略
+
+这是论文里我觉得最有意思的一个观察。
+
+**观察：回答越长，下次访问越晚**
+
+模型回答越长，用户读/听/理解的时间越长，再发下一个请求的间隔就越长。在这段时间里，其他用户的请求会不断进来，加权重用距离自然就越大。
+
+论文在不同时间段、不同压力下跑了 12 组实验，计算了"加权重用距离的下界"与"上一轮回答长度"的 Spearman 相关系数：**全部在 0.94 到 0.98 之间**，强正相关。
+
+![](https://picx.zhimg.com/v2-91d6eba19fd2c6c4652d8b5c487e6bae_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1605' height='706'></svg>)
+
+**Hit Potential 驱动的 Eviction**
+
+有了对加权重用距离的预测，还需要判断：一个 KV 的"下次访问还能命中 host memory 吗？"
+
+论文定义了三种重用距离范围：
+
+* **small**：重用距离小于 host memory 容量，命中率 1.0
+* **promising**：重用距离超出容量但还在一定范围内，有概率命中
+* **extreme**：距离太远，即使 Belady 最优算法也没法命中，命中率 0.0
+
+![](https://picx.zhimg.com/v2-f807705fa0fff7915299235abe5bae82_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='795' height='473'></svg>)
+
+对于 promising 区间，Bidaw 维护了一个后台运行的 **ghost cache**（用 Belady 最优算法做 eviction），从历史 trace 里统计各个距离 bucket 的命中率。
+
+最终，每个用户 KV 的 hit potential 是这样算的：
+
+![\\\text{Overall\_potential} = p_{\text{small}} \times 1.0 + p_{\text{extreme}} \times 0.0 + \sum_{i=1}^{m} p_{\text{promising}(i)} \times \text{hit\_promising}(i)](https://www.zhihu.com/equation?tex=%5C%5C%5Ctext%7BOverall%5C_potential%7D+%3D+p_%7B%5Ctext%7Bsmall%7D%7D+%5Ctimes+1.0+%2B+p_%7B%5Ctext%7Bextreme%7D%7D+%5Ctimes+0.0+%2B+%5Csum_%7Bi%3D1%7D%5E%7Bm%7D+p_%7B%5Ctext%7Bpromising%7D%28i%29%7D+%5Ctimes+%5Ctext%7Bhit%5C_promising%7D%28i%29)
+
+**hit potential 最低的 KV 优先 evict**，而不是按时间顺序或访问频率来。
+
+### 4.3 存储高效的 Tensor 缓存
+
+还有一个工程优化值得单独说一下。
+
+现有方案（CachedAttention、FlashGen）直接缓存 KV tensor。但 Bidaw 发现，LLM 推理过程中有多种中间 tensor，它们大小不同，转换成 KV 所需的计算量也不同。
+
+如果我们缓存的不是 KV tensor，而是**某个更小、转换代价低的中间 tensor**，就可以在同样的存储空间里放更多用户的数据，host memory 命中率自然上去了。
+
+![](https://picx.zhimg.com/v2-f26a91e2170970c55083777e292474c7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='795' height='656'></svg>)
+
+论文定义了 cost efficiency（saved FLOPs / required space），发现 **tensor 6（归一化激活值）的 cost efficiency 为 51.0，远高于直接缓存 KV tensor 的 30.5**。
+
+实现上，把 storage-efficient tensor 转换成 KV tensor 的操作，分配给一个低优先级 CUDA stream，利用推理时闲置的 GPU SM 来做，对 latency 影响可以忽略不计（实测只有几十毫秒，而整体延迟是几百到几千毫秒量级）。
+
+> 需要注意：这个优化对 MHA-based LLM（Llama、Qwen、OPT 等）适用；对于 GQA-based LLM，KV 本身已经比较小了，直接缓存 KV 更合适。
+
+---
+
+## **5. 实验设置**
+
+**硬件环境**：
+
+* 单卡 A800 80GB GPU，PCIe Gen 4 连接
+* 200GB host memory（performance layer）
+* 4 块 SATA SSD 组成 RAID-5，带宽约 1.5 GB/s（capacity layer）
+
+**测试 workload**：
+
+* 自有工业 workload（100 万+ 轮对话，平均 22.4 轮/用户）
+* 公开 ShareGPT workload（平均 5.7 轮/用户）
+
+**对比 baseline**：
+
+* vLLM（re-computation，不缓存 KV）
+* CachedAttention（ATC'24，两层存储 + queue-enhanced eviction）
+* FlashGen（两层存储 + inclusive caching）
+* 理想上界：所有 KV 都在 host memory 里的仿真场景
+
+**测试模型**：OPT-6.7B、Qwen-7B、OPT-13B、Qwen-14B、OPT-30B
+
+---
+
+## **6. 实验结果**
+
+### 6.1 整体性能
+
+下图展示了在各个模型上，随着用户到达率增加，平均响应延迟的变化：
+
+![](https://picx.zhimg.com/v2-003fb3a848822f6e514b1399efde1411_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1605' height='409'></svg>)
+
+几个关键数字：
+
+* **Bidaw 最高能把响应延迟压低 3.58×**（OPT-13B，对比 state-of-the-art）
+* 对比 CachedAttention 和 FlashGen，**延迟平均降低 83.9%**
+* **吞吐量提升 1.43× 到 1.83×**（用每分钟支持的用户数量来衡量）
+* 即使把 SSD 带宽提升到 5 GB/s，FlashGen 从 15.18 users/min 提升到 20.23，而 Bidaw 从 27.81 提升到 30.35——差距依然显著
+
+**注意**：Bidaw 是 lossless 的——只是重新排了请求调度顺序，不影响模型回答的准确性。
+
+### 6.2 host memory 大小敏感性
+
+在 host memory 从 120GB 到 200GB（对应 GPU 显存的 1.5× 到 2.5×）变化时，Bidaw 依然明显优于 CachedAttention 和 FlashGen——**在各种 memory 配置下，Bidaw 支撑的用户到达率是对比方案的 1.75× 到 2.19×**。
+
+### 6.3 公开 workload（ShareGPT）
+
+在 ShareGPT 上，Bidaw 对 FlashGen 的提升约为 **1.40× 吞吐量**，响应延迟最高压低 56.9%。提升幅度略低于自有 workload，原因是 ShareGPT 缺少真实时间戳（只能用 Poisson 分布仿真），previous-answer-based eviction 的效果有所打折。
+
+### 6.4 命中率对比
+
+Bidaw 的 eviction 策略把 host memory 的 **miss rate 压低了 57.6%**（对比 queue-enhanced）和 **69.9%**（对比 FIFO/LRU/LFU 等通用策略）。
+
+### 6.5 请求排队时间
+
+I/O-aware scheduler 把请求的平均排队时间从 5.76s 压低到 **2.45s，降低了 57.5%**。
+
+### 6.6 系统开销
+
+Bidaw 的 overhead 非常低：
+
+* 调度操作：平均 0.62ms/次
+* eviction 操作：0.35ms/次（ghost cache 后台运行：2.86ms/次）
+* storage-efficient tensor 转换：几十毫秒，用低优先级 CUDA stream 并行执行
+
+### 6.7 消融实验
+
+论文把三个组件分别拆开测了一遍（OPT-30B）：
+
+![](https://pic1.zhimg.com/v2-5cb9d7a7ce4417414e004fe8c5c32304_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='795' height='453'></svg>)
+
+* 只加 I/O-aware 调度：latency 降低 **1.58×**
+* 再加 previous-answer-based eviction：throughput 进一步提升 **1.25×**
+* 再加 storage-efficient tensor caching：throughput 再提升 **1.10×**
+
+三个技术叠加才是完整的 Bidaw，缺一不可。
+
+---
+
+## **7. 讨论**
+
+这篇工作的切入点很务实——**不搞新的模型压缩，不搞分布式，就专注于"本地两层存储方案的实际瓶颈在哪"这一个问题**，然后给出了系统性的解法。
+
+几个让我印象深刻的点：
+
+**第一**，"compute 和 storage 互不知情"这个 root cause 分析得很准。很多系统优化工作喜欢把 I/O 优化和 scheduling 优化当成独立问题，但在多轮对话场景下，两者耦合得非常紧——I/O latency 的方差高达 90% CV，任何不感知 I/O 的调度策略都是在赌运气。
+
+**第二**，用"模型回答长度"来预测下次 KV 访问时间，这个洞察很 elegant。它背后的直觉是：**LLM 回答越长 → 用户思考时间越长 → 两次访问间隔越长 → 重用距离越大**。Spearman 相关系数 0.94-0.98，这种规律在 12 组不同时段的实验里都成立，说明这不是 overfitting，是 interactive LLM serving 场景的一个基本性质。
+
+**第三**，storage-efficient tensor caching 这个 trick 挺有意思。不是所有中间 tensor 都一样大，选对缓存的 tensor 可以让同样空间装更多用户的数据。当然这需要 transformer 架构支持（MHA 系列），GQA 的话 KV 本来就小，用处不大。
+
+一个值得讨论的局限：**论文的 eviction 策略依赖真实时间戳**，在有时间戳的工业 workload 上效果显著，但 ShareGPT 这种时间戳仿真的公开数据集上提升就弱了。这其实说明这个方案对 workload 的假设比较强——用户确实在"交互式"地使用，而不是脚本化批量发请求。
+
+总体来说，这是一篇偏系统的实实在在的工程优化工作，代码开源在 GitHub（interactive-conversation-workload），感兴趣的可以去看看。
+
+---
+
+欢迎评论区交流！如果你们在自己的 LLM serving 系统里也踩过类似的两层存储坑，欢迎分享一下经验。
+
+
+---
+
+## 有没有什么方法来识别大模型推理过程中KV cache的冷热程度。？
+
+`link: https://www.zhihu.com/question/1898389278096093545/answer/2036842162999015414 · created: 1778401014`
+
+
+> 原文：[EPIC: Efficient Position-Independent Caching for Serving Large Language Models](https://link.zhihu.com/?target=https%3A//arxiv.org/abs/2410.15332)
+
+## 1. 前言
+
+你有没有想过，当你用 RAG 系统给 LLM 塞了 5 篇文档 + 一个问题时，这 5 篇文档的 KV cache 其实在不同请求之间是可以复用的？
+
+毕竟文档内容没变，变的只是用户的问题。但现实是，**绝大多数系统只支持前缀匹配的 KV cache 复用**——也就是说，只有当两个请求的开头完全一致时，缓存才能命中。这就很尴尬了：你 RAG 检索出来的文档顺序稍微变一下，或者 system prompt 改了一个字，前面缓存的 KV 全部失效，得重算。
+
+这也是整个行业在 KV cache 复用上的**核心矛盾**：你想复用的 chunk（文档/few-shot 示例）在不同请求里出现的位置不一样，但 KV 向量里偏偏编码了位置信息（RoPE），导致"位置一变，缓存作废"。
+
+今天想和大家聊聊这篇 EPIC，它把这个问题用一个非常漂亮的类比讲明白了——**位置无关代码（PIC）**。学过操作系统的同学应该不陌生：动态链接库之所以能被加载到内存的任意地址，靠的就是位置无关代码。EPIC 要做的，是让 KV cache 也能实现"位置无关"。
+
+## 2. 核心问题：为什么 KV Cache 不能随便拼？
+
+先交代下背景。LLM 的 prefill 阶段要给所有 prompt token 算 KV 向量，这一步是 compute-bound 的，也是 TTFT（Time-To-First-Token）的主要瓶颈。Context caching（也叫 prompt caching）的思路很简单：**重复出现的 token 序列，把它们的 KV 向量缓存下来，下次直接用**。
+
+vLLM、SGLang 这些推理框架都实现了 prefix caching——但问题是，它只能复用**公共前缀**。
+
+![](https://picx.zhimg.com/v2-dd8e9f58d8139992bf5c362d30b3b5ab_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1661' height='1330'></svg>)
+
+如上图，EPIC 把 KV cache 的复用类比成编译和链接：
+
+* **Compile 步骤**：每个文档 chunk 被独立送进 LLM，生成 KV 向量并缓存（类比把 C 源文件编译成 .o 文件）
+* **Link 步骤**：使用时把多个 chunk 的 KV 缓存拼起来，加上用户 query，重算一部分 KV 来保证精度（类比链接 .o 文件生成可执行程序）
+
+但这里有个关键问题：**每个 chunk 独立编译时，position ID 都是从 0 开始的**。这意味着拼接后，第二个 chunk 的第一个 token 的位置信息是"0"，但它在完整 prompt 里的实际位置可能是 1024。
+
+RoPE 位置编码直接编进了 K 和 Q 向量，位置信息的错位导致注意力计算出错。更具体地说，**每个 chunk 开头的 token 会产生"attention sink"效应——它们会过度吸引注意力，让后面的 token 无法有效关注到真正重要的内容**。
+
+## 3. 现有方案的痛点
+
+在 EPIC 之前，CacheBlend 是第一个尝试解决 Position-Independent Caching (PIC) 的工作。但它有两个硬伤：
+
+**第一，复杂度太高。** CacheBlend 需要先在第一层完整重算所有 KV，通过对比 attention map 选出"变化最大"的 15% token，然后在剩余层只重算这 15%。但别忘了，第一层的完整重算就已经是 O(N²) 了——当 N 到达 35000 token 时，CacheBlend 直接 OOM。
+
+**第二，动态选择 token 的开销巨大。** CacheBlend 用的是 dynamic sparsity，需要运行时计算 attention map 来选 token，这个"选 token"本身就占了 TTFT 的 **16% - 64%**。
+
+![](https://pica.zhimg.com/v2-9c6fc8d4bea02a4c065bb90b08a63f27_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1164' height='757'></svg>)
+
+如上图，随着 context 变长，CacheBlend-15 的 TTFT 以二次方增长，在约 35000 token 时 OOM；而 LegoLink-16 几乎是线性增长，50000 token 也没问题。
+
+## 4. LegoLink：简单到离谱的核心算法
+
+EPIC 提出的 LegoLink 算法，核心思想简单到让人拍大腿：
+
+> **只重算每个 chunk 开头的 k 个 token（第一个 chunk 除外），让它们"意识到"自己不在序列起始位置。**
+
+就这么简单。k 通常设为 2~16，在论文实验中 **k=2 就足以把精度损失控制在 7% 以内**。
+
+但光这一句话可能还是抽象，下面我用一个具体例子把整个流程拆开讲。
+
+### 4.1 举个例子：一步步走完 LegoLink
+
+假设一个 RAG 场景，用户问"Chrysan Company 的创始人是谁？"，系统检索出了 3 篇文档：
+
+```
+Chunk 0 (系统指令, 4 tokens):  "你 是 一个 助手"       → position [0,1,2,3]
+Chunk 1 (文档A, 5 tokens):     "苹果 公司 由 乔布斯 创立"  → position [0,1,2,3,4]
+Chunk 2 (文档B, 5 tokens):     "Chrysan 公司 由 张三 创立" → position [0,1,2,3,4]
+Query   (用户问题, 3 tokens):   "谁 创立 Chrysan"
+```
+
+**⚠️ 注意看 position：每个 chunk 编译时都是从 0 开始的！** 这就是 PIC 的关键——chunk 独立编码，不知道自己在完整 prompt 里的位置。
+
+### Step 1: Compile — 独立编码每个 chunk
+
+每个 chunk 被独立送进模型，position 从 0 开始：
+
+```
+Chunk 0: tokens=["你","是","一个","助手"],   positions=[0,1,2,3]   → 生成 KV_0 (4个KV向量)
+Chunk 1: tokens=["苹果","公司","由","乔布斯","创立"], positions=[0,1,2,3,4] → 生成 KV_1 (5个KV向量)
+Chunk 2: tokens=["Chrysan","公司","由","张三","创立"], positions=[0,1,2,3,4] → 生成 KV_2 (5个KV向量)
+```
+
+每个 chunk 的 KV 向量都被缓存下来。
+
+### Step 2: Link — 拼接 + 选择性重算
+
+现在用户发来 query，我们要把 3 个 chunk 的 KV 拼起来。拼接后的完整序列长这样：
+
+```
+全局位置:  [0  1  2  3 | 4    5    6   7      8   | 9       10   11  12    13   | 14  15     16]
+Token:    [你 是 一个 助手| 苹果 公司  由  乔布斯  创立 | Chrysan 公司  由  张三   创立  | 谁  创立  Chrysan]
+                       chunk 0          chunk 1                  chunk 2             query
+```
+
+问题来了：chunk 1 的"苹果"这个 token 的 KV 向量里，RoPE 编码的位置是 0（编译时的位置），但它在完整 prompt 里的正确位置应该是 **4**。"Chrysan" 的 KV 里位置是 0，正确应该是 **9**。
+
+这导致了什么？每个 chunk 开头的 token 都以为自己是"位置 0"——序列的起点。在 causal attention 中，位置 0 的 token 会被后续所有 token 关注（因为它"最老"），吸收了大量注意力。这就是 **attention sink**。
+
+**LegoLink (k=2) 的做法：**
+
+```
+需要重算的 token（★ 标记）:
+位置:  [0  1  2  3 | ★4   ★5   6   7      8   | ★9      ★10  11  12    13   | ★14 ★15    ★16]
+Token: [你 是 一个 助手| 苹果 公司  由  乔布斯  创立 | Chrysan 公司  由  张三   创立  | 谁  创立  Chrysan]
+                       ↑ chunk1开头2个     ↑ chunk2开头2个       ↑ query全部
+```
+
+具体重算了哪些？
+
+* Chunk 0：**不重算**（它是第一个 chunk，位置本来就从 0 开始，没有错位）
+* Chunk 1 的前 2 个 token："苹果"(pos 4)、"公司"(pos 5) — **用正确的全局位置重新算 KV**
+* Chunk 2 的前 2 个 token："Chrysan"(pos 9)、"公司"(pos 10) — **用正确的全局位置重新算 KV**
+* Query 的所有 token："谁"(pos 14)、"创立"(pos 15)、"Chrysan"(pos 16) — **query 本来就要算**
+
+**一共只重算了 7 个 token**（2+2+3），而不是全部 17 个。
+
+### Step 3: 重算时的 Attention 计算
+
+重算这 7 个 token 时，每个 token 的 Q 向量用**正确的全局位置**编码 RoPE，然后 attend to **所有 17 个位置的 KV**（其中 7 个是刚重算的，10 个是缓存的）。
+
+以 "Chrysan"(位置 9) 为例：
+
+* **编译时**：它的 K 向量用了 RoPE(pos=0)，所有后续 token 都觉得它是"起点"，疯狂给它注意力 → attention sink
+* **LegoLink 重算后**：它的 K 向量用了 RoPE(pos=9)，后续 token 能正确判断与它的相对距离，不再过度关注 → sink 消失
+
+这就是为什么重算 chunk 开头的少数几个 token 就能解决问题：**只有这几个 token 有严重的 attention sink，后面的 token 虽然位置也有偏差，但它们不在"位置 0"上，不会成为 sink**。
+
+### 直观对比
+
+```
+Naive（不重算）:
+  query "Chrysan" 的注意力 → 80% 被 chunk 1/2 开头 token 吸走 → 找不到"张三"
+
+LegoLink-2（重算 k=2）:
+  query "Chrysan" 的注意力 → 正确分配到"张三 创立"处 → 输出"张三"✓
+
+Full Recompute（全重算）:
+  query "Chrysan" 的注意力 → 和 LegoLink 几乎一样 → 输出"张三"✓
+  但代价是重算了全部 17 个 token 而不是 7 个
+```
+
+![](https://pica.zhimg.com/v2-2bd795d9f7fc3cc330481a4099e82515_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1661' height='698'></svg>)
+
+如上图对比了 Naive（不重算）、FR（全重算）、CacheBlend（重算 15% token）和 LegoLink（只重算每个 chunk 开头 k 个 token）。右边的 attention map 非常直观：
+
+* **Naive**：每个 chunk 开头有明显的亮色竖线（attention sink），注意力被这些 token 吸走了
+* **FR**：attention 分布正常，chunk 开头 token 虽然仍有一定 attention（因为 BOS token 的特殊性），但不再过度集中
+* **LegoLink**：通过只重算开头 k 个 token，attention map 几乎和 FR 一致
+
+### 4.2 为什么只重算开头 k 个 token 就够了？
+
+回到上面的例子。chunk 1 里的"由"(编译 pos=2, 正确 pos=6) 和 "乔布斯"(编译 pos=3, 正确 pos=7) 的位置也是错的，为什么不需要重算？
+
+原因有二：
+
+1. **Attention sink 是位置 0 的专利**。在 causal attention 中，位置 0 的 token 是唯一被所有后续 token 都能看到的，自然成为注意力的"垃圾桶"。位置 2、3 虽然也有偏差，但偏差不会导致极端的 attention 集中。
+2. **Query 和 decode token 才是信息聚合者**。最终回答问题的是 query 和后续生成的 token，它们的 Q 向量是用正确全局位置算的，能正确 attend to 所有 KV（包括那些位置稍有偏差但内容正确的 token）。
+
+### 4.3 复杂度对比
+
+| 方法 | 重算 token 数 | 时间复杂度 | 说明 |
+| --- | --- | --- | --- |
+| FR | N=17 | O(N²) | 全重算，最准但最慢 |
+| CacheBlend-15 | 15%×N≈3 | O(15%·N²) | 还是 O(N²)，因为第一层要全算 |
+| LegoLink-k | (chunks-1)×k+q=7 | O(k·N) ≈ O(N) | k 是常数，近线性 |
+| LegoLink-0 | 0 | O(q·N) | 编译时处理 sink，link 零开销 |
+
+## 5. 系统架构
+
+![](https://picx.zhimg.com/v2-b62847f054793371b18e48a2258686ee_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1661' height='1437'></svg>)
+
+EPIC 的系统架构很清晰：
+
+* **KVCompile**：接收用户提交的 immutable chunk，执行标准 prefill 生成 KV 向量，存入 KVCache，返回 cache ID
+* **KVLink**：收到请求时，根据 cache ID 取出 KV 缓存，执行 LegoLink 重算，然后正常 decode
+* **KVCache**：支持 HBM / DRAM / SSD 多级存储
+
+用户通过两个 API 交互：
+
+1. `generate_context_cache(chunks)` → 获得 cache IDs
+2. `chat_completion(cache_ids, query)` → 获得回复
+
+这种 explicit caching 的设计跟 Google Gemini 和 Mooncake 类似，用户自己管理缓存的生命周期。
+
+## 6. 实验结果
+
+### 6.1 精度-延迟 Pareto 前沿
+
+![](https://picx.zhimg.com/v2-3202b3b3aa921d2fc14e0280b59cdf5f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1661' height='2725'></svg>)
+
+如上图（6 个数据集 × 3 个模型），LegoLink（蓝色星星系列）在大多数场景下建立了新的 Pareto 前沿。核心发现：
+
+* **LegoLink-2 就能把精度损失控制在 0-7%**，同时 TTFT 比 CacheBlend-15 减少最多 **3×**
+* CacheBlend-1 或 CacheBlend-5（重算类似数量的 token）精度会崩——因为它选错了要重算的 token
+* 增大 k 带来的精度增益递减：重算几个开头 token 就够了
+
+### 6.2 系统级性能
+
+![](https://picx.zhimg.com/v2-aedebedabc4fd454fae6abd922c323ad_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1661' height='919'></svg>)
+
+在异步工作负载下：
+
+* LegoLink-16 相比 CacheBlend-15 实现 **最高 8× TTFT 降低**
+* 吞吐提升 **最高 7×**
+* 随着 CCR（Context Cache Ratio）增加，LegoLink 的 TTFT 保持稳定，而 CacheBlend 持续波动
+
+### 6.3 LegoLink-0：零开销变体
+
+论文还提出了一个骚操作：**LegoLink-0**。在 compile 阶段给每个 chunk 前面加 4 个 dummy token（如 BOS token），编译完后把这些 dummy 的 KV 丢掉。这样 attention sink 在编译时就被"预消费"了，link 阶段完全不需要重算！虽然精度比 LegoLink-2 略差一点，但 **link 开销为零**。
+
+## 7. 代码复现
+
+光说不练假把式。我用一个最简的 Transformer 模型复现了 LegoLink 的核心逻辑，不依赖 vLLM，只需要 PyTorch，CPU 就能跑。
+
+代码在这里：[https://github.com/marsggbo/easy-kvcache](https://link.zhihu.com/?target=https%3A//github.com/marsggbo/easy-kvcache)
+
+```
+git clone https://github.com/marsggbo/easy-kvcache.git
+cd easy-kvcache
+python epic/epic_legolink.py
+```
+
+核心实现大概 400 行，把 compile/link 两步和四种算法（Naive / FR / LegoLink / LegoLink-0）都实现了。这里挑几个关键部分讲一下。
+
+### 7.1 Compile 步骤：独立编码 chunk
+
+```
+def compile_chunk(self, token_ids: torch.Tensor) -&gt; CompiledChunk:
+    """Compile：独立编码一个 chunk，position 从 0 开始"""
+    chunk_len = token_ids.shape[1]
+    # ⚠️ 关键：position IDs 从 0 开始
+    positions = torch.arange(chunk_len, device=token_ids.device)
+    _, kv_caches, _ = self.model(token_ids, positions)
+    return CompiledChunk(token_ids=token_ids, kv_caches=kv_caches, chunk_len=chunk_len)
+```
+
+继续沿用上面 4.1 节的例子。假设我们有 3 个 chunk，每个 chunk 被独立编译：
+
+```
+输入 token_ids:           含义:
+chunk 0: tensor([[10, 20, 30, 40]])       → "你 是 一个 助手"     (shape: [1, 4])
+chunk 1: tensor([[50, 60, 70, 80, 90]])   → "苹果 公司 由 乔布斯 创立" (shape: [1, 5])
+chunk 2: tensor([[100,110,120,130,140]])   → "Chrysan 公司 由 张三 创立" (shape: [1, 5])
+```
+
+对于 chunk 1，调用 `compile_chunk(tensor([[50,60,70,80,90]]))` 时内部变量：
+
+```
+chunk_len = 5
+positions = tensor([0, 1, 2, 3, 4])    ← 关键：从 0 开始！不管 chunk 1 在 prompt 里实际从位置 4 开始
+```
+
+模型前向传播后，返回的 `kv_caches` 是一个 list，每个元素是一个 `(K, V)` tuple：
+
+```
+kv_caches = [
+    (K_layer0, V_layer0),   # 每个 shape: [1, n_heads, 5, head_dim]  即 [batch, heads, chunk_len, dim]
+    (K_layer1, V_layer1),
+    (K_layer2, V_layer2),
+    (K_layer3, V_layer3),
+]
+```
+
+这些 KV 向量被存进 `CompiledChunk`，后续 link 时复用。注意 K 向量里已经编进了 RoPE(pos=0,1,2,3,4) 的位置信息——而正确的全局位置应该是 4,5,6,7,8。**这个错位就是后续需要重算的根源**。
+
+### 7.2 LegoLink：只重算开头 k 个 token
+
+```
+def link_legolink(self, query_ids, k=4):
+    """LegoLink：只重算每个 chunk（除第一个）开头的 k 个 token"""
+    # Step 1: 确定重算位置
+    recompute_indices = []
+    offset = 0
+    for i, chunk in enumerate(self.compiled_chunks):
+        if i &gt; 0:  # 第一个 chunk 不需要重算
+            for j in range(min(k, chunk.chunk_len)):
+                recompute_indices.append(offset + j)
+        offset += chunk.chunk_len
+    # 加上 query tokens
+    query_indices = list(range(total_ctx_len, total_ctx_len + query_len))
+    all_recompute_indices = recompute_indices + query_indices
+    
+    # Step 2: 用 **正确的全局位置** 重算这些 token
+    recompute_positions = torch.tensor(all_recompute_indices)  # 全局位置！
+    
+    # Step 3: 逐层执行——新算的 KV 替换缓存中对应位置
+    for layer_idx, layer in enumerate(self.model.layers):
+        # 计算新的 Q, K, V（用正确位置的 RoPE）
+        Q, K_new, V_new = compute_qkv(x, recompute_positions)
+        # 在缓存 KV 的对应位置覆盖
+        K_exp[:, :, recompute_indices] = K_new
+        V_exp[:, :, recompute_indices] = V_new
+        # Q (k' tokens) attends to all N tokens
+        attn = softmax(Q @ K_exp.T / sqrt(d)) @ V_exp
+```
+
+还是用上面的 3 chunk + query 例子，设 k=2，一步步看每个变量：
+
+**Step 1：确定重算位置**
+
+```
+遍历 3 个 chunk：
+  i=0, chunk 0 (len=4): 跳过（第一个 chunk 不重算）, offset=0 → 0+4=4
+  i=1, chunk 1 (len=5): 重算前 2 个 → recompute_indices=[4, 5], offset=4 → 4+5=9
+  i=2, chunk 2 (len=5): 重算前 2 个 → recompute_indices=[4, 5, 9, 10], offset=9 → 9+5=14
+
+total_ctx_len = 4+5+5 = 14
+query_len = 3
+query_indices = [14, 15, 16]
+
+all_recompute_indices = [4, 5, 9, 10, 14, 15, 16]   ← 一共 7 个 token 需要重算
+```
+
+对应到完整序列中的位置：
+
+```
+位置: [0  1  2  3 | 4    5    6   7      8   | 9       10   11  12    13   | 14  15    16  ]
+      [你 是 一个 助手|苹果  公司  由  乔布斯  创立|Chrysan  公司  由  张三   创立 | 谁  创立  Chrysan]
+                     ★    ★                   ★       ★                    ★   ★     ★
+                   重算chunk1前2个            重算chunk2前2个               重算query全部
+```
+
+**Step 2：构造正确位置的重算输入**
+
+```
+# 从完整 token 序列中取出需要重算的 token
+all_token_ids = [10,20,30,40, 50,60,70,80,90, 100,110,120,130,140, 150,160,170]
+                                                                    ↑ query tokens
+recompute_ids = tensor([[50, 60, 100, 110, 150, 160, 170]])   # shape [1, 7]
+#                       pos4 pos5 pos9 pos10 pos14 pos15 pos16
+
+recompute_positions = tensor([4, 5, 9, 10, 14, 15, 16])       # ← 全局位置！不是从 0 开始
+```
+
+**关键区别**：编译时 "苹果"(token 50) 用的 `positions=0`，现在重算用的 `positions=4`。RoPE 编码不同，生成的 K 向量也不同，attention sink 效应就会消失。
+
+**Step 3：逐层重算并替换缓存**
+
+```
+# 拿到缓存的 KV（3 个 chunk 拼接后）
+K_cached shape: [1, n_heads, 14, head_dim]    # 14 = 4+5+5，三个 chunk 的 KV 拼一起
+V_cached shape: [1, n_heads, 14, head_dim]
+
+# 扩展为完整序列长度（加上 query 的位置）
+K_exp shape: [1, n_heads, 17, head_dim]       # 17 = 14 + 3 (query)
+V_exp shape: [1, n_heads, 17, head_dim]
+
+# 复制缓存到前 14 个位置
+K_exp[:, :, :14, :] = K_cached
+
+# 用重算的 KV 覆盖对应位置
+K_exp[:, :, [4,5,9,10,14,15,16], :] = K_new   # 7 个新 K 向量替换原来的
+V_exp[:, :, [4,5,9,10,14,15,16], :] = V_new
+
+# 现在 K_exp 中：
+# 位置 0-3:  chunk 0 的原始缓存 KV（没动，因为第一个 chunk 不需要重算）
+# 位置 4,5:  chunk 1 开头 2 个 token 的 **新** KV（用正确位置 4,5 重算的）
+# 位置 6-8:  chunk 1 剩余 3 个 token 的原始缓存 KV（没动）
+# 位置 9,10: chunk 2 开头 2 个 token 的 **新** KV（用正确位置 9,10 重算的）
+# 位置 11-13:chunk 2 剩余 3 个 token 的原始缓存 KV（没动）
+# 位置 14-16:query 的 KV（首次计算）
+
+# Attention: Q (7个重算token) × K_exp^T (17个位置) → [1, heads, 7, 17]
+attn_scores = Q @ K_exp.transpose(-2, -1) / sqrt(head_dim)
+# 加 causal mask（每个 token 只能看到自己及之前的位置）
+# 最终只取 query 部分（最后 3 个）的输出 → logits
+```
+
+### 7.3 LegoLink-0：编译时预处理
+
+```
+def link_legolink_zero(self, query_ids, n_dummy=4):
+    """LegoLink-0：compile 时加 dummy prefix，link 时零开销"""
+    for chunk in self.compiled_chunks:
+        # 在 chunk 前面加 n_dummy 个 dummy token（如 BOS）
+        dummy_ids = torch.full((1, n_dummy), BOS_TOKEN_ID)
+        padded_ids = torch.cat([dummy_ids, chunk.token_ids], dim=1)
+        # 编译带 dummy 的版本
+        _, kv_caches, _ = self.model(padded_ids, positions)
+        # 丢掉 dummy 的 KV，只保留原始 chunk 的 KV
+        kv_caches = [(K[:,:,n_dummy:,:], V[:,:,n_dummy:,:]) for K, V in kv_caches]
+```
+
+这个变体的思路很巧妙，还是用 chunk 1 举例：
+
+```
+原始编译（标准 compile）:
+  输入: ["苹果","公司","由","乔布斯","创立"]
+  positions: [0, 1, 2, 3, 4]
+  → "苹果"在 pos=0，成为 attention sink
+
+LegoLink-0 编译（加 dummy prefix）:
+  输入: ["&lt;BOS&gt;","&lt;BOS&gt;","&lt;BOS&gt;","&lt;BOS&gt;", "苹果","公司","由","乔布斯","创立"]
+  positions: [0,    1,     2,     3,       4,     5,    6,   7,      8]
+  → 4 个 dummy 占据了 pos 0-3，"苹果"在 pos=4
+  → dummy token "吃掉"了 attention sink
+  
+  然后丢弃前 4 个 dummy 的 KV：
+  KV 原始 shape: [1, heads, 9, dim]
+  丢弃后 shape:  [1, heads, 5, dim]   ← 只保留 "苹果" 到 "创立" 的 KV
+```
+
+这样 chunk 1 的 "苹果" 的 KV 向量里编码的是 pos=4（不再是 0），attention sink 在编译时就被消除了。link 阶段直接 naive 拼接就行，**零重算开销**。
+
+代价是 compile 阶段要多算 4 个 dummy token，但 compile 只做一次、link 做很多次，所以总体上是划算的。
+
+### 7.4 运行结果
+
+跑一下就能看到效果：
+
+```
+Step 5: 不同 k 值对 LegoLink 精度的影响
+
+    k      Cosine Sim     Recompute Tokens   % of Total
+  -------------------------------------------------------
+    0          0.9975                    0         0.0%
+    1          0.9995                   10         9.6%
+    2          0.9996                   12        11.5%
+    4          0.9996                   16        15.4%
+   32          1.0000                   72        69.2%
+```
+
+和论文结论完全一致：**k=2 就够了**，继续加大 k 收益递减。
+
+## 8. 一些个人 Take
+
+1. **类比很精髓**。用编译/链接来类比 PIC 的 compile/link，这个抽象做得很漂亮。看完论文你会觉得"这也太自然了"，但自然的东西往往是最难想到的。
+2. **Attention sink 是个被低估的问题**。之前 StreamingLLM 那篇讲 attention sink 更多是在 decode 阶段（evict 过程中保留 sink token），EPIC 把它放到了 PIC 的场景下，而且给出了比 StreamingLLM 更细粒度的解决方案。
+3. **Static sparsity &gt; Dynamic sparsity**（在这个场景下）。CacheBlend 用 dynamic sparsity 去选 token 重算，看起来更"智能"，但实际上选 token 的开销本身就很大。LegoLink 预先知道该重算谁（每个 chunk 开头），反而又快又准。这给了我们一个启发：**不是所有问题都需要"动态"方案，如果你对问题结构足够了解，静态方案往往更优**。
+4. **这篇工作对 RAG 场景特别有价值**。目前 RAG 系统的瓶颈之一就是长 context 的 prefill 开销。如果 document chunk 的 KV cache 可以跨请求复用，而且不需要 prefix 完全匹配，那 TTFT 可以大幅降低。可以预见未来的推理框架会原生支持 PIC。
+5. **代码质量**。官方代码基于 vLLM 实现，改动了约 2K 行 Python，主要在 attention backend 和 scheduler 两处。代码结构还是比较清晰的，感兴趣的可以 diff 一下和 vLLM 0.7.0 的差异。
+
+欢迎评论区交流，如果觉得有帮助也欢迎 star 一下 [easy-kvcache](https://link.zhihu.com/?target=https%3A//github.com/marsggbo/easy-kvcache) 项目，后续会继续加入更多 KV cache 优化算法的简化复现。
+
+
+---
+
+## MoE与Dense模型之间是否存在规模等效算法？
+
+`link: https://www.zhihu.com/question/1988091347719192660/answer/2036838489161982622 · created: 1778400138`
+
+
+> 原文：[Read-ME: Refactorizing LLMs as Router-Decoupled Mixture of Experts with System Co-Design](https://link.zhihu.com/?target=https%3A//proceedings.neurips.cc/paper_files/paper/2024/file/d298cf34e4539f9134db7f38b42f69fe-Paper-Conference.pdf)
+
+## **1. 前言**
+
+做 MoE 推理优化的牛马应该对这个场景不陌生：
+
+你好不容易把 Mixtral-8x7B 或者 DeepSeek-MoE 部署起来，满心期待地等着"稀疏激活带来的效率红利"落地，结果一跑推理，GPU 显存占用跟 dense 模型差不了多少，延迟也没降多少。
+
+为什么？
+
+因为**MoE 的优势是推理时只激活少数 expert，但落地被"全量加载 + 低效调度"的系统设计给卡死了**。
+
+这也是整个 MoE 推理领域的核心矛盾之一：模型架构设计和系统推理策略之间的脱节。
+
+今天想聊的这篇 Read-ME（NeurIPS 2024）正面刚了这个问题，而且是从算法和系统两侧同时动刀——它不只是在模型结构上做文章，而是提出了一套 algorithm-system co-design 的框架，实现了在更小规模下更好的精度，同时端到端延迟也降下来了。
+
+---
+
+## **2. 问题出在哪**
+
+先交代下背景，MoE 落地有两个经典难题：
+
+**第一个：从头训练 MoE 太贵了。**
+
+Mixtral、DeepSeek 这些模型，要么是专门设计的 MoE 架构从头预训练，要么是对已有 dense 模型做 "upcycling"（把 dense FFN 直接复制成多个 expert，再继续训练）。无论哪条路，都要消耗海量 token。
+
+**第二个：传统 layer-wise router 设计在系统层面效率很差。**
+
+这是 Read-ME 真正重点解决的问题。
+
+现在主流 MoE（Mixtral、OpenMoE 等）的 router 是 **layer-wise** 的：每一层都有独立的 router，每层的 expert 选择要等上一层的 hidden state 出来之后才能决定。这带来两个直接的系统问题：
+
+1. **没法提前 prefetch expert**：expert 权重可能分散在不同 GPU/机器上，等到运行时才决定要哪个 expert，来不及预加载，要么 OOM 全加载，要么边算边取等 I/O。
+2. **batching 效率极差**：一个 batch 里不同 token 需要不同 expert，GPU 利用率拉稀。**这里有个很离谱的数据：Mixtral-8x7B 在 batch size 为 56.8 时，平均每层激活的 unique expert 数量是 7.63 个（总共才 8 个）**——等于说稀疏激活的优势几乎全丢了。
+
+如下图右边的散点图，unique expert 数量和平均延迟几乎线性相关——expert 越分散，latency 越高。左边展示了 batching 困境：同一个 batch 里每个 token 走的 expert 路径都不同，系统调度根本没法做优化：
+
+![](https://picx.zhimg.com/v2-8c8c918ccb44e112f39a410967b58240_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='987' height='348'></svg>)
+
+MoE batching困境：unique expert数量与延迟线性相关
+
+## **3. Read-ME 的核心 idea**
+
+Read-ME 的框架如下图所示：左半部分是**算法侧**，把预训练好的 dense 模型（黄色）"重构"成两个稀疏 expert（红/绿），并训练一个轻量 pre-gating router；右半部分是**系统侧**，利用 pre-gating 在请求到达时就预先分配 expert，实现 expert-aware batching：
+
+![](https://pica.zhimg.com/v2-3ee85443c90caeb49cc133e7e873651b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='969' height='350'></svg>)
+
+Read-ME系统全貌：dense模型重构为MoE并支持推理时expert-aware调度
+
+### 3.1 算法侧：从 Dense 提 Expert，再解耦 Router
+
+Read-ME 首先在 Llama-2-7B-chat 这类预训练 dense 模型上做 MoE 化，不从头训练，只用 **1B tokens** 做 continual tuning，代价极小。
+
+具体是怎么提取 expert 的？基于**激活稀疏性**（activation sparsity）。Dense LLM 里的 FFN，不同数据域对应的激活 channel 是不同的（科学文章、小说、代码、QA 各自激活不同的神经元），把这些"domain-specific"的 channel 组合成独立的 expert，就得到了领域对齐的 MoE 结构——本质是在 activation magnitude 上做 top-k channel 选择，再用 mask 矩阵把 FFN 参数切分成 N 个 expert。
+
+这个思路其实和 NAS 领域的 once-for-all 网络有点像：都是在一个共享的参数空间里，通过动态 mask 选出不同的"子网络"来执行不同任务。这种方式在训练 / fine-tune 数据集上效果可以做得不错，但 mask 的划分是基于这批数据的激活统计，**能否在 distribution 差异较大的其他数据集上保持同等性能，是个值得警惕的问题**。相比之下，直接在预训练好的原生 MoE（如 Mixtral、DeepSeek-MoE）上做推理优化，模型能力的上限和泛化性是原厂保证的，更有工程落地的确定性——我们自己的工作 ExpertFlow [1] 就走的这条路。
+
+---
+
+关键创新在 **router 设计**。
+
+作者发现了一个很有意思的现象：**相邻层之间的 expert 选择高度相关**。如下图(a)所示，Mixtral-8x7B 第 30、31 层之间的转移矩阵几乎是行稀疏的——每行只有少数几个非零项，说明"知道第 30 层选了哪个 expert，第 31 层几乎就确定了"。图(b)的 mutual information 曲线也印证了这一点：相邻层之间的 MI 明显高于条件独立的基线。图(c)是对应的 router 蒸馏训练方案：
+
+![](https://picx.zhimg.com/v2-830e9316e4c08aa6deabc362a8d12b4a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1020' height='367'></svg>)
+
+这意味着什么？**Layer-wise router 大量在做重复工作**，完全可以用一个统一的 router 在推理最开始就预测所有层的 expert 选择。
+
+Read-ME 把这个 router 叫做 **pre-gating router**，它和 MoE backbone 完全解耦。结构很简单：一个 1-layer transformer block，只有 **18M 参数**（可以忽略不计的 overhead）。它在 token 进入 MoE 之前就跑完，一次性输出所有层的 expert 路由决策。训练时用 **routing distillation loss**（KL 散度）对齐原始模型的激活稀疏模式，监督信号非常自然。
+
+### 3.2 系统侧：Pre-gating 带来的三个优化
+
+有了 pre-gating router，推理系统可以做三件事：
+
+**① Fine-grained Expert Prefetching**
+
+知道了接下来要用哪些 expert，就能把加载 expert 权重和当前层的 forward pass 完全 overlap 起来——算第 i 层的同时，后台异步加载第 i+1 层需要的 expert，完全 hide I/O latency。
+
+**② Belady-inspired Expert Caching**
+
+这里先简单交代一下为什么需要 expert cache。
+
+MoE 模型的参数量往往比 dense 模型大很多（比如 Mixtral-8x7B 总参数 47B，但每次推理只激活约 13B），在 GPU 显存有限的情况下，根本没法把所有 expert 都常驻显存。常见的做法是 offload 到 CPU 内存或 NVMe，推理时按需加载（on-demand loading）。这就引出了一个问题：**哪些 expert 应该留在 GPU 显存里（"热缓存"），哪些 expert 应该被换出去？**
+
+这就是 expert cache 的问题。最朴素的策略是 LRU（最近最少使用），但 LRU 是基于历史的，并不知道"接下来要用哪个 expert"。
+
+Read-ME 的做法是利用 pre-gating router 的预测能力，直接实现 **Belady 算法**。Belady 的逻辑很简单：当 cache 满了需要淘汰某个 expert 时，驱逐"未来最晚被再次访问到"的那个——这在理论上是最优的 cache 替换策略。它的问题是在普通场景里你不知道"未来"，是个离线算法。
+
+而有了 pre-gating，你恰好知道当前 batch 里每个 token 接下来要走哪些 expert。**"未来访问序列"从未知变成了已知，Belady 算法就可以直接在线跑了**。论文也在理论上证明了在 pre-gating 框架下这个 caching 策略是 provably optimal 的——这个理论保证在工程实践里相当加分。
+
+**③ Expert-aware Batching**
+
+Pre-gating 让系统在 batch 组建时就知道每个 token 要用哪些 expert，可以把激活相同 expert 的 token 放同一个 batch，从根本上减少每个 batch 里 unique expert 的数量。
+
+如下图对比了两种 pipeline：传统 layer-wise MoE（上）每个 token 各走自己的 route，batching 完全没有 locality 可利用；Read-ME（下）在请求到达时就做 expert-aware 分批，Expert 计算可以高效合并：
+
+![](https://picx.zhimg.com/v2-87da8f2d7734ab186acef3b8bf4253db_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='987' height='345'></svg>)
+
+具体怎么合并？对于进入系统的多个请求，pre-gating 先跑一遍，拿到每个 token 在每一层对应的 expert ID，然后在 scheduler 层面按 expert 亲和性重新分组——把要用同一批 expert 的 token 打包成一个 mini-batch，这样一个 expert forward 可以同时服务多个 token，计算利用率大幅提升。
+
+顺带一提，我们自己的工作 ExpertFlow [1] 也有类似的思路，区别在于我们是在一个 batch 内部用 **k-means token scheduler** 对 token 做重组：按照 token 的 expert 激活向量做聚类，把同 cluster 的 token 组成 mini-batch，目标同样是降低每个 mini-batch 内 unique expert 的数量、提高单个 expert 计算时服务的 token 数。两者目的一致，但 Read-ME 是在请求调度层做，ExpertFlow 是在 batch 内重排做，两个维度可以互补。
+
+---
+
+## **4. 效果怎么样**
+
+### 4.1 模型质量
+
+用 Llama-2-7B-chat 做 base，Read-ME 模型 activated parameters 为 4.7B（总参数 17B），训练代价**只用了 1B tokens**。如下表，和各类 baseline 的综合对比：
+
+![](https://picx.zhimg.com/v2-3637382df1bd4f12e80ad5a4be469673_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1530' height='430'></svg>)
+
+Read-ME 在 MMLU 上达到 **38.9%**，综合 avg 达到 **55.5%**，显著领先同规模的所有 baseline——而对面的 Pythia 用了 300B tokens，Open-Llama-v2 用了 1T tokens，Read-ME 只用 1B tokens 就超过了它们。
+
+**本质上还是 Llama-2-7B-chat 预训练带来的底子**，continual tuning 只是把 dense 知识迁移到 MoE 结构。
+
+如下散点图更直观地展示了 Read-ME 在"MMLU performance vs activated parameters"维度上的位置——相比同等参数量的对手，它处于 Pareto frontier 之上（只有 Llama-2-7B 这种大模型才能超过它，而 Llama-2-7B 激活参数量是它的 1.5 倍）：
+
+![](https://pic1.zhimg.com/v2-58b3191cd2e9c1dd0f0d5749cc22a86b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='780' height='300'></svg>)
+
+（细思极恐：Open-Llama-v2 用 1T tokens 才训到 25.7% MMLU，Read-ME 1B tokens 就做到 38.9%……这就是 pretrain-then-convert 的威力。）
+
+### 4.2 推理速度
+
+如下图展示了三组实验：左图是单次 124 token 生成任务的 latency 分解（OpenMoE / Llama2-7b / Read-ME），Read-ME 的 Expert/MLP 耗时明显更短；中图是 batched inference 场景下的 p95 latency 分布，Read-ME 的分布更集中且整体更低；右图展示了 temporal locality 分析——Read-ME 的 router 让同序列内 token 倾向于选相同 expert（2921 个 token 跟随上一个 token 的选择 vs Mixtral 的 850 个），这进一步降低 unique expert 的切换开销：
+
+![](https://picx.zhimg.com/v2-6428c309d42c45678ac26a64310243d6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1029' height='377'></svg>)
+
+综合下来：平均 end-to-end latency 降低 **6.1%**，tail latency（p95）改善 **9.5-10.0%**。
+
+在内存受限场景（只缓存 k 个 expert）下，expert prefetching 的效果如下图——在所有 cache capacity 设置下，蓝色（Prefetching）都比橙色（On-demand Loading）有稳定优势，cache capacity 越小时差距越大，最多 **30% 的 latency 节省**：
+
+![](https://pic1.zhimg.com/50/v2-2aa33c378cc960be4af09c7fb3168bc3_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='381' height='380'></svg>)
+
+---
+
+## **5. 我的一些看法**
+
+这篇工作让我觉得最有意思的地方，不是最终数字，而是那个关于**层间 router 冗余性**的观察。
+
+大家做 MoE 时候默认每层都需要独立的 router，没人细想过这个设计是不是多余的。Read-ME 用转移矩阵和 mutual information 两个角度说话，发现**相邻层 router 的决策几乎是确定性的，layer-wise 设计是过设计（overdesign）**。
+
+这个 insight 的迁移价值很高：如果我们在一开始就设计 MoE 架构（而不是从 dense 转换），是不是也可以考虑 shared router？参数量少了，推理也更友好。这是个值得跟进的方向。
+
+另外值得注意的是，这套框架的前提是"从预训练 dense 模型转换 MoE"，且需要原始模型本身有足够强的激活稀疏性，才能做出质量够好的 expert 划分。如果原始模型的 FFN 激活很稠密，这条路可能就走不通。而且把 dense FFN 按 domain 切分成 expert，类似 once-for-all NAS 的思路，mask 划分基于训练数据的激活统计，**能否在 distribution 差异较大的下游任务上保持性能，是个需要认真对待的风险**。这也是我们在 ExpertFlow [1] 里选择直接在原生 MoE 上做推理优化（而非模型重构）的原因之一——原生 MoE 的能力边界和泛化性是原厂保证的，推理优化不损失模型本身的能力。
+
+不管怎样，**algorithm-system co-design 这个思路是对的**——光在模型架构上优化，忽视系统层面适配，落地效果必然打折。Read-ME 这篇给出了一个完整的闭环方案，理论上证明了 caching 最优性，工程上也量化了每个优化模块的贡献，是那种"可以直接参考来设计自己系统"的工作。
+
+欢迎评论区交流，有 MoE 推理踩坑经历的也欢迎来聊。
+
+---
+
+**References**
+
+[1] ExpertFlow: Optimized Expert Activation and Token Allocation for Efficient Mixture-of-Experts Inference *(DAC 2026)*
+
+*代码开源在：[https://github.com/VITA-Group/READ-ME](https://link.zhihu.com/?target=https%3A//github.com/VITA-Group/READ-ME)*
+
+
+---
+
+## 基于Decoder的LLM为何需要位置编码？
+
+`link: https://www.zhihu.com/question/640465759/answer/2032882623555576577 · created: 1777456986`
+
+
+## **1. 前言**
+
+你有没有过这种感觉——看了五六篇 RoPE 的解析文章，每篇都说"RoPE 利用了旋转矩阵来编码相对位置"，然后给你列一堆公式，最后贴一段 `rotate_half` 的代码，你点点头，好像懂了，但第二天回想起来，还是不知道那个旋转矩阵是从哪儿来的，也不明白代码里的 `chunk(2, dim=-1)` 到底在干什么。
+
+我就是这样。
+
+作为研究 LLM 推理效率的牛马，KV cache 管理、prefix sharing 这些东西几乎每天都要打交道，RoPE 的性质直接决定了 KV cache 能不能共享（不能共享就白搭）。所以最近花时间把这条线从头捋了一遍，从最朴素的 sin/cos 位置编码开始，一路推到 RoPE 的实现，争取把每个"为什么"都说清楚。
+
+有几个问题在网上真的很难找到好答案：
+
+* `sin` 和 `cos` 为什么要**交替配对**用？全用 `sin` 不行吗？
+* position embedding 和 hidden dimension 到底是什么关系？维度那么多，为什么每个维度还要用不同的"频率"？
+* RoPE 从 2D 扩展到 d 维的时候，到底发生了什么？很多文章直接就跳过去了
+* 代码里的 `rotate_half` 为什么直接前后切两半，而不是像 sinusoidal 那样 sin/cos 间隔处理？
+
+下面一个一个说清楚。
+
+不过为了防止后面乱，先把本文用到的所有变量统一说明一下：
+
+![](https://pica.zhimg.com/v2-be9ed916a742fb29dc0b04496ab94bf8_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1274' height='930'></svg>)
+
+注：后面为了简洁，有时用 ![d](https://www.zhihu.com/equation?tex=d) 统一表示 hidden dim 或 head dim，具体含义从上下文判断。
+
+---
+
+## **2. 问题的起点：Attention 根本不知道顺序**
+
+先确认一件事：Attention 机制本身是**置换不变（permutation-invariant）的**。
+
+说人话：给 Attention 层看 `[A, B, C]` 和看 `[C, A, B]`，如果没有位置编码，**它的输出完全一模一样**。
+
+为什么？来直接算一遍。
+
+假设序列只有 2 个 token，embedding 维度 ![d=2](https://www.zhihu.com/equation?tex=d%3D2)。两个 token 的 embedding 分别是：
+
+![\\\mathbf{x}_A = [1, 0],\quad \mathbf{x}_B = [0, 1]](https://www.zhihu.com/equation?tex=%5C%5C%5Cmathbf%7Bx%7D_A+%3D+%5B1%2C+0%5D%2C%5Cquad+%5Cmathbf%7Bx%7D_B+%3D+%5B0%2C+1%5D)
+
+为了简化，令 ![W_Q = W_K = W_V = I](https://www.zhihu.com/equation?tex=W_Q+%3D+W_K+%3D+W_V+%3D+I)（单位矩阵），即 ![Q = K = V = X](https://www.zhihu.com/equation?tex=Q+%3D+K+%3D+V+%3D+X)（直接用 embedding 自身）。
+
+**情形 1：输入顺序是 `[A, B]`**
+
+![\\X = \begin{bmatrix}1 &amp; 0 \\ 0 &amp; 1\end{bmatrix},\quad Q = K = V = \begin{bmatrix}1 &amp; 0 \\ 0 &amp; 1\end{bmatrix}](https://www.zhihu.com/equation?tex=%5C%5CX+%3D+%5Cbegin%7Bbmatrix%7D1+%26amp%3B+0+%5C%5C+0+%26amp%3B+1%5Cend%7Bbmatrix%7D%2C%5Cquad+Q+%3D+K+%3D+V+%3D+%5Cbegin%7Bbmatrix%7D1+%26amp%3B+0+%5C%5C+0+%26amp%3B+1%5Cend%7Bbmatrix%7D)
+
+注意力分数矩阵（缩放后）：
+
+![\\\text{scores} = QK^T = \begin{bmatrix}1\cdot1+0\cdot0 &amp; 1\cdot0+0\cdot1 \\ 0\cdot1+1\cdot0 &amp; 0\cdot0+1\cdot1\end{bmatrix} = \begin{bmatrix}1 &amp; 0 \\ 0 &amp; 1\end{bmatrix}](https://www.zhihu.com/equation?tex=%5C%5C%5Ctext%7Bscores%7D+%3D+QK%5ET+%3D+%5Cbegin%7Bbmatrix%7D1%5Ccdot1%2B0%5Ccdot0+%26amp%3B+1%5Ccdot0%2B0%5Ccdot1+%5C%5C+0%5Ccdot1%2B1%5Ccdot0+%26amp%3B+0%5Ccdot0%2B1%5Ccdot1%5Cend%7Bbmatrix%7D+%3D+%5Cbegin%7Bbmatrix%7D1+%26amp%3B+0+%5C%5C+0+%26amp%3B+1%5Cend%7Bbmatrix%7D)
+
+经过 softmax（按行）：
+
+![\\\text{attn} = \text{softmax}\begin{bmatrix}1 &amp; 0 \\ 0 &amp; 1\end{bmatrix} = \begin{bmatrix}0.731 &amp; 0.269 \\ 0.269 &amp; 0.731\end{bmatrix}](https://www.zhihu.com/equation?tex=%5C%5C%5Ctext%7Battn%7D+%3D+%5Ctext%7Bsoftmax%7D%5Cbegin%7Bbmatrix%7D1+%26amp%3B+0+%5C%5C+0+%26amp%3B+1%5Cend%7Bbmatrix%7D+%3D+%5Cbegin%7Bbmatrix%7D0.731+%26amp%3B+0.269+%5C%5C+0.269+%26amp%3B+0.731%5Cend%7Bbmatrix%7D)
+
+输出 ![O = \text{attn} \cdot V](https://www.zhihu.com/equation?tex=O+%3D+%5Ctext%7Battn%7D+%5Ccdot+V)：
+
+![\\O_A = 0.731 \cdot [1,0] + 0.269 \cdot [0,1] = [0.731,\ 0.269]](https://www.zhihu.com/equation?tex=%5C%5CO_A+%3D+0.731+%5Ccdot+%5B1%2C0%5D+%2B+0.269+%5Ccdot+%5B0%2C1%5D+%3D+%5B0.731%2C%5C+0.269%5D)
+
+![\\O_B = 0.269 \cdot [1,0] + 0.731 \cdot [0,1] = [0.269,\ 0.731]](https://www.zhihu.com/equation?tex=%5C%5CO_B+%3D+0.269+%5Ccdot+%5B1%2C0%5D+%2B+0.731+%5Ccdot+%5B0%2C1%5D+%3D+%5B0.269%2C%5C+0.731%5D)
+
+**情形 2：输入顺序是 `[B, A]`**
+
+![\\X = \begin{bmatrix}0 &amp; 1 \\ 1 &amp; 0\end{bmatrix},\quad Q = K = V = \begin{bmatrix}0 &amp; 1 \\ 1 &amp; 0\end{bmatrix}](https://www.zhihu.com/equation?tex=%5C%5CX+%3D+%5Cbegin%7Bbmatrix%7D0+%26amp%3B+1+%5C%5C+1+%26amp%3B+0%5Cend%7Bbmatrix%7D%2C%5Cquad+Q+%3D+K+%3D+V+%3D+%5Cbegin%7Bbmatrix%7D0+%26amp%3B+1+%5C%5C+1+%26amp%3B+0%5Cend%7Bbmatrix%7D)
+
+注意力分数：
+
+![\\\text{scores} = QK^T = \begin{bmatrix}0\cdot0+1\cdot1 &amp; 0\cdot1+1\cdot0 \\ 1\cdot0+0\cdot1 &amp; 1\cdot1+0\cdot0\end{bmatrix} = \begin{bmatrix}1 &amp; 0 \\ 0 &amp; 1\end{bmatrix}](https://www.zhihu.com/equation?tex=%5C%5C%5Ctext%7Bscores%7D+%3D+QK%5ET+%3D+%5Cbegin%7Bbmatrix%7D0%5Ccdot0%2B1%5Ccdot1+%26amp%3B+0%5Ccdot1%2B1%5Ccdot0+%5C%5C+1%5Ccdot0%2B0%5Ccdot1+%26amp%3B+1%5Ccdot1%2B0%5Ccdot0%5Cend%7Bbmatrix%7D+%3D+%5Cbegin%7Bbmatrix%7D1+%26amp%3B+0+%5C%5C+0+%26amp%3B+1%5Cend%7Bbmatrix%7D)
+
+和情形 1 的分数矩阵完全一样！softmax 后也一样，输出是：
+
+![\\O_B = 0.731 \cdot [0,1] + 0.269 \cdot [1,0] = [0.269,\ 0.731]](https://www.zhihu.com/equation?tex=%5C%5CO_B+%3D+0.731+%5Ccdot+%5B0%2C1%5D+%2B+0.269+%5Ccdot+%5B1%2C0%5D+%3D+%5B0.269%2C%5C+0.731%5D)
+
+![\\O_A = 0.269 \cdot [0,1] + 0.731 \cdot [1,0] = [0.731,\ 0.269]](https://www.zhihu.com/equation?tex=%5C%5CO_A+%3D+0.269+%5Ccdot+%5B0%2C1%5D+%2B+0.731+%5Ccdot+%5B1%2C0%5D+%3D+%5B0.731%2C%5C+0.269%5D)
+
+两种顺序下，![A](https://www.zhihu.com/equation?tex=A) 的输出都是 ![[0.731, 0.269]](https://www.zhihu.com/equation?tex=%5B0.731%2C+0.269%5D)，![B](https://www.zhihu.com/equation?tex=B) 的输出都是 ![[0.269, 0.731]](https://www.zhihu.com/equation?tex=%5B0.269%2C+0.731%5D)。**换个顺序输入，只是输出行的顺序变了，每个 token 对应的输出向量本身没有任何变化。**
+
+这就是所谓的置换不变：Attention 不在乎你是先说 A 还是先说 B，它对每个 token 的处理方式取决于 token 的内容，和位置无关。
+
+所以我们必须人为地把"位置"信息注入进去。问题是：**怎么注入，才算"注入对了"？**
+
+---
+
+## **3. 位置编码应该满足什么条件？**
+
+在设计具体方案之前，先想清楚"好的位置编码"应该有什么性质。
+
+最核心的一条：**位置 ![m](https://www.zhihu.com/equation?tex=m) 的 query 向量 ![\mathbf{q}_m](https://www.zhihu.com/equation?tex=%5Cmathbf%7Bq%7D_m) 和位置 ![n](https://www.zhihu.com/equation?tex=n) 的 key 向量 ![\mathbf{k}_n](https://www.zhihu.com/equation?tex=%5Cmathbf%7Bk%7D_n) 的内积，应该只依赖相对位置 ![(m-n)](https://www.zhihu.com/equation?tex=%28m-n%29)，而不依赖 ![m](https://www.zhihu.com/equation?tex=m)、![n](https://www.zhihu.com/equation?tex=n) 的绝对值。**
+
+用公式写就是：
+
+![\\\mathbf{q}_m \cdot \mathbf{k}_n = f(m - n)](https://www.zhihu.com/equation?tex=%5C%5C%5Cmathbf%7Bq%7D_m+%5Ccdot+%5Cmathbf%7Bk%7D_n+%3D+f%28m+-+n%29)
+
+其中 ![f](https://www.zhihu.com/equation?tex=f) 是某个只和差值 ![(m-n)](https://www.zhihu.com/equation?tex=%28m-n%29) 有关的函数。
+
+**为什么这个性质很重要？**
+
+因为语言中"两个词的关系"取决于它们的相对距离，而不是它们在文章里的绝对位置。"他打了我"里"打"和"我"的关系，不会因为这句话出现在第 1 段还是第 100 段而改变。
+
+有了这个目标，接下来的问题就变成了：怎么设计位置编码，让内积满足这个条件？
+
+---
+
+## **4. Sinusoidal 位置编码：sin 和 cos 为什么要搭配用？**
+
+原始 Transformer（Vaswani et al., 2017）的方案是对每个位置索引 ![t](https://www.zhihu.com/equation?tex=t)（第几个 token）和维度索引 ![i](https://www.zhihu.com/equation?tex=i) 计算一个标量，直接加到 token embedding 上：
+
+![\\\text{PE}(t,\ 2i) = \sin(t \cdot \theta_i),\qquad \text{PE}(t,\ 2i+1) = \cos(t \cdot \theta_i),\qquad \theta_i = 10000^{-2i/d}](https://www.zhihu.com/equation?tex=%5C%5C%5Ctext%7BPE%7D%28t%2C%5C+2i%29+%3D+%5Csin%28t+%5Ccdot+%5Ctheta_i%29%2C%5Cqquad+%5Ctext%7BPE%7D%28t%2C%5C+2i%2B1%29+%3D+%5Ccos%28t+%5Ccdot+%5Ctheta_i%29%2C%5Cqquad+%5Ctheta_i+%3D+10000%5E%7B-2i%2Fd%7D)
+
+偶数维度用 sin，奇数维度用 cos，两个维度共用同一频率 ![\theta_i](https://www.zhihu.com/equation?tex=%5Ctheta_i)，成对出现。
+
+这个设计有两个很自然的问题：
+
+* 为什么一个维度用 sin，另一个用 cos，不能全用 sin 吗？
+* 为什么要每**两个**维度组成一对，而不是其他分组方式？
+
+搞懂这两点之后，会有种豁然开朗的感觉，下面一一说清楚。
+
+### 4.1 为什么一个用 sin，一个用 cos？
+
+PE 是加到 token embedding 上再做投影的，注入 attention 后效果是什么？以位置 ![s](https://www.zhihu.com/equation?tex=s) 的 token 和位置 ![t](https://www.zhihu.com/equation?tex=t) 的 token 为例（注意：![s, t](https://www.zhihu.com/equation?tex=s%2C+t) 是位置索引整数，不是 query/key 向量）：
+
+![\\\tilde{\mathbf{x}}_s = \mathbf{x}_s + \text{PE}(s),\qquad \tilde{\mathbf{x}}_t = \mathbf{x}_t + \text{PE}(t)](https://www.zhihu.com/equation?tex=%5C%5C%5Ctilde%7B%5Cmathbf%7Bx%7D%7D_s+%3D+%5Cmathbf%7Bx%7D_s+%2B+%5Ctext%7BPE%7D%28s%29%2C%5Cqquad+%5Ctilde%7B%5Cmathbf%7Bx%7D%7D_t+%3D+%5Cmathbf%7Bx%7D_t+%2B+%5Ctext%7BPE%7D%28t%29)
+
+经过线性投影后计算 attention score：
+
+![\\Q_s \cdot K_t = \underbrace{(W_Q \mathbf{x}_s) \cdot (W_K \mathbf{x}_t)}_{\text{语义交互}} + \underbrace{(W_Q \mathbf{x}_s) \cdot (W_K \text{PE}(t)) + (W_Q \text{PE}(s)) \cdot (W_K \mathbf{x}_t)}_{\text{语义 × 位置交叉项}} + \underbrace{(W_Q\,\text{PE}(s)) \cdot (W_K\,\text{PE}(t))}_{\text{位置 × 位置}}](https://www.zhihu.com/equation?tex=%5C%5CQ_s+%5Ccdot+K_t+%3D+%5Cunderbrace%7B%28W_Q+%5Cmathbf%7Bx%7D_s%29+%5Ccdot+%28W_K+%5Cmathbf%7Bx%7D_t%29%7D_%7B%5Ctext%7B%E8%AF%AD%E4%B9%89%E4%BA%A4%E4%BA%92%7D%7D+%2B+%5Cunderbrace%7B%28W_Q+%5Cmathbf%7Bx%7D_s%29+%5Ccdot+%28W_K+%5Ctext%7BPE%7D%28t%29%29+%2B+%28W_Q+%5Ctext%7BPE%7D%28s%29%29+%5Ccdot+%28W_K+%5Cmathbf%7Bx%7D_t%29%7D_%7B%5Ctext%7B%E8%AF%AD%E4%B9%89+%C3%97+%E4%BD%8D%E7%BD%AE%E4%BA%A4%E5%8F%89%E9%A1%B9%7D%7D+%2B+%5Cunderbrace%7B%28W_Q%5C%2C%5Ctext%7BPE%7D%28s%29%29+%5Ccdot+%28W_K%5C%2C%5Ctext%7BPE%7D%28t%29%29%7D_%7B%5Ctext%7B%E4%BD%8D%E7%BD%AE+%C3%97+%E4%BD%8D%E7%BD%AE%7D%7D)
+
+前三项涉及 ![W_Q, W_K](https://www.zhihu.com/equation?tex=W_Q%2C+W_K) 的参数，模型在训练中可以灵活学习如何处理。**最后一项 ![(W_Q\,\text{PE}(s)) \cdot (W_K\,\text{PE}(t))](https://www.zhihu.com/equation?tex=%28W_Q%5C%2C%5Ctext%7BPE%7D%28s%29%29+%5Ccdot+%28W_K%5C%2C%5Ctext%7BPE%7D%28t%29%29) 完全由位置编码决定**——如果它只依赖相对距离 ![(s-t)](https://www.zhihu.com/equation?tex=%28s-t%29)，就给模型一个稳定的"位置锚点"。
+
+为了分析最方便，令 ![W_Q = W_K = I](https://www.zhihu.com/equation?tex=W_Q+%3D+W_K+%3D+I)（单位矩阵），此时这一项简化为 ![\text{PE}(s) \cdot \text{PE}(t)](https://www.zhihu.com/equation?tex=%5Ctext%7BPE%7D%28s%29+%5Ccdot+%5Ctext%7BPE%7D%28t%29)。
+
+**先看全用 sin 会怎样**。两个位置的 PE 内积：
+
+![\\\text{PE}_{\sin}(s) \cdot \text{PE}_{\sin}(t) = \sum_i \sin(s\theta_i)\sin(t\theta_i)](https://www.zhihu.com/equation?tex=%5C%5C%5Ctext%7BPE%7D_%7B%5Csin%7D%28s%29+%5Ccdot+%5Ctext%7BPE%7D_%7B%5Csin%7D%28t%29+%3D+%5Csum_i+%5Csin%28s%5Ctheta_i%29%5Csin%28t%5Ctheta_i%29)
+
+用积化和差 ![\sin(a)\sin(b) = \frac{1}{2}[\cos(a-b) - \cos(a+b)]](https://www.zhihu.com/equation?tex=%5Csin%28a%29%5Csin%28b%29+%3D+%5Cfrac%7B1%7D%7B2%7D%5B%5Ccos%28a-b%29+-+%5Ccos%28a%2Bb%29%5D)：
+
+![\\= \frac{1}{2}\sum_i \bigl[\cos\!\bigl((s-t)\theta_i\bigr) - \cos\!\bigl((s+t)\theta_i\bigr)\bigr]](https://www.zhihu.com/equation?tex=%5C%5C%3D+%5Cfrac%7B1%7D%7B2%7D%5Csum_i+%5Cbigl%5B%5Ccos%5C%21%5Cbigl%28%28s-t%29%5Ctheta_i%5Cbigr%29+-+%5Ccos%5C%21%5Cbigl%28%28s%2Bt%29%5Ctheta_i%5Cbigr%29%5Cbigr%5D)
+
+里面有 ![\cos((s-t)\theta_i)](https://www.zhihu.com/equation?tex=%5Ccos%28%28s-t%29%5Ctheta_i%29)（相对位置），**同时还有** ![\cos((s+t)\theta_i)](https://www.zhihu.com/equation?tex=%5Ccos%28%28s%2Bt%29%5Ctheta_i%29)（绝对位置之和）。两者都在，内积同时依赖相对和绝对位置，没办法给模型纯粹的"相对位置信号"。
+
+**换成 sin + cos 配对**：
+
+![\\\text{PE}(s) \cdot \text{PE}(t) = \sum_i \bigl[\sin(s\theta_i)\sin(t\theta_i) + \cos(s\theta_i)\cos(t\theta_i)\bigr] = \sum_i \cos\!\bigl((s-t)\theta_i\bigr)](https://www.zhihu.com/equation?tex=%5C%5C%5Ctext%7BPE%7D%28s%29+%5Ccdot+%5Ctext%7BPE%7D%28t%29+%3D+%5Csum_i+%5Cbigl%5B%5Csin%28s%5Ctheta_i%29%5Csin%28t%5Ctheta_i%29+%2B+%5Ccos%28s%5Ctheta_i%29%5Ccos%28t%5Ctheta_i%29%5Cbigr%5D+%3D+%5Csum_i+%5Ccos%5C%21%5Cbigl%28%28s-t%29%5Ctheta_i%5Cbigr%29)
+
+利用 ![\sin(a)\sin(b) + \cos(a)\cos(b) = \cos(a-b)](https://www.zhihu.com/equation?tex=%5Csin%28a%29%5Csin%28b%29+%2B+%5Ccos%28a%29%5Ccos%28b%29+%3D+%5Ccos%28a-b%29)，**绝对位置完全消掉，只剩相对位置差 ![(s-t)](https://www.zhihu.com/equation?tex=%28s-t%29)**。
+
+这就是 sin/cos 必须配对的根本原因：![\cos(a-b)](https://www.zhihu.com/equation?tex=%5Ccos%28a-b%29) 的恒等式展开式天然需要 sin 和 cos 各一个。全用 sin 缺少 cos 项，内积里就会多出 ![\cos(s+t)](https://www.zhihu.com/equation?tex=%5Ccos%28s%2Bt%29) 这个绝对位置污染项。
+
+### 4.2 为什么要每两个维度一组，且每组频率不同？
+
+上面的结论直接决定了分组方式：**一个 sin + 一个 cos 凑在一起，内积才能只依赖 ![(s-t)](https://www.zhihu.com/equation?tex=%28s-t%29)**，两者必须成对出现，不能单打独斗。
+
+attention 的内积计算是逐维度累加的：
+
+![\\Q_s \cdot K_t = \sum_{j=0}^{d-1} Q_s^{(j)} \cdot K_t^{(j)} = \underbrace{Q_s^{(0)} K_t^{(0)} + Q_s^{(1)} K_t^{(1)}}_{\text{第 0 对}} + \underbrace{Q_s^{(2)} K_t^{(2)} + Q_s^{(3)} K_t^{(3)}}_{\text{第 1 对}} + \cdots](https://www.zhihu.com/equation?tex=%5C%5CQ_s+%5Ccdot+K_t+%3D+%5Csum_%7Bj%3D0%7D%5E%7Bd-1%7D+Q_s%5E%7B%28j%29%7D+%5Ccdot+K_t%5E%7B%28j%29%7D+%3D+%5Cunderbrace%7BQ_s%5E%7B%280%29%7D+K_t%5E%7B%280%29%7D+%2B+Q_s%5E%7B%281%29%7D+K_t%5E%7B%281%29%7D%7D_%7B%5Ctext%7B%E7%AC%AC+0+%E5%AF%B9%7D%7D+%2B+%5Cunderbrace%7BQ_s%5E%7B%282%29%7D+K_t%5E%7B%282%29%7D+%2B+Q_s%5E%7B%283%29%7D+K_t%5E%7B%283%29%7D%7D_%7B%5Ctext%7B%E7%AC%AC+1+%E5%AF%B9%7D%7D+%2B+%5Ccdots)
+
+sinusoidal PE 的奇偶设计使得维度 ![2i](https://www.zhihu.com/equation?tex=2i) 和维度 ![2i+1](https://www.zhihu.com/equation?tex=2i%2B1) 天然成一对，其内积之和恰好构成 ![\cos((s-t)\theta_i)](https://www.zhihu.com/equation?tex=%5Ccos%28%28s-t%29%5Ctheta_i%29)：
+
+![\\\sin(s\theta_i)\sin(t\theta_i) + \cos(s\theta_i)\cos(t\theta_i) = \cos\!\bigl((s-t)\theta_i\bigr)](https://www.zhihu.com/equation?tex=%5C%5C%5Csin%28s%5Ctheta_i%29%5Csin%28t%5Ctheta_i%29+%2B+%5Ccos%28s%5Ctheta_i%29%5Ccos%28t%5Ctheta_i%29+%3D+%5Ccos%5C%21%5Cbigl%28%28s-t%29%5Ctheta_i%5Cbigr%29)
+
+**这就是"每两个维度一组"的根本来源**：内积的每一对加法项对应一个 ![\cos(a-b)](https://www.zhihu.com/equation?tex=%5Ccos%28a-b%29) 恒等式，强制要求 sin 和 cos 必须成对落在相邻维度。
+
+---
+
+**那为什么 ![d/2](https://www.zhihu.com/equation?tex=d%2F2) 对要各用不同的频率 ![\theta_i](https://www.zhihu.com/equation?tex=%5Ctheta_i)？**
+
+想象极端情形：![d=64](https://www.zhihu.com/equation?tex=d%3D64)，但全部 32 对都用同一频率 ![\theta_0 = 1](https://www.zhihu.com/equation?tex=%5Ctheta_0+%3D+1)。
+
+* 位置 ![t = 0](https://www.zhihu.com/equation?tex=t+%3D+0)：![\text{PE} = [\sin 0, \cos 0, \sin 0, \cos 0, \ldots] = [0, 1, 0, 1, \ldots]](https://www.zhihu.com/equation?tex=%5Ctext%7BPE%7D+%3D+%5B%5Csin+0%2C+%5Ccos+0%2C+%5Csin+0%2C+%5Ccos+0%2C+%5Cldots%5D+%3D+%5B0%2C+1%2C+0%2C+1%2C+%5Cldots%5D)
+* 位置 ![t = 2\pi \approx 6.28](https://www.zhihu.com/equation?tex=t+%3D+2%5Cpi+%5Capprox+6.28)：![\text{PE} = [\sin 2\pi, \cos 2\pi, \ldots] = [0, 1, 0, 1, \ldots]](https://www.zhihu.com/equation?tex=%5Ctext%7BPE%7D+%3D+%5B%5Csin+2%5Cpi%2C+%5Ccos+2%5Cpi%2C+%5Cldots%5D+%3D+%5B0%2C+1%2C+0%2C+1%2C+%5Cldots%5D)
+
+两个完全不同的位置，PE 向量**一模一样**——模型根本分不清。sin/cos 的值在 ![[-1, 1]](https://www.zhihu.com/equation?tex=%5B-1%2C+1%5D) 之间震荡，周期是 ![2\pi / \theta_i](https://www.zhihu.com/equation?tex=2%5Cpi+%2F+%5Ctheta_i)。同一频率意味着超过一个周期就会"碰撞"。
+
+解决办法：让每对维度用不同的频率，就像时钟三根指针各自独立旋转：
+
+![](https://picx.zhimg.com/v2-ad18b5cfa4d21c10210845e3f3a4416b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1278' height='600'></svg>)
+
+秒针（高频）区分秒级差距，时针（低频）区分小时级差距，三根指针组合才能唯一确定时刻。同理，高频维度对区分相邻 token，低频维度对感知长程位置，![d/2](https://www.zhihu.com/equation?tex=d%2F2) 对频率合在一起唯一表示任意位置。
+
+**结论：![d](https://www.zhihu.com/equation?tex=d) 维 embedding 里有 ![d/2](https://www.zhihu.com/equation?tex=d%2F2) 个计时器，每个计时器占 2 个维度（sin + cos 各一），每个计时器转速不同。sin/cos 必须配对，是 ![\cos(a-b)](https://www.zhihu.com/equation?tex=%5Ccos%28a-b%29) 公式的要求；频率必须各异，是为了避免碰撞、覆盖所有距离范围。**
+
+---
+
+## **5. RoPE：不加，而是转**
+
+Sinusoidal PE 把位置加到 embedding 再做投影，内积展开后有 4 项，位置和语义信息混在一起，相对位置的保证并不精确。苏剑林（苏大神，@苏建林）在 2021 年提出了 RoPE（Rotary Position Embedding），核心思路翻转：**不在 embedding 上加位置，直接对 Q 和 K 施加依赖于位置的旋转变换**。
+
+直觉：如果位置 ![m](https://www.zhihu.com/equation?tex=m) 的 Q 被旋转了 ![m\theta](https://www.zhihu.com/equation?tex=m%5Ctheta) 角度，位置 ![n](https://www.zhihu.com/equation?tex=n) 的 K 被旋转了 ![n\theta](https://www.zhihu.com/equation?tex=n%5Ctheta) 角度，内积里自然包含角度差 ![(m-n)\theta](https://www.zhihu.com/equation?tex=%28m-n%29%5Ctheta)——相对位置，而且是**精确地**只有相对位置，没有绝对位置的污染。
+
+### 5.1 从 2D 推到 d_h 维
+
+先把问题化到最简单：head dimension ![d_h = 2](https://www.zhihu.com/equation?tex=d_h+%3D+2)，query ![\mathbf{q} = [q_1, q_2]^T](https://www.zhihu.com/equation?tex=%5Cmathbf%7Bq%7D+%3D+%5Bq_1%2C+q_2%5D%5ET)，key ![\mathbf{k} = [k_1, k_2]^T](https://www.zhihu.com/equation?tex=%5Cmathbf%7Bk%7D+%3D+%5Bk_1%2C+k_2%5D%5ET)，只有一个频率 ![\theta](https://www.zhihu.com/equation?tex=%5Ctheta)。
+
+RoPE 对位置 ![m](https://www.zhihu.com/equation?tex=m) 的 query 做旋转：
+
+![\\\mathbf{q}_m^{\text{rope}} = \begin{bmatrix}\cos m\theta &amp; -\sin m\theta \\ \sin m\theta &amp; \cos m\theta\end{bmatrix} \begin{bmatrix}q_1 \\ q_2\end{bmatrix} = \begin{bmatrix}q_1\cos m\theta - q_2\sin m\theta \\ q_1\sin m\theta + q_2\cos m\theta\end{bmatrix}](https://www.zhihu.com/equation?tex=%5C%5C%5Cmathbf%7Bq%7D_m%5E%7B%5Ctext%7Brope%7D%7D+%3D+%5Cbegin%7Bbmatrix%7D%5Ccos+m%5Ctheta+%26amp%3B+-%5Csin+m%5Ctheta+%5C%5C+%5Csin+m%5Ctheta+%26amp%3B+%5Ccos+m%5Ctheta%5Cend%7Bbmatrix%7D+%5Cbegin%7Bbmatrix%7Dq_1+%5C%5C+q_2%5Cend%7Bbmatrix%7D+%3D+%5Cbegin%7Bbmatrix%7Dq_1%5Ccos+m%5Ctheta+-+q_2%5Csin+m%5Ctheta+%5C%5C+q_1%5Csin+m%5Ctheta+%2B+q_2%5Ccos+m%5Ctheta%5Cend%7Bbmatrix%7D)
+
+这是平面几何里的**逆时针旋转**：把向量 ![\mathbf{q}](https://www.zhihu.com/equation?tex=%5Cmathbf%7Bq%7D) 旋转 ![m\theta](https://www.zhihu.com/equation?tex=m%5Ctheta) 弧度，模长不变。同样对位置 ![n](https://www.zhihu.com/equation?tex=n) 的 key 旋转 ![n\theta](https://www.zhihu.com/equation?tex=n%5Ctheta)，然后算内积（展开后利用 ![\cos(a)\cos(b)+\sin(a)\sin(b)=\cos(a-b)](https://www.zhihu.com/equation?tex=%5Ccos%28a%29%5Ccos%28b%29%2B%5Csin%28a%29%5Csin%28b%29%3D%5Ccos%28a-b%29)）：
+
+![\\\langle \mathbf{q}_m^{\text{rope}},\ \mathbf{k}_n^{\text{rope}} \rangle = (q_1 k_1 + q_2 k_2)\cos\!\bigl((m-n)\theta\bigr) + (q_1 k_2 - q_2 k_1)\sin\!\bigl((m-n)\theta\bigr)](https://www.zhihu.com/equation?tex=%5C%5C%5Clangle+%5Cmathbf%7Bq%7D_m%5E%7B%5Ctext%7Brope%7D%7D%2C%5C+%5Cmathbf%7Bk%7D_n%5E%7B%5Ctext%7Brope%7D%7D+%5Crangle+%3D+%28q_1+k_1+%2B+q_2+k_2%29%5Ccos%5C%21%5Cbigl%28%28m-n%29%5Ctheta%5Cbigr%29+%2B+%28q_1+k_2+-+q_2+k_1%29%5Csin%5C%21%5Cbigl%28%28m-n%29%5Ctheta%5Cbigr%29)
+
+只含 ![(m-n)\theta](https://www.zhihu.com/equation?tex=%28m-n%29%5Ctheta)，**精确地只依赖相对位置**，绝对位置 ![m, n](https://www.zhihu.com/equation?tex=m%2C+n) 完全消掉了。
+
+扩展到 ![d_h](https://www.zhihu.com/equation?tex=d_h) 维也是同样的道理：把 ![d_h](https://www.zhihu.com/equation?tex=d_h) 维 query 切成 ![d_h/2](https://www.zhihu.com/equation?tex=d_h%2F2) 对，每对独立做一次 2D 旋转，各自用不同的频率 ![\theta_i = 10000^{-2i/d_h}](https://www.zhihu.com/equation?tex=%5Ctheta_i+%3D+10000%5E%7B-2i%2Fd_h%7D)：
+
+![\\\text{第 } i \text{ 对} \quad (q_{2i+1}, q_{2i+2}) \xrightarrow{\;\text{旋转}\; m\theta_i\;} \begin{bmatrix}q_{2i+1}\cos m\theta_i - q_{2i+2}\sin m\theta_i \\ q_{2i+1}\sin m\theta_i + q_{2i+2}\cos m\theta_i\end{bmatrix}](https://www.zhihu.com/equation?tex=%5C%5C%5Ctext%7B%E7%AC%AC+%7D+i+%5Ctext%7B+%E5%AF%B9%7D+%5Cquad+%28q_%7B2i%2B1%7D%2C+q_%7B2i%2B2%7D%29+%5Cxrightarrow%7B%5C%3B%5Ctext%7B%E6%97%8B%E8%BD%AC%7D%5C%3B+m%5Ctheta_i%5C%3B%7D+%5Cbegin%7Bbmatrix%7Dq_%7B2i%2B1%7D%5Ccos+m%5Ctheta_i+-+q_%7B2i%2B2%7D%5Csin+m%5Ctheta_i+%5C%5C+q_%7B2i%2B1%7D%5Csin+m%5Ctheta_i+%2B+q_%7B2i%2B2%7D%5Ccos+m%5Ctheta_i%5Cend%7Bbmatrix%7D)
+
+全部 ![d_h/2](https://www.zhihu.com/equation?tex=d_h%2F2) 对旋转完拼在一起，等价于施加一个**块对角旋转矩阵** ![R_{\Theta,m}](https://www.zhihu.com/equation?tex=R_%7B%5CTheta%2Cm%7D)。内积性质对全部维度精确成立：
+
+![\\\langle \mathbf{q}_m^{\text{rope}},\ \mathbf{k}_n^{\text{rope}} \rangle = \mathbf{q}^T R_{\Theta,m}^T R_{\Theta,n}\,\mathbf{k} = \mathbf{q}^T R_{\Theta,n-m}\,\mathbf{k}](https://www.zhihu.com/equation?tex=%5C%5C%5Clangle+%5Cmathbf%7Bq%7D_m%5E%7B%5Ctext%7Brope%7D%7D%2C%5C+%5Cmathbf%7Bk%7D_n%5E%7B%5Ctext%7Brope%7D%7D+%5Crangle+%3D+%5Cmathbf%7Bq%7D%5ET+R_%7B%5CTheta%2Cm%7D%5ET+R_%7B%5CTheta%2Cn%7D%5C%2C%5Cmathbf%7Bk%7D+%3D+%5Cmathbf%7Bq%7D%5ET+R_%7B%5CTheta%2Cn-m%7D%5C%2C%5Cmathbf%7Bk%7D)
+
+### 5.2 代码实现
+
+实际代码不会构造那个稀疏块对角矩阵，而是把矩阵乘法等价分解成两次逐元素乘法。以 ![d_h=4](https://www.zhihu.com/equation?tex=d_h%3D4)、相邻配对为例展开：
+
+![\\\mathbf{q}^{\text{rope}} = \begin{bmatrix}q_1 \\ q_2 \\ q_3 \\ q_4\end{bmatrix} \odot \begin{bmatrix}\cos m\theta_0 \\ \cos m\theta_0 \\ \cos m\theta_1 \\ \cos m\theta_1\end{bmatrix} + \begin{bmatrix}-q_2 \\ q_1 \\ -q_4 \\ q_3\end{bmatrix} \odot \begin{bmatrix}\sin m\theta_0 \\ \sin m\theta_0 \\ \sin m\theta_1 \\ \sin m\theta_1\end{bmatrix}](https://www.zhihu.com/equation?tex=%5C%5C%5Cmathbf%7Bq%7D%5E%7B%5Ctext%7Brope%7D%7D+%3D+%5Cbegin%7Bbmatrix%7Dq_1+%5C%5C+q_2+%5C%5C+q_3+%5C%5C+q_4%5Cend%7Bbmatrix%7D+%5Codot+%5Cbegin%7Bbmatrix%7D%5Ccos+m%5Ctheta_0+%5C%5C+%5Ccos+m%5Ctheta_0+%5C%5C+%5Ccos+m%5Ctheta_1+%5C%5C+%5Ccos+m%5Ctheta_1%5Cend%7Bbmatrix%7D+%2B+%5Cbegin%7Bbmatrix%7D-q_2+%5C%5C+q_1+%5C%5C+-q_4+%5C%5C+q_3%5Cend%7Bbmatrix%7D+%5Codot+%5Cbegin%7Bbmatrix%7D%5Csin+m%5Ctheta_0+%5C%5C+%5Csin+m%5Ctheta_0+%5C%5C+%5Csin+m%5Ctheta_1+%5C%5C+%5Csin+m%5Ctheta_1%5Cend%7Bbmatrix%7D)
+
+"邻位交换取负"——把每对 ![(q_{2i+1}, q_{2i+2})](https://www.zhihu.com/equation?tex=%28q_%7B2i%2B1%7D%2C+q_%7B2i%2B2%7D%29) 变成 ![(-q_{2i+2}, q_{2i+1})](https://www.zhihu.com/equation?tex=%28-q_%7B2i%2B2%7D%2C+q_%7B2i%2B1%7D%29)——是 HuggingFace LLaMA 实现里的相邻配对方式。还有另一种等价实现：把整个向量**前半段和后半段**对应配对，维度 ![i](https://www.zhihu.com/equation?tex=i) 和维度 ![i + d_h/2](https://www.zhihu.com/equation?tex=i+%2B+d_h%2F2) 配成一对：
+
+```
+import torch
+
+def rotate_half(x):
+    # x shape: [B, heads, T, d_h]
+    # 前后半段配对：维度 i 和维度 i+d_h/2 配对旋转
+    x1 = x[..., : x.shape[-1] // 2]   # 前半段
+    x2 = x[..., x.shape[-1] // 2 :]   # 后半段
+    return torch.cat([-x2, x1], dim=-1)  # [-后半, 前半]
+
+def apply_rope(q, k, cos, sin):
+    # cos/sin shape: [1, 1, T, d_h]
+    return (q * cos) + (rotate_half(q) * sin), \
+           (k * cos) + (rotate_half(k) * sin)
+```
+
+以 ![d_h = 4](https://www.zhihu.com/equation?tex=d_h+%3D+4)，位置 ![m](https://www.zhihu.com/equation?tex=m) 为例展开：前半 `x1 = [q₁, q₂]`，后半 `x2 = [q₃, q₄]`，`rotate_half(q) = [-q₃, -q₄, q₁, q₂]`。cos 表为 `[cos(mθ₀), cos(mθ₁), cos(mθ₀), cos(mθ₁)]`，结果：![(q_1, q_3)](https://www.zhihu.com/equation?tex=%28q_1%2C+q_3%29) 配对旋转 ![m\theta_0](https://www.zhihu.com/equation?tex=m%5Ctheta_0)，![(q_2, q_4)](https://www.zhihu.com/equation?tex=%28q_2%2C+q_4%29) 配对旋转 ![m\theta_1](https://www.zhihu.com/equation?tex=m%5Ctheta_1)。和相邻配对只是分组方式不同，**数学性质完全一致**。
+
+**为什么用前后切两半，而不像 sinusoidal 那样奇偶间隔？**
+
+sinusoidal 的相邻配对（维度 ![2i](https://www.zhihu.com/equation?tex=2i) 和 ![2i+1](https://www.zhihu.com/equation?tex=2i%2B1)）需要"隔一个取一个"，实现稍复杂。前后切两半只需要一次 chunk 操作，逻辑更清晰——因为频率查找表是把 ![d_h/2](https://www.zhihu.com/equation?tex=d_h%2F2) 个频率直接重复两遍，前半段和后半段天然共享相同频率，只需做整块交换。
+
+cos/sin 查找表的预计算：
+
+```
+def build_rope_cache(head_dim: int, max_seq_len: int = 512, base: float = 10000.0):
+    # 频率：theta_i = base^(-2i/d_h)，共 d_h/2 个
+    # i=0 -&gt; 最大频率（旋转最快），i=d_h/2-1 -&gt; 最小频率（旋转最慢）
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+
+    positions = torch.arange(max_seq_len, dtype=torch.float)    # [max_len]
+    freqs = torch.outer(positions, inv_freq)                     # [max_len, d_h/2]
+    # freqs[t, i] = t * theta_i，即位置 t、第 i 对维度的旋转角度
+
+    # 前后半段配对：把 d_h/2 个频率重复两遍 -&gt; [max_len, d_h]
+    # 前 d_h/2 列 = 后 d_h/2 列，保证前后半段共享相同频率
+    emb = torch.cat([freqs, freqs], dim=-1)
+    return emb.cos(), emb.sin()
+```
+
+### 5.3 与 KV Cache 的配合
+
+RoPE 和 KV cache 配合得天衣无缝。Prefill 阶段一次性处理 prompt，每个位置 ![t](https://www.zhihu.com/equation?tex=t) 的 K 在生成时编码了位置 ![t](https://www.zhihu.com/equation?tex=t) 的旋转并缓存。Decode 阶段新 token 在位置 `past_len`，只需对新的 Q、K 施加该位置的旋转：
+
+```
+cos_table, sin_table = build_rope_cache(head_dim)
+
+# Decode 阶段：past_len = 已缓存的 K 序列长度
+cos = cos_table[past_len: past_len + 1].unsqueeze(0).unsqueeze(0)  # [1,1,1,d_h]
+sin = sin_table[past_len: past_len + 1].unsqueeze(0).unsqueeze(0)
+q_rope, k_rope_new = apply_rope(q, k_new, cos, sin)
+
+# 新 K 追加到历史 KV cache，历史 K 保持不动
+k_full = torch.cat([k_cache, k_rope_new], dim=2)
+```
+
+历史 K 不动（已编好各自位置的旋转），新 Q 旋转到当前位置，做 attention 时：
+
+![\\\langle \mathbf{q}_m^{\text{rope}},\ \mathbf{k}_n^{\text{rope}} \rangle = f(\mathbf{q}, \mathbf{k},\ m - n)](https://www.zhihu.com/equation?tex=%5C%5C%5Clangle+%5Cmathbf%7Bq%7D_m%5E%7B%5Ctext%7Brope%7D%7D%2C%5C+%5Cmathbf%7Bk%7D_n%5E%7B%5Ctext%7Brope%7D%7D+%5Crangle+%3D+f%28%5Cmathbf%7Bq%7D%2C+%5Cmathbf%7Bk%7D%2C%5C+m+-+n%29)
+
+相对距离 ![(m-n)](https://www.zhihu.com/equation?tex=%28m-n%29) 自动从旋转角度之差中来，**不需要对历史 K 重新编码，cache 可以直接复用**。这也是为什么 prefix sharing（前缀 KV 共享）在 RoPE 模型里能正确工作：只要前缀从位置 0 开始，其 KV 就和任何共享同一前缀的请求完全一致。
+
+---
+
+## **6. 对比总结**
+
+![](https://picx.zhimg.com/v2-348ad56ff7f1c839a63c3196878478b4_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1276' height='684'></svg>)
+
+**为什么 sin/cos 要配对用，不能全用 sin？** 因为 ![\sin(a)\sin(b) + \cos(a)\cos(b) = \cos(a-b)](https://www.zhihu.com/equation?tex=%5Csin%28a%29%5Csin%28b%29+%2B+%5Ccos%28a%29%5Ccos%28b%29+%3D+%5Ccos%28a-b%29)，配对后内积只剩相对位置差。全用 sin 的话，积化和差会多出 ![\cos(a+b)](https://www.zhihu.com/equation?tex=%5Ccos%28a%2Bb%29) 项，绝对位置混进来了。
+
+**为什么 position embedding 跟维度索引 ![i](https://www.zhihu.com/equation?tex=i) 也有关？** 每对维度充当不同频率的计时器，高频区分相邻 token，低频感知长程结构。如果所有维度用同一频率，不同位置的编码会碰撞。
+
+**RoPE 从 2D 到 ![d_h](https://www.zhihu.com/equation?tex=d_h) 维怎么扩展？** 把 ![d_h](https://www.zhihu.com/equation?tex=d_h) 维切成 ![d_h/2](https://www.zhihu.com/equation?tex=d_h%2F2) 对，每对独立做 2D 旋转，每对频率不同——就是 2D 的简单重复，合在一起是块对角矩阵。
+
+**代码里的 `rotate_half` 为什么直接前后切两半？** 前后半段配对是一种等价的分组方式（维度 ![i](https://www.zhihu.com/equation?tex=i) 和 ![i+d_h/2](https://www.zhihu.com/equation?tex=i%2Bd_h%2F2) 配对），`chunk(2, dim=-1)` + `cat([-x2, x1])` 比相邻配对实现更简洁，数学性质完全一样。
+
+欢迎评论区讨论，有理解不对的地方也欢迎指出。
+
+
+---
+
+## 公众号不支持markdown格式文件编写怎么办？
+
+`link: https://www.zhihu.com/question/640911439/answer/2032224962321305978 · created: 1777300187`
+
+
+作为一个用 Markdown 写所有东西的牛马，最烦的事情不是写文章本身，而是写完之后的"排版搬运"——
+
+微信公众号编辑器不认 Markdown，公式渲染不了，代码块丑得没法看。知乎编辑器好一点但也有各种格式丢失。小红书更别提了，想发个技术笔记还得截图……
+
+每次写完一篇技术博客，光是把内容搬到各个平台就要花半小时甚至更久。**写作 20 分钟，排版 2 小时**，这也太离谱了。
+
+所以我花了一天时间（当然是和 Claude 一起），撸了一个 VS Code 插件：**MD2WeChat**。
+
+> GitHub：[https://github.com/marsggbo/md2wechat](https://link.zhihu.com/?target=https%3A//github.com/marsggbo/md2wechat)
+
+---
+
+## 它能干什么？
+
+一句话：**在 VS Code 里写完 Markdown，一键生成微信公众号 / 知乎 / 小红书三个平台的排版内容**。
+
+![](https://picx.zhimg.com/v2-5d1af3b5a43bbd315409fa60338ce2d5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1039' height='777'></svg>)
+
+具体功能：
+
+* **📋 复制微信**：一键复制排版好的 HTML，直接粘贴到微信公众号编辑器，格式完美保留
+* **📋 复制知乎**：自动适配知乎的排版样式，粘贴即用
+* **📱 导出小红书**：生成适合小红书的图片截图，直接发帖
+* **📐 LaTeX 公式**：支持行内 `$...$` 和独立 `$$...$$` 公式块，基于 KaTeX 渲染，微信公众号里也能显示公式了
+* **🖼️ 图片说明文字**：Markdown 图片的 alt 文本自动渲染为居中灰色 caption
+* **👁️ 实时预览**：右侧独立预览面板，保存即刷新
+* **🎨 修改样式**：内置 CSS 编辑器，所见即所得
+* **☁️ 上传公众号**：直接上传到微信草稿箱（通过 FastPen 服务）
+* **💾 导出 HTML**：导出带完整内联样式的 HTML 文件
+
+---
+
+## 怎么用？
+
+### 安装
+
+目前支持两种安装方式：
+
+**方式一：VS Code 扩展市场搜索 `MD2WeChat` 一键安装**（推荐）
+
+**方式二：从源码安装**
+
+```
+git clone https://github.com/marsggbo/md2wechat.git
+cd md2wechat
+npm install
+# 在 VS Code 中打开并按 F5 启动调试
+```
+
+### 使用
+
+1. 在 VS Code 里打开任意 `.md` 文件
+2. 快捷键 `Cmd+Shift+W`（macOS）/ `Ctrl+Shift+W`（Windows/Linux）
+3. 右侧弹出预览面板，顶部工具栏选择你要的操作
+
+就这么简单。写完 Markdown，按一下快捷键，点「复制微信」，去公众号编辑器里 `Cmd+V`，完事。
+
+### 公式效果
+
+行内公式 `$E = mc^2$` 和独立公式块都支持：
+
+```
+$$
+\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}
+$$
+```
+
+对于我们这种写技术文章动不动就要插公式的人来说，这个功能是刚需。
+
+---
+
+## 为什么不用现有的工具？
+
+市面上做 Markdown 转微信的工具不少，但大多数都有这些问题：
+
+1. **不支持公式**——对技术写作者来说是硬伤
+2. **需要在线编辑器**——离开了本地 Markdown 工作流
+3. **不支持多平台**——只能转微信，知乎和小红书还得另外处理
+4. **图片需要图床**——多一步操作多一份麻烦
+
+MD2WeChat 的思路就是：**不要让你离开 VS Code，不要让你改变写作习惯，写完 Markdown 之后的所有事情插件帮你搞定**。
+
+---
+
+插件刚写好，功能还在迭代中，欢迎试用和反馈。有 bug 或者 feature request 直接去 GitHub 提 issue 就行：
+
+👉 [https://github.com/marsggbo/md2wechat](https://link.zhihu.com/?target=https%3A//github.com/marsggbo/md2wechat)
+
+觉得有用的话顺手给个 star 哈哈。
 
 
 ---
@@ -45,7 +2308,7 @@ Qwen3-30B-A3B 有 128 个 expert，全量加载就是海量的 on-chip 存储需
 
 这篇工作的出发点很有意思 —— 既然 D2D（die-to-die）高带宽互联（比如 UCIe）越来越成熟，**为什么不把它当成一种计算资源，而不是单纯的通信开销来对待？**
 
-![](https://pic1.zhimg.com/v2-60a0d55ea1e2dac1dac754bdd8f9133c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2461' height='861'></svg>)
+![](https://picx.zhimg.com/v2-60a0d55ea1e2dac1dac754bdd8f9133c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2461' height='861'></svg>)
 
 核心方案叫 **FSE-DP（Fully Sharded Expert Data Parallelism）**，可以拆成三个互相咬合的设计：
 
@@ -71,7 +2334,7 @@ Qwen3-30B-A3B 有 128 个 expert，全量加载就是海量的 on-chip 存储需
 
 一个 expert 不再绑定在某一个芯粒上，而是**均匀切分到所有芯粒上**。每个芯粒持有这个 expert 的一个 slice，token 在芯粒间做 redispatch 以均衡负载。
 
-![](https://picx.zhimg.com/v2-91e87eed556ff7cd5919c93563a35591_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='917' height='305'></svg>)
+![](https://pic1.zhimg.com/v2-91e87eed556ff7cd5919c93563a35591_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='917' height='305'></svg>)
 
 两种等价的执行方式：
 
@@ -88,11 +2351,11 @@ Qwen3-30B-A3B 有 128 个 expert，全量加载就是海量的 on-chip 存储需
 
 **Token Buffering**：遇到 cold expert 时，不急着立刻处理这个 request，而是在 MoE 层边界暂停，等积累到一定数量的 token 之后再一起处理，提升 expert 利用率。
 
-![](https://picx.zhimg.com/v2-fd478dd29f6e5bc3bd7a28801d0085b7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='896' height='303'></svg>)
+![](https://pica.zhimg.com/v2-fd478dd29f6e5bc3bd7a28801d0085b7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='896' height='303'></svg>)
 
 这两个策略把 DDR 加载的 overhead 和 D2D 的 micro-slice 流完全融合进了一个统一的 pipeline：
 
-![](https://pic1.zhimg.com/v2-8c7a626a571a823d84c9408fda3aead0_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='996' height='625'></svg>)
+![](https://picx.zhimg.com/v2-8c7a626a571a823d84c9408fda3aead0_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='996' height='625'></svg>)
 
 ---
 
@@ -102,11 +2365,11 @@ Qwen3-30B-A3B 有 128 个 expert，全量加载就是海量的 on-chip 存储需
 
 他们把这个调度器实现在 IO die 上，面积仅 **0.43 mm²（28nm 工艺）**，调度延迟在**亚微秒级别**，不会成为 bottleneck。
 
-![](https://pica.zhimg.com/v2-f33769a7ac026b491a1df21a054ca42d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='856' height='450'></svg>)
+![](https://pic1.zhimg.com/v2-f33769a7ac026b491a1df21a054ca42d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='856' height='450'></svg>)
 
 "Virtualization"是调度器抽象层的关键概念 —— 无论 expert 在各芯粒上如何不均匀分布，调度器只需要保证 micro-slice 按规定的 trajectory 流动，底层实现细节对上层完全透明。
 
-![](https://pic1.zhimg.com/v2-d8200cefba78dd91a3f9c7ed670c01f2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='996' height='850'></svg>)
+![](https://picx.zhimg.com/v2-d8200cefba78dd91a3f9c7ed670c01f2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='996' height='850'></svg>)
 
 ---
 
@@ -116,7 +2379,7 @@ Qwen3-30B-A3B 有 128 个 expert，全量加载就是海量的 on-chip 存储需
 
 ### 单层 latency
 
-![](https://picx.zhimg.com/v2-b41e2e64b444563b4c237ad695b9127a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2326' height='294'></svg>)
+![](https://pic1.zhimg.com/v2-b41e2e64b444563b4c237ad695b9127a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2326' height='294'></svg>)
 
 FSE-DP 在 16–1024 token 的 low-batch 范围内，单层 latency 均优于 EP 和 Hydra。
 
@@ -130,11 +2393,11 @@ FSE-DP 在 16–1024 token 的 low-batch 范围内，单层 latency 均优于 EP
 
 与 Expert Parallelism 相比，**节省了高达 78.8% 的 on-chip memory**。
 
-![](https://pica.zhimg.com/v2-745d6ae30f703314385ec0e64733ec0c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1372' height='588'></svg>)
+![](https://picx.zhimg.com/v2-745d6ae30f703314385ec0e64733ec0c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1372' height='588'></svg>)
 
 ### Ablation study
 
-![](https://pic1.zhimg.com/v2-9f80a439942ae919d4fbc693e3c85aa2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2364' height='586'></svg>)
+![](https://picx.zhimg.com/v2-9f80a439942ae919d4fbc693e3c85aa2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2364' height='586'></svg>)
 
 micro-slice streaming、paired-load、token buffering 三个模块各自都有贡献，叠加后达到最优。
 
@@ -148,7 +2411,7 @@ micro-slice streaming、paired-load、token buffering 三个模块各自都有�
 
 **2. 真正的硬件协同设计。** 光有算法不够，他们实际流片了（Figure 10 有芯片照片），在真实芯片上验证了整套方案，这在学术界还是比较稀缺的。
 
-![](https://pica.zhimg.com/v2-c65d2ad85a63fe33f2dae0e42679f2ae_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='498' height='375'></svg>)
+![](https://picx.zhimg.com/v2-c65d2ad85a63fe33f2dae0e42679f2ae_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='498' height='375'></svg>)
 
 **3. 对 edge MoE 的意义。** 2.00× throughput + 78.8% memory savings，在资源受限的 edge 场景下，这个 combo 是实质性的提升，不是那种"提了 3%，但只在特定条件下"的 benchmark 游戏。
 
@@ -180,7 +2443,7 @@ micro-slice streaming、paired-load、token buffering 三个模块各自都有�
 
 20 个 Agent，每人都有同样的公共输出 block，但因为各自的私有历史（private history）长度不一样，这些公共 block 在不同 prompt 里出现在不同位置——这就直接把 vLLM 的 prefix caching 废掉了，因为 prefix caching 要求共享内容必须在 prompt 开头，位置完全一致。
 
-最近看到了一篇来自 UCLA 的工作 **TokenDance**（arXiv 2604.03143），专门解决这个问题，思路挺清晰的，今天想和大家聊聊它解决了什么真问题、以及是怎么解的。
+最近看到了一篇来自北大 的工作 **TokenDance**（arXiv 2604.03143），专门解决这个问题，思路挺清晰的，今天想和大家聊聊它解决了什么真问题、以及是怎么解的。
 
 ---
 
@@ -195,7 +2458,7 @@ micro-slice streaming、paired-load、token buffering 三个模块各自都有�
 
 如下图所示，公共输出 block O 在每个 Agent 的 prompt 里都出现，但位置不同，因为每个人的私有历史 H 长度不一样：
 
-![](https://pic1.zhimg.com/v2-8e8c8c05c8a91aaa651b84ab72218ef6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='996' height='375'></svg>)
+![](https://picx.zhimg.com/v2-8e8c8c05c8a91aaa651b84ab72218ef6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='996' height='375'></svg>)
 
 这就带来了一个核心问题：**所有 Agent 的 KV Cache 里都包含了大量结构相似的内容，但现有系统完全没有跨 Agent 复用。**
 
@@ -213,7 +2476,7 @@ vLLM 的 prefix caching 只能处理前缀完全一致的情况——只要 H �
 
 如下图对比了 per-request PIC（上）和 TokenDance 的 collective reuse（下）：
 
-![](https://pica.zhimg.com/v2-3a19d0080152a19166517a2e769f0f54_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='996' height='1266'></svg>)
+![](https://picx.zhimg.com/v2-3a19d0080152a19166517a2e769f0f54_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='996' height='1266'></svg>)
 
 **这就是整个行业在多 Agent serving 上面临的核心矛盾**：公共内容明明存在，但跨 Agent 的复用机制不存在。
 
@@ -237,9 +2500,7 @@ TokenDance 的整体架构如下：
 
 TokenDance 引入了一个 **round-aware prompt interface**，用特殊分隔符 `<TTSEP>` 显式标记不同 block 的边界。如下图：
 
-![](https://picx.zhimg.com/v2-0fd3221009d52c4ad1dc2b4f993c00e2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1988' height='1234'></svg>)
-
-![](https://pic1.zhimg.com/v2-8e8c8c05c8a91aaa651b84ab72218ef6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='996' height='375'></svg>)
+![](https://pica.zhimg.com/v2-0fd3221009d52c4ad1dc2b4f993c00e2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1988' height='1234'></svg>)![](https://picx.zhimg.com/v2-8e8c8c05c8a91aaa651b84ab72218ef6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='996' height='375'></svg>)
 
 这个改动看起来很简单，但很关键——它让 runtime 能够在 block 粒度上识别共享内容，为后续的 collective reuse 和 diff-aware storage 奠定基础。
 
@@ -259,7 +2520,7 @@ TokenDance 引入了一个 **round-aware prompt interface**，用特殊分隔符
 
 实验结果显示，collective reuse 相比 serial PIC 最高有 **2.57x** 的 prefill 加速（10 agents，QPS=1）：
 
-![](https://pica.zhimg.com/v2-e21a8c4f42d9b8c584da29f2aa8b9ac0_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='996' height='592'></svg>)
+![](https://pic1.zhimg.com/v2-e21a8c4f42d9b8c584da29f2aa8b9ac0_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='996' height='592'></svg>)
 
 ---
 
@@ -404,7 +2665,7 @@ GPT-4 Turbo 支持 128K token，Claude 3 号称能处理 200K，Gemini 1.5 Pro �
 
 RAG 的精妙之处在于它把"记忆"问题转化成了"检索"问题。检索是信息领域研究了几十年的老问题，有成熟的工具和方法论——向量数据库、倒排索引、BM25、语义嵌入——这些都可以直接拿来用。
 
-![](https://pic1.zhimg.com/v2-1d4b494c112d170923cef6e37cbdb431_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2718' height='1858'></svg>)
+![](https://picx.zhimg.com/v2-1d4b494c112d170923cef6e37cbdb431_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2718' height='1858'></svg>)
 
 但 RAG 的挑战也很明显：**检索的是片段，而非完整的知识**。想象你在问一个跨越多个文档的复杂问题，答案需要综合三个段落的信息，而每个段落单独看都不像是"相关"的——这时候简单的相似度检索就会失效。
 
@@ -424,7 +2685,7 @@ RAG 的精妙之处在于它把"记忆"问题转化成了"检索"问题。检索
 
 问题在于，KV Cache 的大小随序列长度线性增长，而 GPU 显存是有限的。当上下文达到几万 token，缓存就会成为瓶颈。于是就有了各种"压缩"策略。
 
-![](https://pica.zhimg.com/v2-5c78987ab9d5c00fe2d0fcdb24fffcf9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2696' height='2272'></svg>)
+![](https://picx.zhimg.com/v2-5c78987ab9d5c00fe2d0fcdb24fffcf9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2696' height='2272'></svg>)
 
 最直接的思路是**淘汰不重要的 token**。StreamingLLM 发现了一个有趣的现象：注意力分数往往集中在序列开头的几个 token 上（即使它们在语义上并不重要），这被称为"attention sink"。基于这个发现，它只保留开头几个 token 和最近的滑动窗口，其余全部丢弃，就能支持无限长的流式生成。H2O 则更精细，它追踪每个 token 的累积注意力分数，只保留"heavy hitter"——那些真正被频繁关注的 token。
 
@@ -440,7 +2701,7 @@ RAG 的精妙之处在于它把"记忆"问题转化成了"检索"问题。检索
 
 参数化记忆的好处是一劳永逸——不需要检索，不需要缓存，知识就在那里，推理时自动激活。研究表明，Transformer 的 FFN 层可以被理解为一个巨大的 key-value 存储，特定的神经元甚至对应特定的事实知识。
 
-![](https://pic1.zhimg.com/v2-5fc180f3071d1f8d472c7ab3b03dbe08_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2010' height='1850'></svg>)
+![](https://picx.zhimg.com/v2-5fc180f3071d1f8d472c7ab3b03dbe08_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2010' height='1850'></svg>)
 
 但代价也很明显：**参数一旦写入，就很难修改**。这不仅是工程问题，更是科学问题。"灾难性遗忘"是持续学习领域的老大难：微调模型学习新知识时，旧知识会被覆盖。EWC 等方法通过正则化约束"重要参数"的变化来缓解这个问题，但远没有根本解决。
 
@@ -456,7 +2717,7 @@ WISE 提出了一个有趣的架构：维护两套记忆——稳定的"预训�
 
 把三种记忆表示放在一起看，会发现一个有趣的规律：**选择不同的表示，本质上是在选择不同的瓶颈**。
 
-![](https://pica.zhimg.com/v2-b60afea3b8b3c87e3c9ce074eed22f7c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2724' height='782'></svg>)
+![](https://picx.zhimg.com/v2-b60afea3b8b3c87e3c9ce074eed22f7c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2724' height='782'></svg>)
 
 Token 记忆的瓶颈在查询。上下文窗口就那么大，你不可能把所有历史都塞进去，必须选择"放什么"。这个选择做好了，模型能看到正确的信息；做不好，关键证据就被遗漏了。
 
@@ -540,13 +2801,13 @@ ExpertFlow不是单点的优化，而是一套端到端的协同优化系统，�
 
 之前的token批次是按输入顺序排的，就像乘客随机上出租车，每辆车都要跑不同的地方，最后所有路都要跑一遍，每辆车只拉一个人。我们的TS做的事，就是**把要去同一个“地方”（路由路径相似）的token，重新拼成一个新批次**。
 
-![](https://pic1.zhimg.com/v2-9b025c5f27606c8c2ad537ff800f45d8_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='936' height='766'></svg>)
+![](https://pica.zhimg.com/v2-9b025c5f27606c8c2ad537ff800f45d8_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='936' height='766'></svg>)
 
 比如两个批次各4个token，原本每个批次都要激活4个专家，每个专家只处理1个token；重排之后，每个批次只需要激活2个专家，每个专家处理2个token。专家的调用次数直接砍半，单专家处理的token数翻倍，GPU算力利用率一下就上来了。
 
 当然，工程上也踩了不少坑：token重排会打乱KV缓存的顺序，我们专门做了Merge和Reindex两个轻量操作，保证注意力计算的语义完全不变；还设计了双批次流水线，让当前批次的模型计算，和下一个批次的预测、调度并行跑，把额外开销完全隐藏掉，最终调度的CPU开销不到10ms。
 
-![](https://pic1.zhimg.com/v2-a520e7e84732728785042e09bc258a3d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1118' height='380'></svg>)
+![](https://picx.zhimg.com/v2-a520e7e84732728785042e09bc258a3d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1118' height='380'></svg>)
 
 从实测来看，专家数量越多，TS的收益越明显：Switch-128模型上，吞吐量直接提了17%，就算是专家数最少的Switch-32，也有3%的稳定提升。
 
@@ -572,7 +2833,7 @@ ExpertFlow不是单点的优化，而是一套端到端的协同优化系统，�
 
 这里挑几个最实在的结果和大家说：
 
-![](https://pic1.zhimg.com/v2-8cc8b48463d9492854490d5d7235b3a0_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2900' height='624'></svg>)![](https://picx.zhimg.com/v2-72caebebc1336cd25fc1ef0359e97b3f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1510' height='788'></svg>)
+![](https://picx.zhimg.com/v2-8cc8b48463d9492854490d5d7235b3a0_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2900' height='624'></svg>)![](https://picx.zhimg.com/v2-72caebebc1336cd25fc1ef0359e97b3f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1510' height='788'></svg>)
 
 1. **显存占用砍到极致**：相比全量加载到GPU，我们最高能降低\*\*93.72%\*\*的峰值显存。Switch-128模型从15.26GB降到了1.03GB；之前全量加载直接OOM的Mixtral-8×7B，我们用15.99GB显存就能流畅跑起来。
 2. **吞吐量提升拉满**：在显存卡得最死的场景下，Switch-128模型的吞吐量是SE-MoE基线的**10倍**；在Mixtral、Qwen、Deepseek这些主流开源模型上，也能稳定做到比Cache-MoE基线高2倍左右的吞吐量。就算用跨域的预测器，这个收益也完全不掉。
@@ -611,7 +2872,7 @@ ExpertFlow不是单点的优化，而是一套端到端的协同优化系统，�
 
 ## 从超连接到流形约束：HC 与 mHC 的演化
 
-![](https://pic1.zhimg.com/v2-34702bb0502ac5c3c94c9fe1a18e5e91_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='864'></svg>)
+![](https://pica.zhimg.com/v2-34702bb0502ac5c3c94c9fe1a18e5e91_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='864'></svg>)
 
 残差连接是现代 Transformer 和 ResNet 架构的核心。字节团队在 2024 年提出的 Hyper‑Connections (HC) 突破了传统残差（图 a）连接将输入直接相加的范式。HC （图 b）通过扩展残差流的宽度并增加连接的复杂度，引入了一种在层间混合信息的新方式，即“深度轴上的注意力”，在不增加单元计算量的前提下显著提高了网络的拓扑表达能力。然而，HC 的矩阵是完全自由的，这种设计牺牲了原本残差连接中的恒等映射特性。当网络跨多个层堆叠时，残差流的平均信号会失去保持，导致信号放大或衰减，训练不稳定，并且拓宽的流还带来额外的访存开销。
 
@@ -623,13 +2884,13 @@ DeepSeek 的 mHC 是在此基础上的改进。论文发现，保持信号平均
 
 我自己的早期研究曾在神经网络结构搜索中使用过“流形”这一概念，并提出了《NAS-LID: Efficient Neural Architecture Search with Local Intrinsic Dimension》算法。我们在 NAS‑LID 中引入了局部本征维度 (Local Intrinsic Dimension，LID) 来衡量神经网络每一层激活在流形上的维度。实验发现，表现好的模型在训练过程中先将输入升维，然后再降维，其逐层 LID 值呈现“先增后降”的趋势，而表现差的模型无法完成先增过程。这一观察提示模型在学习阶段需要扩展特征空间以更好地分离类别，随后再进行压缩。基于这些规律，我们设计了基于 LID 的指标来预测模型性能并加速搜索。下图展示了我们在不同模型上的 LID 变化趋势：
 
-![](https://picx.zhimg.com/v2-4bffc863675bcfbd5be4d2af1e76c3e5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='605' height='485'></svg>)
+![](https://pic1.zhimg.com/v2-4bffc863675bcfbd5be4d2af1e76c3e5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='605' height='485'></svg>)
 
 这一图中，横轴为层数（做了归一化，0 表示输入成，1 表示输出层），纵轴为每层输出 activation 的 LID 数值，红色曲线对应性能较好的模型，蓝色曲线对应性能较差的模型。红色曲线在浅层快速升高，随后在高层逐步下降，说明模型在前半部分主动扩展特征维度，后半部分逐步提炼信息。而蓝色曲线则基本平滑，缺少升维阶段。mHC 利用流形约束保证残差流处在受限的几何空间，与 LID 揭示的升维—降维过程不谋而合：一个好的表示学习路径既要能够扩充表示，也要在后续收敛到稳定的低维结构。
 
 ## Engram 条件记忆：让模型学会快速查找
 
-![](https://pic1.zhimg.com/v2-e4d1c9950e3b3a0737632f3e154e3752_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='738'></svg>)
+![](https://picx.zhimg.com/v2-e4d1c9950e3b3a0737632f3e154e3752_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='738'></svg>)
 
 Engram 是 deepseek另一篇论文《Conditional Memory via Scalable Lookup》 中提出的新的结构，它关注的是另一类稀疏性问题。直观上，Engram 想做的事很简单：当模型读到某个 token 时，不只依赖注意力和 FFN 去“算”知识，而是先问一句：这段上下文里有没有我见过的高频短语/实体模式？如果有，就像查字典一样把对应的向量“捞出来”再用。
 
@@ -654,7 +2915,7 @@ Engram 的核心并不是“再造一个更大的词表”，而是把 n-gram �
 
 这听起来和字节 Seed 团队提出的 Over-Encoding（同样利用 n-gram / 短语表）很相似，那有什么不同呢？这里需要先理清关系：Over-Encoding 是 《Over-tokenized transformer: Vocabulary is generally worth scaling》 论文提出的“输入侧”做法——通过显著扩大输入词表，把大量 n-gram/短语作为更细粒度的 token 单元“前置”到 embedding 层，从而增强编码阶段的表达能力；而 Over-Tokenized Transformer 还进一步提出 Over-Decoding（输出侧扩展与训练目标设计），两者合起来构成一个“从输入到输出都在扩展 tokenization 维度”的完整框架。换句话说，Over-Encoding 更像是“把词表做大、把输入表征做强”，而 Engram 更像是“把查表能力做成块内记忆，让它在更深层参与推理与知识调用”。
 
-![](https://pic1.zhimg.com/v2-8f8d5c778265a0661064f617fa5ea158_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1208' height='930'></svg>)
+![](https://picx.zhimg.com/v2-8f8d5c778265a0661064f617fa5ea158_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1208' height='930'></svg>)
 
 DeepSeek 的 Engram 论文在实验上也把这点讲得很清楚，你看这张图：横轴是 Embedding Slots 数量（可理解为记忆表/扩展词表的容量），纵轴是 Validation Loss（越低越好）。最上面那条几乎水平的 Pure MoE 线说明：如果把稀疏预算几乎都花在 MoE 专家上，只做“条件计算”，并不会随着 embedding 容量增加而带来类似的收益；而绿色的 Over-Encoding 曲线随 slots 增大明显下降，表示“把预算投到更大的 n-gram 输入词表”确实能带来收益（图中标注的 gain from overencoding）。关键在于紫色的 Engram：在相近的 slots 范围内，它整体更低，且随着容量扩展持续下降，说明 Engram 不只是重复 Over-Encoding 的输入侧扩词表，而是在其基础上额外挖出了收益（图中 additional gain on top of overencoding）。简单来说：扩大输入词表确实有效，但把查表做成“可控、可插拔的条件记忆模块”，还能让模型在更深层把这些“查到的知识”用起来，因此收益更进一步、更可扩展。
 
@@ -1049,7 +3310,7 @@ PPO通过分阶段解耦“数据生成”和“策略学习”，在保证训�
 
 参与模型与接口
 
-![](https://pic1.zhimg.com/v2-b1d8734cdf174d3d43756db834bee2b9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='840' height='225'></svg>)
+![](https://picx.zhimg.com/v2-b1d8734cdf174d3d43756db834bee2b9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='840' height='225'></svg>)
 > 注：![L_x](https://www.zhihu.com/equation?tex=L_x) 是 prompt 长度，![T](https://www.zhihu.com/equation?tex=T) 是生成回复长度（实际中常 padding 到固定 max\_len）。
 
 核心计算逻辑
@@ -1473,7 +3734,7 @@ def iterative(root):
 
 * 通义 AI清晰明了的给出了详细的流程示意图，输入是“Today”，draft 模型和 target 模型分别有输出，并且有验证。最后也附上了示意图说明帮助理解。
 
-![](https://picx.zhimg.com/v2-2b8d93d1f9fe8ba5e8ed91a4455eca67_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='627' height='778'></svg>)
+![](https://pic1.zhimg.com/v2-2b8d93d1f9fe8ba5e8ed91a4455eca67_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='627' height='778'></svg>)
 
 * 豆包本身是会自动去渲染流程图的，但这次没渲染成功。另外生成的算法示意图是非常简单的，并没有清晰展示出算法的细节：
 
@@ -1514,7 +3775,7 @@ def iterative(root):
 
 很多时候我们只知道要做什么东西，但是代码具体的架构设计不是很清楚。**通义AI很贴心地支持自动优化 prompt**，下面是优化前后的 prompt，可以看到它能直接定义清楚了代码的架构和模块等等，逻辑更加清晰了，而且我们也可以在这个基础上提前检查需求是否准确。
 
-![](https://pica.zhimg.com/v2-a89eff4ff053ef6a46db62c44873d271_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='815' height='250'></svg>)![](https://picx.zhimg.com/v2-5d797d870ea058187f00edb717d50f00_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='893' height='276'></svg>)
+![](https://picx.zhimg.com/v2-a89eff4ff053ef6a46db62c44873d271_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='815' height='250'></svg>)![](https://picx.zhimg.com/v2-5d797d870ea058187f00edb717d50f00_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='893' height='276'></svg>)
 
 下面是基于优化后的 prompt生成的代码，可以看到很准确地理解了指令，并且 prompt 中设计了 MainModel和 DraftModel，整个代码逻辑非常清晰：
 
@@ -1659,7 +3920,7 @@ if __name__ == "__main__":
 
 * 首先可以看到回复内容完成了基于 huggingface 实现的要求，还提供了依赖安装方法。而且还推荐使用了Gemma 系列主模型和 draft 模型。
 
-![](https://picx.zhimg.com/v2-55ce2c98b5e9cbc45e15cfdb6da7fcc6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='742' height='385'></svg>)
+![](https://pic1.zhimg.com/v2-55ce2c98b5e9cbc45e15cfdb6da7fcc6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='742' height='385'></svg>)
 
 * 完整代码
 
@@ -1835,7 +4096,7 @@ if __name__ == "__main__":
 
 我按照建议把模型换成 gpt2 系列后，代码便可正常运行了。
 
-![](https://picx.zhimg.com/v2-76ab93ff7f8b9078fc8fb9ea17a18216_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='935' height='541'></svg>)
+![](https://pica.zhimg.com/v2-76ab93ff7f8b9078fc8fb9ea17a18216_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='935' height='541'></svg>)
 
 整个代码生成过程非常顺畅。**通义 AI 不仅写出了结构清晰、逻辑完整的实现示例，还贴心地提醒了可能遇到的问题和解决方案，感觉就像和一个真正懂算法的同事在讨论细节，既专业又高效。**生成的代码能够直接运行，逻辑和命名也延续了前面的解释，让整个过程保持了连贯的思维流，也省去了我反复切换和沟通。
 
@@ -1859,11 +4120,11 @@ if __name__ == "__main__":
 
 通义AI还支持支持上传参考图，我从网上搜了3张和 speculative decoding 相关的算法示意图丢给了通义 AI，如下所示
 
-![](https://pic1.zhimg.com/v2-d9cb88ca9d28d0e59f0be7fe9b56bb2c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1392' height='771'></svg>)
+![](https://pica.zhimg.com/v2-d9cb88ca9d28d0e59f0be7fe9b56bb2c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1392' height='771'></svg>)
 
 我们把文字 prompt 和三个参考图都丢给通义AI：
 
-![](https://pic1.zhimg.com/v2-556d466c1487e7232d1d17ff5cd39ecd_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1944' height='872'></svg>)
+![](https://pica.zhimg.com/v2-556d466c1487e7232d1d17ff5cd39ecd_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1944' height='872'></svg>)
 
 生成的图片效果如下， 可以看到这个生成的示意图很好的融合了不同参考图的特点，保留了参考图 1 的 Draft 和 Target Model，图 2 的 prompt（虽然部分文本没有渲染成功，但是不影响提供绘图灵感，这是更重要的点），还保留了图 3 的 parallel 验证示意。我经常会让大模型帮我生成图片给我图片布局的灵感，后续就会用 Drawio 或者 PPT 来细化。
 
@@ -1871,7 +4132,7 @@ if __name__ == "__main__":
 
 我也试用了豆包，但是最终生成的效果我只能说它可能是个自由派画家，我给的参考图它是一个都没参考。
 
-![](https://pic1.zhimg.com/v2-2bfeefa2c01de893124d807a7e0b1738_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1220' height='807'></svg>)
+![](https://pica.zhimg.com/v2-2bfeefa2c01de893124d807a7e0b1738_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1220' height='807'></svg>)
 
 这个简单的画图测试再次验证了通义 AI 对于用户指令具有很强的理解和执行能力，实际应用中我们还可以通过细化 prompt 要求来进一步提高画图质量。**而且通义是完全免费的，可以重复画很多次。**我已经把ChatGPT 停掉续费了，省下的钱打算买点好吃的犒劳自己了～
 
@@ -1931,11 +4192,11 @@ if __name__ == "__main__":
 在大会开幕式上，百度副总裁沈抖的演讲中着重介绍了两个平台：**百舸、千帆**。  
 百舸是新的算力与系统基础设施。大会发布的百舸AI 计算平台 5.0，强化了高密度超节点、分布式 KV Cache、MoE 专家路由优化等能力。这些听上去偏技术，但背后的含义是：在智能时代，算力基础设施的使命不再只是“降本增效”，而是直接为 Agent 提供高效、可扩展的推理和协作支持。
 
-![](https://picx.zhimg.com/v2-f9444623a727e642506808a6fc62a6a3_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2544' height='918'></svg>)
+![](https://pic1.zhimg.com/v2-f9444623a727e642506808a6fc62a6a3_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2544' height='918'></svg>)
 
 千帆是大模型与 Agent 的开发平台。它把模型调用、精调、工具编排、数据治理打包成一站式服务，企业可以直接基于千帆来开发、部署和管理自己的智能体。这也是百度提出“Agent 即服务”的出发点。
 
-![](https://pic1.zhimg.com/v2-594e5e758f84ac6639a05a32da4d56fa_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2708' height='1016'></svg>)
+![](https://picx.zhimg.com/v2-594e5e758f84ac6639a05a32da4d56fa_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2708' height='1016'></svg>)
 
 在我看来，这二者为 Agent 的发展提供了强有力的支撑：百舸是算力与系统层的底座，用来处理异构资源、推理并发、稳定性这些基础能力；千帆是一站式的开发与运营平台，从模型管理、数据治理到智能体编排、评测与上线，提供了一条贯通的工具链。它们的角色更像“公共基础设施”，不是叙事的终点，而是让后续“把任务交给 Agent”变得现实的前提。
 
@@ -1990,19 +4251,19 @@ if __name__ == "__main__":
 除了面向大型企业的行业 Agent，大会还发布了一些面向大众和中小企业的工具。例如“秒哒”，就是一个无代码的应用开发平台。用户只需要一句自然语言描述，比如“请生成一份客户调查问卷”或者“设计一个抽奖系统”，秒哒就能自动生成应用。  
 这类工具的价值在于降低了门槛，把“人人都是开发者”从口号变成现实。对于企业来说，它意味着可以快速响应长尾需求；对于个人来说，它则让创意有机会落地为真实可用的应用。
 
-![](https://pica.zhimg.com/v2-b0063567f1ab13f9aaf600ff1e94099e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1332' height='1572'></svg>)
+![](https://picx.zhimg.com/v2-b0063567f1ab13f9aaf600ff1e94099e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1332' height='1572'></svg>)
 
 我自己也测试了一下，使用起来非常简单，只需要用百度账号登录后，用文字输入自己的需求，秒哒就会自动解析我的需求，生成一个 markdown 文件。
 
-![](https://picx.zhimg.com/v2-fc3ce8195977f44c710f020f1840c9d7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2760' height='1548'></svg>)
+![](https://pic1.zhimg.com/v2-fc3ce8195977f44c710f020f1840c9d7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2760' height='1548'></svg>)
 
 之后，直接点击【生成应用】就会开始进行应用搭建，整个过程不需要手写一个代码
 
-![](https://pica.zhimg.com/v2-6464254ea3c54d8a7556114d0edc338b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2474' height='1446'></svg>)
+![](https://picx.zhimg.com/v2-6464254ea3c54d8a7556114d0edc338b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2474' height='1446'></svg>)
 
 待结束之后就可以直接体验并且发布，而且秒哒非常好的一个功能是可以在微信小程序上也能使用你创建的应用，大家也可以去体验一下我创建的 ToDo 应用。[https://app-5u8rg2ro6neq.appmiaoda.com/](https://link.zhihu.com/?target=https%3A//app-5u8rg2ro6neq.appmiaoda.com/)
 
-![](https://pic1.zhimg.com/v2-920acbc667da407b5b04d4aede59d7eb_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2742' height='1548'></svg>)
+![](https://picx.zhimg.com/v2-920acbc667da407b5b04d4aede59d7eb_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2742' height='1548'></svg>)
 
 生成应用的网页界面
 
@@ -2275,7 +4536,7 @@ pdfclean prune_structure.pdf
 
 普通人难道只能眼巴巴地当这场技术革命的旁观者？答案其实藏在一本被AI圈奉为“中文RL圣经”的神作里——**《动手学强化学习》**。
 
-![](https://pic1.zhimg.com/v2-8d1b9c01127287518fe6019e271c593b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2276'></svg>)
+![](https://pica.zhimg.com/v2-8d1b9c01127287518fe6019e271c593b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2276'></svg>)
 
 ### 为什么说这本书能让你「摸透大模型的底层逻辑」？
 
@@ -2325,7 +4586,7 @@ pdfclean prune_structure.pdf
 
 Kimi K1.5 支持长思考模式，能够更加精准的理解和分析问题，给出更优质的回答。 而且这一功能可以免费无限制体验。本文将结合实际场景，介绍它在学术研究、健康管理两大场景的应用价值，大家可前往网页端和手机 app 端体验使用。
 
-![](https://pic1.zhimg.com/v2-a67f02682657b9d00fca648005ac1895_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2136' height='1148'></svg>)
+![](https://picx.zhimg.com/v2-a67f02682657b9d00fca648005ac1895_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2136' height='1148'></svg>)
 
 电脑端
 
@@ -2339,11 +4600,11 @@ Kimi K1.5 支持长思考模式，能够更加精准的理解和分析问题，�
   
 例如，现在人人讨论的大语言模型的核心模块就是注意力机制。为了提高效率，出现了很多创新的注意力机制算法，例如原始的 **多头注意力机制（MHA）、和后续改进的MQA 和 GQA** 。下图是三个工作的论文截图。
 
-![](https://picx.zhimg.com/v2-08a62c0ee920905d4d57ec7b1f3c1c0a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='4096' height='5458'></svg>)
+![](https://pic1.zhimg.com/v2-08a62c0ee920905d4d57ec7b1f3c1c0a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='4096' height='5458'></svg>)
 
 为了理解这三种不同注意力机制的区别以及各自是如何实现的，只需将对应的论文链接输入 Kimi K1.5即可
 
-![](https://pica.zhimg.com/v2-1d502616b45df77002c73a66fbce1d50_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1348' height='1550'></svg>)
+![](https://picx.zhimg.com/v2-1d502616b45df77002c73a66fbce1d50_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1348' height='1550'></svg>)
 
 可以看到，Kimi K1.5会从以下几个方面给出详尽的解析：
 
@@ -2356,15 +4617,15 @@ Kimi K1.5 支持长思考模式，能够更加精准的理解和分析问题，�
 
 * MHA 代码实现部分：
 
-![](https://pic1.zhimg.com/v2-95dbd3f464042854b20955db135b6f3f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='643' height='1250'></svg>)
+![](https://picx.zhimg.com/v2-95dbd3f464042854b20955db135b6f3f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='643' height='1250'></svg>)
 
 * MQA 代码实现部分：
 
-![](https://picx.zhimg.com/v2-44634a6cf7a4f6286ee56c3624cb1587_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='649' height='1319'></svg>)
+![](https://pic1.zhimg.com/v2-44634a6cf7a4f6286ee56c3624cb1587_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='649' height='1319'></svg>)
 
 * GQA 代码实现部分：
 
-![](https://picx.zhimg.com/v2-9585894050f5d8253caed3a0ed73c37d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1319' height='4222'></svg>)
+![](https://pica.zhimg.com/v2-9585894050f5d8253caed3a0ed73c37d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1319' height='4222'></svg>)
 
 ## 2. 辅助课程学习
 
@@ -2378,11 +4639,11 @@ Kimi K1.5 支持长思考模式，能够更加精准的理解和分析问题，�
 
 下面是 Kimi k1.5的生成结果。可以看到思考过程很详实，能够准确定位板书内容。例如明确指出了板书标题是“概率知识补充。也准确识别出了左上角的指数族分布的数学形式。
 
-![](https://pic1.zhimg.com/v2-e72161e2f795de9ab55d09b8d82de03f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1114' height='2278'></svg>)
+![](https://picx.zhimg.com/v2-e72161e2f795de9ab55d09b8d82de03f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1114' height='2278'></svg>)
 
 板书右边的内容也能准确定位和识别
 
-![](https://pica.zhimg.com/v2-216fe1a5ada6eabe38d013da3ac7641f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='718' height='1080'></svg>)
+![](https://pic1.zhimg.com/v2-216fe1a5ada6eabe38d013da3ac7641f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='718' height='1080'></svg>)
 
 ## 3. 日常健康管理
 
@@ -2418,17 +4679,17 @@ Kimi K1.5 支持长思考模式，能够更加精准的理解和分析问题，�
 
 你是不是也经常被一坨英文文献压得喘不过气？没事，丢给灵办 AI，搞定！它不仅帮你把文献翻译得清楚明白，还贴心到能给你联想出相关问题，真是把学术饭嚼碎了喂到你嘴里。
 
-![](https://pic1.zhimg.com/v2-a9ca0ce37213eee54c9478273b4f1dd5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='790' height='398'></svg>)
+![](https://picx.zhimg.com/v2-a9ca0ce37213eee54c9478273b4f1dd5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='790' height='398'></svg>)
 
 **AI 搜索和总结**
 
 灵办 AI 还有一个特别牛的地方——它会嵌入到不同的网页里，自动给你总结结果。比如，我测试了一下在谷歌搜索“大模型越狱攻击”，灵办 AI 会立马在右侧给你总结精华信息。再也不用一个个网页慢慢啃了，效率蹭蹭往上涨！
 
-![](https://pic1.zhimg.com/v2-222a60a2318142ab85dd83d71c1dd853_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1960' height='1430'></svg>)
+![](https://picx.zhimg.com/v2-222a60a2318142ab85dd83d71c1dd853_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1960' height='1430'></svg>)
 
 甚至在 GitHub 这样的技术网站，它还能直接总结 repo 里干了啥，帮你快速判断这个代码库是不是你要的。是不是觉得瞬间变身科研效率王？（下面的 repo 非常推荐，可以直接把 数学公式截图转换成 latex，写论文就方便多了）
 
-![](https://picx.zhimg.com/v2-835f49be8330d9e7c33ce2b26f9460a3_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='936' height='614'></svg>)
+![](https://pic1.zhimg.com/v2-835f49be8330d9e7c33ce2b26f9460a3_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='936' height='614'></svg>)
 
 我也尝试了用灵办 AI 来总结这问题下其他答主的回答，总结得也比较准确。不过 很多介绍的工具可能只负责某一部分的功能，灵办 AI 基本上是把这些功能做了整合，用起来会更加全面。
 
@@ -2440,11 +4701,11 @@ Kimi K1.5 支持长思考模式，能够更加精准的理解和分析问题，�
 
 下面是一个示例，假如你需要准备一个关于人教版牛顿三定律的课程教案，然后你可以自定义一些要求，同时有必要的话你也可以把一些参考资料上传上去作为参考。
 
-![](https://picx.zhimg.com/v2-0668fce37fb021dde58183b1f9a06201_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1974' height='1390'></svg>)
+![](https://pica.zhimg.com/v2-0668fce37fb021dde58183b1f9a06201_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1974' height='1390'></svg>)
 
 最后，灵办 AI 会生成一个 word 版本的教案，下面是教案的部分截图示例。我这里只是给出了一个非常简单的示例。在实际上，你可以指定更加详细的要求生成不同的教学资料。
 
-![](https://pic1.zhimg.com/v2-f1c385b5fd3e0e4bdbd8e1889255e011_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1636' height='1052'></svg>)![](https://pica.zhimg.com/v2-451911738ef0ece2b2a136b924f50496_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1722' height='1086'></svg>)![](https://picx.zhimg.com/v2-2f081865745f5aaedb0ab5bcc368c15a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1450' height='1484'></svg>)
+![](https://pica.zhimg.com/v2-f1c385b5fd3e0e4bdbd8e1889255e011_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1636' height='1052'></svg>)![](https://picx.zhimg.com/v2-451911738ef0ece2b2a136b924f50496_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1722' height='1086'></svg>)![](https://pica.zhimg.com/v2-2f081865745f5aaedb0ab5bcc368c15a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1450' height='1484'></svg>)
 
 可以看到，生成的教案会自动判断每个知识点需要分配的时间和教学内容，这对于新手教师来说还是很有帮助的。当然，对于有经验的老师其实也是会有很大的帮助，例如通过这么一个 AI 工具，可以得到一些新的教学思路，进一步提高教学水平。
 
@@ -2452,11 +4713,11 @@ Kimi K1.5 支持长思考模式，能够更加精准的理解和分析问题，�
 
 AI 扩写在写论文的时候经常用到。比如在写论文摘要的时候，你可能心里有一个大概的思路，甚至是只有一些关键词，这个时候灵办AI提供的扩写功能就能很好地帮你整理出一个更加完善的表达。下面给了一个简单的关于大模型论文的摘要扩写的例子，提示词非常简单，灵办 AI 就能自动地给出扩写后的摘要。这里给的例子很简单，你可以通过给出更多关键词从而让扩写后的内容更加符合你的要求。
 
-![](https://pica.zhimg.com/v2-981b14d16a3b24f32cc6c7f1b5d86033_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='818' height='604'></svg>)
+![](https://picx.zhimg.com/v2-981b14d16a3b24f32cc6c7f1b5d86033_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='818' height='604'></svg>)
 
 另外，大家经常写的总结报告也可以用灵办 AI 来完成。这里我 Cosplay 了一下高三的物理老师，只需要指定一下字数就可以了，效率直接拉满。
 
-![](https://pic1.zhimg.com/v2-fb99264ed0b158fec98d74af57400643_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='830' height='532'></svg>)
+![](https://picx.zhimg.com/v2-fb99264ed0b158fec98d74af57400643_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='830' height='532'></svg>)
 
 
 ---
@@ -2474,21 +4735,21 @@ AI 扩写在写论文的时候经常用到。比如在写论文摘要的时候�
 
 既然说了我主要的研究方向是 AutoML，那我就很好奇，在知乎AI 搜索眼里，我到底做了那些事情呢？
 
-![](https://pica.zhimg.com/v2-9add89e9cbeeb769b743cab0e332efa5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1260' height='4968'></svg>)
+![](https://pic1.zhimg.com/v2-9add89e9cbeeb769b743cab0e332efa5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1260' height='4968'></svg>)
 
 看完回答，我只能说知乎这个 AI 是个人简历包装的神奇，能把你做过的一些小事情包装的特别伟大。比如，我只不过弄了个 AutoML 相关的公众号，它浓缩成了“推广和教育”，很不错，我坦然接受 hhh，今后继续努力
 
 接着，我测试了一下搜索时效性，以英伟达最新发布的 GPU 为例，可以看到知乎 AI 搜索时效性还是不错的
 
-![](https://pic1.zhimg.com/v2-4787e036882636a6468af7cb639c66e7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1423' height='600'></svg>)
+![](https://picx.zhimg.com/v2-4787e036882636a6468af7cb639c66e7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1423' height='600'></svg>)
 
 知乎 AI 搜索的一个比较好的地方是除了回答问题外，还提供了和你的问题相关的其他答主的回答供参考。比如，读博因为科研进度 emo 了，可以看看别人的建议，这个还是很不错的
 
-![](https://pic1.zhimg.com/v2-4b23e1a6e955140424a765c6ae23b79b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1260' height='2720'></svg>)
+![](https://picx.zhimg.com/v2-4b23e1a6e955140424a765c6ae23b79b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1260' height='2720'></svg>)
 
 知乎的特点是专业性强，所以涉及到一些需要专业指导的东西，除了给出 AI 生成的回答外，还要有很多其他专业答主的回答供参考。比如要减肥的朋友也可以看看食谱咋弄
 
-![](https://picx.zhimg.com/v2-6a6c727c15245157f8c4f818b2866e03_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1260' height='2720'></svg>)
+![](https://pic1.zhimg.com/v2-6a6c727c15245157f8c4f818b2866e03_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1260' height='2720'></svg>)
 
 总的来说，知乎 AI 搜索很简洁，未来应该再丰富一点，支持上传图片等其他 AI 工具都已具备的功能。另外，AI 生成的回答目前来说还比较简洁，不过好在有嵌入其他答主的回答。但是这对用户来说多少还是有点麻烦，如果能更好地对所有人的回答取其精华的总结就更好了
 
@@ -2549,33 +4810,33 @@ AI 扩写在写论文的时候经常用到。比如在写论文摘要的时候�
 
 GPT-4搜索到的最新 GPU 是 RTX 40 SUPER，这个是 2024 年 1 月发布的。
 
-![](https://pic1.zhimg.com/v2-810404be24a99ecacfbd9204ea9dfa77_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1504' height='1034'></svg>)
+![](https://pica.zhimg.com/v2-810404be24a99ecacfbd9204ea9dfa77_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1504' height='1034'></svg>)
 
 在时效性这方面，智谱清言值得信赖，非常可靠
 
-![](https://pic1.zhimg.com/50/v2-d2468eecb91cb1ce72555c65aa458ae4_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='124' height='118'></svg>)
+![](https://picx.zhimg.com/50/v2-d2468eecb91cb1ce72555c65aa458ae4_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='124' height='118'></svg>)
 
 ### 1.2 娱乐性：打败容嬷嬷智能体
 
 除了这种实用性强的智能体，还有很多平时可以用来休闲娱乐的。我最近一直在玩那种有剧情走向的智能体，比如“穿越之打败容嬷嬷”
 
-![](https://pic1.zhimg.com/v2-fafc816b43a9e12afa4570fc6f30b7f3_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1384' height='532'></svg>)
+![](https://picx.zhimg.com/v2-fafc816b43a9e12afa4570fc6f30b7f3_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1384' height='532'></svg>)
 
 做人讲究 peace and love,所以第一步当然是和容嬷嬷讲道理，以德服人。咱们就是说上来先动之以情，毕竟都是宫里的人，素质应该大概多少还是有点的。
 
-![](https://pic1.zhimg.com/v2-37a08d97503e65d6f971b6ff9cc17c74_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1346' height='1420'></svg>)
+![](https://pica.zhimg.com/v2-37a08d97503e65d6f971b6ff9cc17c74_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1346' height='1420'></svg>)
 
 但是剧情走向是容嬷嬷还是犹豫不决。动情没用，咱们就晓之以理，选择策略 3
 
-![](https://pica.zhimg.com/v2-4d9ed8c010b04c3d3eb033c9de7382a8_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1326' height='762'></svg>)
+![](https://picx.zhimg.com/v2-4d9ed8c010b04c3d3eb033c9de7382a8_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1326' height='762'></svg>)
 
 容嬷嬷简直是个滚刀肉，动之以情，晓之以理感觉都没用，既然如此，咱们就来硬的，直接改变策略，利诱！！提出交换条件，在利益面前肯定没人能 hold 住的
 
-![](https://pic1.zhimg.com/v2-3ce4a001619c09e5b3001ce305e01b02_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1322' height='882'></svg>)
+![](https://picx.zhimg.com/v2-3ce4a001619c09e5b3001ce305e01b02_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1322' height='882'></svg>)
 
 看，在利益面前终于松口了，预知后面的剧情走向，且听下回分解
 
-![](https://picx.zhimg.com/v2-13feca51f137aa688fed6eb6be4fb042_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='580' height='336'></svg>)
+![](https://pic1.zhimg.com/v2-13feca51f137aa688fed6eb6be4fb042_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='580' height='336'></svg>)
 
 ## 2. 自定义智能体
 
@@ -2587,11 +4848,11 @@ GPT-4搜索到的最新 GPU 是 RTX 40 SUPER，这个是 2024 年 1 月发布的
 
 比如，我平时经常需要跟进某个领域的最新文献，我就创建了这么一个智能体。只要给出智能体的描述就好了
 
-![](https://pica.zhimg.com/v2-3bb74b3bfbcd0d1dbdd0fa836a8f34d6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2148' height='1342'></svg>)
+![](https://picx.zhimg.com/v2-3bb74b3bfbcd0d1dbdd0fa836a8f34d6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2148' height='1342'></svg>)
 
 点击【生成配置】后，会将描述自动转换成具体的配置信息，如下图，不仅给出了 logo 和智能体名字，还润色和丰富了智能体的描述。我们也可以根据需求再做修改。我这里根据需求选择开启了联网、绘画和代码能力。当然我们甚至还可以上传文件作为知识库，智谱清言会结合提供的内容提供更加个性化的回答。
 
-![](https://pic1.zhimg.com/v2-86c421298e6af109d1db941b6e3a7dd6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1602' height='793'></svg>)
+![](https://picx.zhimg.com/v2-86c421298e6af109d1db941b6e3a7dd6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1602' height='793'></svg>)
 
 下面是具体的使用体验，可以看到我的问题是搜索最新的大模型推理优化相关的论文，返回的结果的确是 2024 年较新的大模型推理方向的论文，对比过给出的网页链接也是正确的，靠谱！
 
@@ -2603,11 +4864,11 @@ GPT-4搜索到的最新 GPU 是 RTX 40 SUPER，这个是 2024 年 1 月发布的
 
 前面这个“智慧搜寻者”智能体是主要是用来粗读论文，帮助我快速筛选相关的论文。我还创建了用于精读的智能体，只需要传入 pdf 链接即可自动根据指定的要求总结论文
 
-![](https://picx.zhimg.com/v2-20288bb205cd009a843fed5353a14975_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1172' height='788'></svg>)
+![](https://pic1.zhimg.com/v2-20288bb205cd009a843fed5353a14975_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1172' height='788'></svg>)
 
 我用我之前 2021 年发表在 AAAI （Association for the Advancement of Artificial Intelligence）上的一篇论文做了测试，总结的很准确,清楚的总结了研究的问题、方法、实验结果和结论等信息。
 
-![](https://pic1.zhimg.com/v2-05fa98e5c437dd755bdb0b8f97ba285f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2912' height='1428'></svg>)
+![](https://picx.zhimg.com/v2-05fa98e5c437dd755bdb0b8f97ba285f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2912' height='1428'></svg>)
 
 我又进一步问了一下最终模型准确率，智谱清言准确总结了在三个不同数据集上的实验结果，牛！
 
@@ -2637,7 +4898,7 @@ GPT-4搜索到的最新 GPU 是 RTX 40 SUPER，这个是 2024 年 1 月发布的
 
 * 硅仙人：Jim Keller。简单科普一下，这个大哥是芯片界的传说，他基本上在硅谷各大芯片厂商都待过，并且在每个公司都创下了不可磨灭的功绩。比如，在 AMD 期间先后参与和领导设计了 K7,K8 处理器，开启了 AMD 对英特尔的反击。后面又去了苹果，带领团队开拓了苹果A系列处理器中的开山之作A4和下一代的A5。老哥曾经放言：“**我这个人没什么太大成就，你们用过最好的CPU，都是我设计的。**”狂的有底气，大佬就是大佬。这次没能亲临现场，但是录制的 VCR 很大篇幅在介绍 RISC-V 在 AI 领域的应用前景，我只能说相信大佬的眼光准没错，all in 就完事了！
 
-![](https://pic1.zhimg.com/v2-326e549af1cb9e14f1182c5b73e3e7a1_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='832' height='470'></svg>)
+![](https://picx.zhimg.com/v2-326e549af1cb9e14f1182c5b73e3e7a1_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='832' height='470'></svg>)
 
 Jim Keller
 
@@ -2697,7 +4958,7 @@ RISC-V的旅程，才刚刚开始。在这个旅途中，出现了一个让人�
 
 先看看官方渲染图
 
-![](https://picx.zhimg.com/v2-df23a7400af60cd50a4c46e6c899b92b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='832' height='446'></svg>)
+![](https://pic1.zhimg.com/v2-df23a7400af60cd50a4c46e6c899b92b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='832' height='446'></svg>)
 
 再看看实拍图
 
@@ -2715,7 +4976,7 @@ RISC-V的旅程，才刚刚开始。在这个旅途中，出现了一个让人�
 
 听展台的工作人员介绍，在应用生态方面，「如意BOOK」搭载的OpenEuler操作系统，不仅能够流畅运行钉钉、Libre Office、福昕PDF、搜狗输入法等办公软件，还具备长达12小时的综合续航能力，快速启动系统，一键休眠功能，以及网页浏览、4K高清视频播放等强大功能。在会上，达摩院院长张建峰特别提到基于 RISC-V 实现的玄铁架构和多个 Linux 系统平台也有了不同程度的合作和尝试。
 
-![](https://picx.zhimg.com/v2-96b0c2d76263e34fe9cbe39b8676bdda_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='832' height='440'></svg>)
+![](https://pic1.zhimg.com/v2-96b0c2d76263e34fe9cbe39b8676bdda_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='832' height='440'></svg>)
 
 ### 性能
 
@@ -2727,23 +4988,23 @@ RISC-V的旅程，才刚刚开始。在这个旅途中，出现了一个让人�
 
 自2018年起，阿里巴巴就开始了对RISC-V架构的深入探索，从最初的IoT小溪流，逐渐汇成了涵盖高性能应用的宽广河流。2019年，玄铁C910的问世，不仅标志着RISC-V在高性能计算领域的突破，也为后续的技术创新奠定了坚实的基础。六年磨一剑，阿里巴巴达摩院不仅推出了多款覆盖低功耗到高性能的RISC-V处理器，更是将这些处理器的应用领域扩展到了30多个，包括边缘计算、无线通信等，出货量更是达到了惊人的40亿颗，让玄铁成为了国内RISC-V领域的佼佼者。
 
-![](https://pica.zhimg.com/v2-719f68713cc76af0c698c6dd99552421_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='654' height='352'></svg>)
+![](https://pic1.zhimg.com/v2-719f68713cc76af0c698c6dd99552421_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='654' height='352'></svg>)
 
 在全栈技术能力方面，达摩院的探索从未停歇。XT-Link的推出，无剑芯片设计平台的高性能异构特性，以及剑池编译及开发工具的全面优化，这些技术的进步不仅降低了开发门槛，缩短了产品研发周期，更是大幅提升了开发效率，为RISC-V生态的蓬勃发展注入了新的活力。在大会上还正式成立了 RISC-V 无剑联盟，首批成员包括达摩院、中国电信研究员、新思、芯昇科技、Imagination 和 ARTERIS等。
 
-![](https://pica.zhimg.com/v2-69a189c8aeeaf39f0901105955249abc_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='832' height='694'></svg>)
+![](https://picx.zhimg.com/v2-69a189c8aeeaf39f0901105955249abc_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='832' height='694'></svg>)
 
 RISC-V 无剑联盟
 
 另外，今年的玄铁RISC-V生态大会上，玄铁处理器家族的全面升级成为了焦点。玄铁C907的矩阵运算扩展为AI加速计算带来了新的可能，而且张建峰院长表示旗舰处理器C930的即将在 2024 年下半年发布，性能将得到更进一步的提升，这让人们对RISC-V的未来充满了期待。
 
-![](https://picx.zhimg.com/v2-b5f8980f9d2c0d0864dcee60b8af4d06_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='666' height='382'></svg>)
+![](https://pic1.zhimg.com/v2-b5f8980f9d2c0d0864dcee60b8af4d06_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='666' height='382'></svg>)
 
 阿里巴巴通过玄铁系列处理器的持续创新和全栈技术的深度融合，不仅在国内RISC-V领域占据了领先地位，更为RISC-V生态的未来发展打下了坚实的基础。目前，国内外很多厂商也都基于 RISC-V 推出了不同程度的产品和应用。比如：
 
 * 中科蓝讯为耳机专门制作了基于 RISC-V 的耳机芯片，每年出货量超过 8 亿颗，成功在科创板上市。
 
-![](https://pica.zhimg.com/v2-fe105794604e7ddf6db22444b452c8a9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='676' height='410'></svg>)
+![](https://pic1.zhimg.com/v2-fe105794604e7ddf6db22444b452c8a9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='676' height='410'></svg>)
 
 * 著名的 GPU IP公司 Imagination 基于 RISC-V 迭代出了多款性能出色的 GPU。
 
@@ -2769,17 +5030,17 @@ RISC-V 无剑联盟
 
 下面是整个AutoML的pipeline，全文也是围绕这个pipeline对AutoML技术做了回顾和总结。
 
-![](https://picx.zhimg.com/v2-84a19096d309068057adc1074a5b7c0a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1419' height='734'></svg>)
+![](https://pic1.zhimg.com/v2-84a19096d309068057adc1074a5b7c0a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1419' height='734'></svg>)
 
 下表总结了目前现有的AutoML相关的综述，我们的survey涵盖了更广的范围，并且将2020年已发表在会议或期刊上的很多论文都整理在内。其他综述写的都很棒，都有很高的参考价值。
 
-![](https://pic1.zhimg.com/v2-cf1e5440bf9a7064465f086ccc5c6631_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='696' height='445'></svg>)
+![](https://picx.zhimg.com/v2-cf1e5440bf9a7064465f086ccc5c6631_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='696' height='445'></svg>)
 
 下面的内容会对论文做一个简单的总结，不会涉及到太多的细节，感兴趣的朋友可以移步最上面的链接阅读原文。
 
 ## **2、Data preparation**
 
-![](https://picx.zhimg.com/v2-7b575d4631d0d484cad5371a36dcfa79_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='728' height='643'></svg>)
+![](https://pic1.zhimg.com/v2-7b575d4631d0d484cad5371a36dcfa79_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='728' height='643'></svg>)
 
 上图是数据准备的流程图，涉及到的技术有：
 
@@ -2816,7 +5077,7 @@ RISC-V 无剑联盟
 
 为了解决上个方式的问题，Cell-based，顾名思义，就是先搜索出一个表现最好的cell结构，然后堆叠cell来得到最终的模型。
 
-![](https://picx.zhimg.com/v2-21468beec007658473d05f57baa5e4d2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='690' height='850'></svg>)
+![](https://pica.zhimg.com/v2-21468beec007658473d05f57baa5e4d2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='690' height='850'></svg>)
 
 * Hierarchical search space
 
@@ -2824,17 +5085,17 @@ cell-based 有个缺点就是cell 结构其实是人为固定好的，比如你�
 
 第一种是将cell分成若干个level，高level的cell由低level的cell组成
 
-![](https://pic1.zhimg.com/v2-befd5e10cf2af68182cf0e6d1ce1aa71_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='717' height='628'></svg>)
+![](https://picx.zhimg.com/v2-befd5e10cf2af68182cf0e6d1ce1aa71_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='717' height='628'></svg>)
 
 另一种是以MnasNet为代表的方法，即每一层是一个cell，每个cell由若干个block组成，block的数量是可以搜索的。另外每个cell内部的block结构是一样的，但是不同的cell之间的block是不一样的。
 
-![](https://picx.zhimg.com/v2-12a4041644f80df43214dc29b5ec108d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='690' height='788'></svg>)
+![](https://pic1.zhimg.com/v2-12a4041644f80df43214dc29b5ec108d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='690' height='788'></svg>)
 
 * Morphism-based search space
 
 这种方式简单理解就是可以基于现有的模型进行扩展，比如模型加宽、加深，或者把某一个操作替换成其他操作等。
 
-![](https://pica.zhimg.com/v2-9c631259bfcbbeb5980a6aa12801cdcb_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='747' height='561'></svg>)
+![](https://pic1.zhimg.com/v2-9c631259bfcbbeb5980a6aa12801cdcb_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='747' height='561'></svg>)
 
 ## **3.2 Architecture Optimization**
 
@@ -2859,7 +5120,7 @@ cell-based 有个缺点就是cell 结构其实是人为固定好的，比如你�
 
 SMBO简单理解就使用一个代理模型（比如Gaussian process）来预测生成的模型的性能，进而加快搜索效率。
 
-![](https://pica.zhimg.com/v2-5e6c08a36f8fd003a39b0a7797b3b421_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='718' height='342'></svg>)
+![](https://pic1.zhimg.com/v2-5e6c08a36f8fd003a39b0a7797b3b421_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='718' height='342'></svg>)
 
 * Random & Grid search
 
@@ -2897,7 +5158,7 @@ ENAS 和DARTS都采用了类似的方式，即所有可能的模型都是一个s
 
 ## **4.1 Performance Comparison**
 
-![](https://picx.zhimg.com/v2-620433d696018bf5dcc647ccc6039136_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='916' height='1080'></svg>)![](https://picx.zhimg.com/v2-1d0979925687c40d79b35b1a427627e5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='940' height='1053'></svg>)
+![](https://pic1.zhimg.com/v2-620433d696018bf5dcc647ccc6039136_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='916' height='1080'></svg>)![](https://picx.zhimg.com/v2-1d0979925687c40d79b35b1a427627e5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='940' height='1053'></svg>)
 
 上面两个表格总结了NAS算法在CIFAR-10和ImageNet上的结果。虽然每个论文使用的硬件设备都不太一样，但是大致上我们还是能看到Gradient descent-based methods是非常高效的，不仅使用的资源少，而且效果还很不错，这也是为什么很多后续NAS工作都是沿着这个思路做的。
 
@@ -2921,13 +5182,13 @@ ENAS 和DARTS都采用了类似的方式，即所有可能的模型都是一个s
 
 ## **4.2 Two-stage vs. One-stage NAS**
 
-![](https://picx.zhimg.com/v2-dc8f638476f127bcff3e3cfcd40b985f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='708' height='810'></svg>)
+![](https://pica.zhimg.com/v2-dc8f638476f127bcff3e3cfcd40b985f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='708' height='810'></svg>)
 
 一般的NAS算法都是Two-stage的，即先找到一个比较有潜力的模型，之后在deploy之前基本上还得retrain或者finetune一遍。而one-stage NAS则不需要，即找到模型后即可直接用这个模型来做预测了，这方面的方法有Once-for-all NAS, AutoHAS, FBNetv3等。
 
 ## **4.3 One-shot NAS**
 
-![](https://picx.zhimg.com/v2-909c3d4955617c353226c87c8ea09221_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='711' height='434'></svg>)
+![](https://pic1.zhimg.com/v2-909c3d4955617c353226c87c8ea09221_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='711' height='434'></svg>)
 
 在介绍之前需要说明下：One-shot NAS和One-stage NAS是两回事，二者可能会有重叠的地方，但是分类的方法是不一样的。One-stage NAS强调的是一步到位，即搜索完之后模型可以直接使用，而不再需要retrain等操作；而One-shot NAS指的是那些将search space构造成一个supernet的方法，即对网络结构的搜索其实就是对supernet内部路径的搜索。
 
@@ -2968,7 +5229,7 @@ Understanding and Simplifying One-Shot Architecture Search和Single Path One-Sho
 
 下表统计了除了图像分类外，目前NAS所应用的领域
 
-![](https://picx.zhimg.com/v2-175358cc5aba4f6ab4413e580264c191_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1370' height='791'></svg>)
+![](https://pica.zhimg.com/v2-175358cc5aba4f6ab4413e580264c191_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1370' height='791'></svg>)
 
 * 完整的AutoML pipeline系统
 
@@ -2986,7 +5247,7 @@ Understanding and Simplifying One-Shot Architecture Search和Single Path One-Sho
 
 ### **微信公众号：AutoML机器学习**
 
-![](https://pic1.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
+![](https://pica.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
 
 **MARSGGBO♥原创**  
 **如有意合作或学术讨论欢迎私戳联系~**  
@@ -3051,19 +5312,19 @@ for output in outputs:
 
 整个推理过程大大致流程如下图所示，即 1 给定一定数量的 prompts（字符串数组） 2. vllm 会使用 Scheduler 模块自动对需要推理句子进行调度 3. 根据调度的结果，使用 tokenizer 将字符串转换成 prompt id，然后喂给 model 进行计算得到 logits 预测结果 4. 根据 logits 预测结果和提前设置好的采样策略对结果进行采样得到新的 token id 5. 将采样结果保存到 output
 
-![](https://pic1.zhimg.com/v2-c1cc9475fc25d13583f7af950481542b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1720' height='312'></svg>)
+![](https://picx.zhimg.com/v2-c1cc9475fc25d13583f7af950481542b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1720' height='312'></svg>)
 
 inferencce pipeline
 
 ## **2. 整体核心模块**
 
-![](https://picx.zhimg.com/v2-d692937551e96c74b2e7dd508fa2120b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='823' height='871'></svg>)
+![](https://pic1.zhimg.com/v2-d692937551e96c74b2e7dd508fa2120b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='823' height='871'></svg>)
 
 上图给出了 vLLM 核心模块之间的结构关系。接下来我们从简单的模块（即输入、采样和输出）开始介绍，最后详细介绍 LLM 模块。
 
 ## **3. Sequence**
 
-![](https://pic1.zhimg.com/50/v2-7f158b90189375fe99cbdd76a90d2d39_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='193' height='390'></svg>)
+![](https://picx.zhimg.com/50/v2-7f158b90189375fe99cbdd76a90d2d39_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='193' height='390'></svg>)
 
 如上图我们可以看到 vLLM 为输入的句子设计了很多子模块，这些模块的用处各不相同，但是有彼此之间有关系，下面分别详细介绍一下。
 
@@ -3316,7 +5577,7 @@ SamplingParams 包含以下参数：
 
 ## **5. Output 模块**
 
-![](https://pic1.zhimg.com/50/v2-067aa13f79c213df18df86f50ae2f7c8_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='233' height='382'></svg>)
+![](https://pica.zhimg.com/50/v2-067aa13f79c213df18df86f50ae2f7c8_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='233' height='382'></svg>)
 
 Output 主要用于表示语言模型（LLM）的生成结果，包含如下两个模块：
 
@@ -3410,7 +5671,7 @@ class RequestOutput:
 
 ### **微信公众号：AutoML机器学习**
 
-**![](https://picx.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)**
+**![](https://pic1.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)**
 
 **MARSGGBO♥原创**  
 **如有意合作或学术讨论欢迎私戳联系~**  
@@ -3438,11 +5699,11 @@ GPT 训练和推理过程示意图，如有理解错误欢迎指正
 
 我住在国贸旁边的公寓，暴雨当晚停电，直到两天后才用发电机供上电，但是还是限时的而且不稳定。住10楼，电梯没供电，每天上下爬十楼就当锻炼了。老街，国贸，罗湖地铁直到今天(2023/09/11)都还没通，而且有的商铺和居民楼也没来电，下面是暴雨第二天晚上在金光华拍的照片，金光华黯淡无光
 
-![](https://pic1.zhimg.com/v2-2dbacfee09071c2f1cd6a2fe5b65a5ad_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2276' height='1280'></svg>)![](https://picx.zhimg.com/v2-3d2f55d1f293c140c66ae7016b567225_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2276' height='1280'></svg>)![](https://pic1.zhimg.com/v2-a52cd6d7ec427d5bc92f3f451eed75e9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2276' height='1280'></svg>)![](https://picx.zhimg.com/v2-aba5c41d3e37f6191d126b58dc2e8b18_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2276' height='1280'></svg>)
+![](https://pica.zhimg.com/v2-2dbacfee09071c2f1cd6a2fe5b65a5ad_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2276' height='1280'></svg>)![](https://picx.zhimg.com/v2-3d2f55d1f293c140c66ae7016b567225_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2276' height='1280'></svg>)![](https://picx.zhimg.com/v2-a52cd6d7ec427d5bc92f3f451eed75e9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2276' height='1280'></svg>)![](https://picx.zhimg.com/v2-aba5c41d3e37f6191d126b58dc2e8b18_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2276' height='1280'></svg>)
 
 现在在香港，又开始下暴雨，不知道还能不能回去了。。。
 
-![](https://pica.zhimg.com/v2-17a520749e04292f750f4035ee07677f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)![](https://pica.zhimg.com/v2-c8e7315a263de67594dcfc95a7f3d888_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)![](https://pica.zhimg.com/v2-cff0d3e0c38b80183bf05a5b10490041_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)![](https://picx.zhimg.com/v2-2e87fddd644aa1492349fce977e518cd_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)![](https://picx.zhimg.com/v2-da6bb9fc9ded29e3bfdeed5edaa6bcb5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)
+![](https://picx.zhimg.com/v2-17a520749e04292f750f4035ee07677f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)![](https://picx.zhimg.com/v2-c8e7315a263de67594dcfc95a7f3d888_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)![](https://picx.zhimg.com/v2-cff0d3e0c38b80183bf05a5b10490041_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)![](https://pic1.zhimg.com/v2-2e87fddd644aa1492349fce977e518cd_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)![](https://pic1.zhimg.com/v2-da6bb9fc9ded29e3bfdeed5edaa6bcb5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)
 
 真的不想过没电没网，水压还不稳的生活了。。真是一夜回到解放前了
 
@@ -3456,7 +5717,7 @@ GPT 训练和推理过程示意图，如有理解错误欢迎指正
 
 [https://arxiv.org/pdf/2205.14135.pdf](https://link.zhihu.com/?target=https%3A//arxiv.org/pdf/2205.14135.pdf)
 
-![](https://pic1.zhimg.com/v2-66f1e5829c79eefe92d5b78a7c8a0af4_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2220' height='844'></svg>)
+![](https://picx.zhimg.com/v2-66f1e5829c79eefe92d5b78a7c8a0af4_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2220' height='844'></svg>)
 
 https://arxiv.org/pdf/2205.14135.pdf
 
@@ -3464,11 +5725,11 @@ https://arxiv.org/pdf/2205.14135.pdf
 
 不同硬件模块之间的带宽和存储空间有明显差异，例如下图中左边的三角图，最顶端的是GPU种的SRAM，它的容量非常小但是带宽非常大，以A100 GPU为例，它有108个流式多核处理器，每个处理器上的片上SRAM大小只有192KB，因此A100总共的SRAM大小是192KB![\times](https://www.zhihu.com/equation?tex=%5Ctimes)108![\approx](https://www.zhihu.com/equation?tex=%5Capprox)20MB，但是其吞吐量能高达19TB/s。而A100 GPU HBM（High Bandwidth Memory也就是我们常说的GPU显存大小）大小在40GB~80GB左右，但是带宽只与1.5TB/s。
 
-![](https://pic1.zhimg.com/v2-c7e2ecc450e405170eb0128a9455f9cf_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1938' height='830'></svg>)
+![](https://picx.zhimg.com/v2-c7e2ecc450e405170eb0128a9455f9cf_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1938' height='830'></svg>)
 
 下图给出了标准的注意力机制的实现流程，可以看到因为HBM的大小更大，我们平时写pytorch代码的时候最常用到的就是HBM，所以对于HBM的读写操作非常频繁，而SRAM利用率反而不高。
 
-![](https://pic1.zhimg.com/v2-a9d55ec5b6e8dadbb378e004bcab33c9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1652' height='402'></svg>)
+![](https://picx.zhimg.com/v2-a9d55ec5b6e8dadbb378e004bcab33c9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1652' height='402'></svg>)
 
 FlashAttention的主要动机就是希望把SRAM利用起来，但是难点就在于SRAM太小了，一个普通的矩阵乘法都放不下去。FlashAttention的解决思路就是将计算模块进行分解，拆成一个个小的计算任务。
 
@@ -3478,7 +5739,7 @@ FlashAttention的主要动机就是希望把SRAM利用起来，但是难点就�
 
 1. 数值稳定： Softmax包含指数函数，所以为了避免数值溢出问题，可以将每个元素都减去最大值，如下图示，最后计算结果和原来的Softmax是一致的。
 
-![](https://picx.zhimg.com/v2-b49a95b04d4881a0400701edefe9550b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2028' height='180'></svg>)
+![](https://pic1.zhimg.com/v2-b49a95b04d4881a0400701edefe9550b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2028' height='180'></svg>)
 
 2. 分块计算Softmax
 
@@ -3498,7 +5759,7 @@ FlashAttention算法流程如下图所示
 
 为方便理解，下图将FlashAttention的计算流程可视化出来了，简单理解就是每一次只计算一个block的值，通过多轮的双for循环完成整个注意力的计算。
 
-![](https://picx.zhimg.com/v2-45534db483a314bbc23a6aa59c5f2c8d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='999' height='1158'></svg>)
+![](https://pic1.zhimg.com/v2-45534db483a314bbc23a6aa59c5f2c8d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='999' height='1158'></svg>)
 
 下面是FlashAttention的代码实现，参考自[https://github.com/shreyansh26/FlashAttention-PyTorch/tree/master](https://link.zhihu.com/?target=https%3A//github.com/shreyansh26/FlashAttention-PyTorch/tree/master)
 
@@ -3718,7 +5979,7 @@ if __name__ == "__main__":
 
 ### **微信公众号：AutoML机器学习**
 
-**![](https://picx.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)**
+**![](https://pica.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)**
 
 **MARSGGBO♥原创**  
 **如有意合作或学术讨论欢迎私戳联系~**  
@@ -3750,7 +6011,7 @@ if __name__ == "__main__":
 
 后面有工作对FFN做了改进，提出了[GLU（Gated Linear Unit）结构](https://link.zhihu.com/?target=https%3A//www.notion.so/GLU-Variants-Improve-Transformer-8651dcfc5b444fa3ba379ce50624584d%3Fpvs%3D21)，并且发现能有效提升模型性能。GLU结构大致如下图。简单理解就是有两个支路，两条支路都是全连接层加激活函数。两条支路的激活函数可以不同。最后两路的结果会做element-wise相乘，得到的结果会再经过一个全连接层进行处理。
 
-![](https://picx.zhimg.com/v2-d7eee1de2fe52666de4b673e48c6962f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1578' height='985'></svg>)
+![](https://pic1.zhimg.com/v2-d7eee1de2fe52666de4b673e48c6962f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1578' height='985'></svg>)
 
 图2 GLU+MHSA
 
@@ -3764,7 +6025,7 @@ if __name__ == "__main__":
 
 上面的GLU和注意力模块是独立开的，GAU做了一个很巧的构思把二者融合到了一个模块，其结构和伪代码如下图所示
 
-![](https://picx.zhimg.com/v2-dab2f95cd0224dcfd8c8dc84048b4ff9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2162' height='1125'></svg>)
+![](https://pic1.zhimg.com/v2-dab2f95cd0224dcfd8c8dc84048b4ff9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2162' height='1125'></svg>)
 
 图3 GAU示意图和伪代码
 
@@ -3795,7 +6056,7 @@ GAU的数学表达式如下：
 
 对比GLU+MHSA和GAU，我们可以看到GAU只有一个head，而且去掉了Softmax，而且实验结果显示GAU的表现和原来的MHSA+MLP也不分伯仲，甚至更好
 
-![](https://pic1.zhimg.com/v2-dd1f44079d5522f7c687f34285bd0493_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='998' height='352'></svg>)
+![](https://picx.zhimg.com/v2-dd1f44079d5522f7c687f34285bd0493_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='998' height='352'></svg>)
 
 图4 GAU和Transformer实验结果对比
 
@@ -3833,7 +6094,7 @@ GAU的数学表达式如下：
 
 为了解决上面提到的推理计算技巧无法应用到训练阶段，本文作者提出了Mixed Chunk Attention方法，该方法将Partial Attention（简单理解就是只计算更重要部分的注意力，但是实际上这类方法的计算效率不高，因为计算是不规则和碎片化的）和Linear Attention的优点进行了结合。
 
-![](https://pica.zhimg.com/v2-f974b9762f3e01c0d7c644e2e98a8c10_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1348' height='1250'></svg>)
+![](https://picx.zhimg.com/v2-f974b9762f3e01c0d7c644e2e98a8c10_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1348' height='1250'></svg>)
 
 图5 三种不同注意力计算方法
 
@@ -3895,7 +6156,7 @@ Mixed Chunk Attention伪代码如下：
 
 原论文还做了消融实验，显示相对来说局部注意力比全局注意力更重要，而混合式的效果最好。下面实验中的MC-TFM++是指将Mixed Chunk Attention运用到Transformer++。MC-TFM++和FLASH一样都是线性复杂度，但是用的FFN。可以看到使用GAU的FLASH要明显优于MC-TFM++。
 
-![](https://pica.zhimg.com/v2-d016ae48fb6c350f6a951602d890cba6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2057' height='587'></svg>)
+![](https://picx.zhimg.com/v2-d016ae48fb6c350f6a951602d890cba6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2057' height='587'></svg>)
 
 ## **5.3 Chunk大小该如何选择**
 
@@ -3915,7 +6176,7 @@ Mixed Chunk Attention伪代码如下：
 
 如果我说本科同学 [@Gaoning](https://www.zhihu.com/people/c325bebfb60bb9a62a33b31f23d36c08) 27岁成了教授，阁下又当如何应对
 
-![](https://pica.zhimg.com/v2-a6cf744309e1d0186f5f1a49045c54ef_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='512' height='512'></svg>)
+![](https://pic1.zhimg.com/v2-a6cf744309e1d0186f5f1a49045c54ef_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='512' height='512'></svg>)
 
 
 ---
@@ -3964,7 +6225,7 @@ Mixed Chunk Attention伪代码如下：
 
 计划都做好了，接下来就是要如何提高会议的效率了。因为现如今的会议大多都是用英文交流的，加上有的时候现场环境嘈杂或者走神，很可能就会错过一些重要内容。所以一种办法是用录音笔或者手机录音，会议结束后再去从录音里回顾会议内容。但是，很显然这种办法很累，因为一般开完会后是没有精力再去整理的。这里推荐一个神器，iFLYBUDS Nano+耳机。真的，这玩意儿绝了，除了颜值不错，它还把蓝牙耳机玩出花了，商务人士或者学生党真的可以入手一个。
 
-<https://xg.zhihu.com/plugin/4889b3ba3f5cabaf2be5313ab08e9f2f?BIZ=ECOMMERCE>![](https://picx.zhimg.com/v2-85e20bc8a7ecb2a47c58438d59fd38dd_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1379' height='776'></svg>)
+<https://xg.zhihu.com/plugin/4889b3ba3f5cabaf2be5313ab08e9f2f?BIZ=ECOMMERCE>![](https://pic1.zhimg.com/v2-85e20bc8a7ecb2a47c58438d59fd38dd_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1379' height='776'></svg>)
 
 iFLYBUDS Nano+是一个具有主动降噪和录音功能的耳机。一听是不是觉得，不就是降噪加录音嘛，我用手机不也一样可以录音。是的！我第一次看到这耳机的时候我也是这么想的。但是，它不仅仅能做到录音转写还做了很多后续场景的优化。
 
@@ -3976,7 +6237,7 @@ iFLYBUDS Nano+是一个具有主动降噪和录音功能的耳机。一听是不
 
 应用用商店可以直接搜索下载。手机端提供了提供三种场景的录音：现场录音、网络电话录音（比如微信、zoom、腾讯会议等）、音视频录音（例如看B站视频或者听广播）。
 
-![](https://picx.zhimg.com/50/v2-674aa9791f8ae41f7a75c0cd9bc09482_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='261' height='580'></svg>)
+![](https://pic1.zhimg.com/50/v2-674aa9791f8ae41f7a75c0cd9bc09482_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='261' height='580'></svg>)
 
 手机APP端提供三种录音方式
 
@@ -3996,7 +6257,7 @@ iFLYBUDS Nano+是一个具有主动降噪和录音功能的耳机。一听是不
 
 选择【区分说话人】
 
-![](https://picx.zhimg.com/50/v2-4d74b33ba17713657c2adb21bfe735b6_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='417' height='926'></svg>)
+![](https://pic1.zhimg.com/50/v2-4d74b33ba17713657c2adb21bfe735b6_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='417' height='926'></svg>)
 
 录音转化为文本后，会自动按照说话人进行文本区分
 
@@ -4006,11 +6267,11 @@ iFLYBUDS Nano+是一个具有主动降噪和录音功能的耳机。一听是不
 
 另外录音内容还支持智能播放，比如它会根据算法自动把一些空白或者杂声给去掉，这可以极大节省时间。
 
-![](https://pica.zhimg.com/v2-f3878e3d623016670f2384fb30300274_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='540' height='1199'></svg>)
+![](https://picx.zhimg.com/v2-f3878e3d623016670f2384fb30300274_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='540' height='1199'></svg>)
 
 只是简单把录音转成文字肯定是不够的。iFLYBUDS 手机app里提供了生成式VIAIM AI会议助理，它能够基于人工智能（AI）技术自动对录音信息做处理。比如，如果你嫌文字内容太多，讯飞会议耳机甚至还可以贴心提供了【摘要】功能，它能自动将文字内容里提取出重要信息，转换成摘要。像一些会议开头的“喂，听得到吗”，“诶，听得到”，“hello, can you hear me”这些戏份一键删除。不仅如此，VIAIM AI会议助理还能够自动生成待办事项，一切安排的明明白白，属实是被拿捏住了。讯飞会议耳机它真的，我哭死。
 
-![](https://picx.zhimg.com/50/v2-9f1c6ee671b10c2d20e472900a196694_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='250' height='196'></svg>)![](https://picx.zhimg.com/50/v2-e0178db5b047f85fea7949e21cc283a2_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='163' height='156'></svg>)
+![](https://pica.zhimg.com/50/v2-9f1c6ee671b10c2d20e472900a196694_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='250' height='196'></svg>)![](https://pic1.zhimg.com/50/v2-e0178db5b047f85fea7949e21cc283a2_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='163' height='156'></svg>)
 
 还有还有啊，先留点眼泪别哭死，关键的是语音转文字功能永久免费！！！是的，永久免费！！！来，1,2,3，给我哭！！！
 
@@ -4146,7 +6407,7 @@ NAS Benchmark dataset提供了查询式的数据库，每个模型都有对应�
 
 我现在在家，无法直接访问远程服务器，只能把学校电脑作为跳板才可以。下面是示意图
 
-![](https://pic1.zhimg.com/v2-dc2037d66275dc67e867f98776591ad7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1758' height='904'></svg>)
+![](https://picx.zhimg.com/v2-dc2037d66275dc67e867f98776591ad7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1758' height='904'></svg>)
 
 image
 
@@ -4166,7 +6427,7 @@ image
 
 首先按下快捷键 `Win + R`，然后输入`services.msc`，之后会进入到windows的服务管理界面。往下滑你可以找到OpenSSH SSH Server选项，双击它后点击`启动`，并将启动类型选项改为`自动`。
 
-![](https://picx.zhimg.com/v2-9ccc5b75448634084d8dc11ad9d0921d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1278' height='612'></svg>)
+![](https://pic1.zhimg.com/v2-9ccc5b75448634084d8dc11ad9d0921d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1278' height='612'></svg>)
 
 image
 
@@ -4285,7 +6546,7 @@ ssh -J x@a.b.c.d,y@127.0.0.1 z@e.f.g.h
 `link: https://www.zhihu.com/question/582930903/answer/2884842350 · created: 1675936164`
 
 
-![](https://picx.zhimg.com/v2-a7cb052c4cb72eac8ee78c86c56d4b44_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='794' height='742'></svg>)
+![](https://pic1.zhimg.com/v2-a7cb052c4cb72eac8ee78c86c56d4b44_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='794' height='742'></svg>)
 
 1. Bard出错的原因可能是什么？
 
@@ -4376,20 +6637,20 @@ One-NAS通过训练一个超网来估计每个可能的子网的性能，从而�
 4. 基于min-cut算法找到对sub-Supernet最合理的划分方式，即尽可能保证相似的sub-Supernet归为同一类。属于同一类的会进行合并得到最终的sub-Supernet，如下图（左）所示。
 5. 划分完sub-Supernet之后分别finetune若干个epoch，最后每个模型通过继承对应sub-Supernet的权重直接进行性能评估。我们采用了进化算法进行搜索。
 
-![](https://pic1.zhimg.com/v2-9c94751fe99639ea58221c8b83a1c3b5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1703' height='690'></svg>)
+![](https://pica.zhimg.com/v2-9c94751fe99639ea58221c8b83a1c3b5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1703' height='690'></svg>)
 
 ## 4. 实验结果
 
 * GPU内存开销对比  
   下表显示了GM-NAS和NAS-LID在不同搜索空间和输入数据大下GPU内存开销对比。可以看到，在四种情况下，NAS-LID的GPU内存开销都明显小于GM-NAS，尤其是当时输入数据大小为32×3×224×224和搜索空间为NASBench-201时，GPU内存开销能降低86%。
 
-![](https://picx.zhimg.com/v2-4908946c27e470250a32d339388a6d51_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='629' height='269'></svg>)
+![](https://pica.zhimg.com/v2-4908946c27e470250a32d339388a6d51_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='629' height='269'></svg>)
 
 * 模型性能排序相关性实验
 
 下表对比了SPOS、GM-NAS和我们的NAS-LID在NAS-Bench201数据集上对模型性能排序相关性。可以看到NAS-LID有效提升了排名靠前的模型之间的性能排序。
 
-![](https://pic1.zhimg.com/v2-c117613731ecc3d925c852ec0035d20d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1240' height='249'></svg>)
+![](https://picx.zhimg.com/v2-c117613731ecc3d925c852ec0035d20d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1240' height='249'></svg>)
 
 * 相似度衡量指标对性能排序影响  
   我们对比了基于欧氏距离和Pearson距离指标对最终性能排序相关性的影响。其中Pearson只衡量不同模型的LID的相对关系，例如假设两个模型的LID分布分别是[1,2,3]和[10,20,30]，那么Pearson指标会认为二者完全相似，而欧氏距离则关注的是绝对关系。  
@@ -4401,7 +6662,7 @@ One-NAS通过训练一个超网来估计每个可能的子网的性能，从而�
 
 我们进一步在 OFA和ProxylessNAS搜索空间验证了NAS-LID的有效性，下表显示了搜索到的模型在ImageNet上的表现，可以看到NAS-LID能够有效找到优秀的模型结构。
 
-![](https://picx.zhimg.com/v2-8bb5f01f2c53f4256eaaf95cdcf0078c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1234' height='873'></svg>)
+![](https://pic1.zhimg.com/v2-8bb5f01f2c53f4256eaaf95cdcf0078c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1234' height='873'></svg>)
 
 ## 5. 总结
 
@@ -4427,7 +6688,7 @@ One-NAS通过训练一个超网来估计每个可能的子网的性能，从而�
 
 我惊讶的是论文只有老爷子一个人的署名，致敬
 
-![](https://picx.zhimg.com/v2-0fbd5dd2495e321a13b75495106235a8_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='691' height='599'></svg>)
+![](https://pica.zhimg.com/v2-0fbd5dd2495e321a13b75495106235a8_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='691' height='599'></svg>)
 
 
 ---
@@ -4443,17 +6704,17 @@ One-NAS通过训练一个超网来估计每个可能的子网的性能，从而�
 
 * Grammarly: 改语法错误。安装浏览器插件后会自动识别你输入的英文内容并提出修改建议
 
-[Write your best with Grammarly.](https://link.zhihu.com/?target=https%3A//www.grammarly.com/)![](https://pica.zhimg.com/v2-c79d2fa2006af3d6f0443cba82c77125_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='524' height='407'></svg>)
+[Write your best with Grammarly.](https://link.zhihu.com/?target=https%3A//www.grammarly.com/)![](https://picx.zhimg.com/v2-c79d2fa2006af3d6f0443cba82c77125_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='524' height='407'></svg>)
 
 * Quillbot：同义词替换，改变句式
 
-![](https://pic1.zhimg.com/v2-0aac35163cd649edef51817a74bd37de_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1307' height='210'></svg>)
+![](https://pica.zhimg.com/v2-0aac35163cd649edef51817a74bd37de_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1307' height='210'></svg>)
 
 * EasyEssay
 
 输入一句话，可以自动根据话的意思生成一个段落。比如这里我让它写一下AutoML的历史，下面方框中的内容就是生成的。不过不是免费的，每天就有几次的额度而已
 
-![](https://pic1.zhimg.com/v2-4b617a5b835f22c637bf5b4785c5bbca_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='664' height='493'></svg>)
+![](https://picx.zhimg.com/v2-4b617a5b835f22c637bf5b4785c5bbca_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='664' height='493'></svg>)
 
 我把生成的内容复制过来，客官们可以看看效果如何：
 
@@ -4473,7 +6734,7 @@ One-NAS通过训练一个超网来估计每个可能的子网的性能，从而�
 
 货比三家才是真正好
 
-![](https://pic1.zhimg.com/v2-368cadb4221485c84a843bb21db75018_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='593' height='634'></svg>)
+![](https://picx.zhimg.com/v2-368cadb4221485c84a843bb21db75018_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='593' height='634'></svg>)
 
 ### 画图
 
@@ -4501,7 +6762,7 @@ One-NAS通过训练一个超网来估计每个可能的子网的性能，从而�
 
 支持Excel、markdown，HTML，Latex等格式的表格转换，latex新手推荐使用
 
-![](https://pic1.zhimg.com/v2-5611997eb1ac610d0a5c68386a752b16_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='968' height='682'></svg>)
+![](https://picx.zhimg.com/v2-5611997eb1ac610d0a5c68386a752b16_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='968' height='682'></svg>)
 
 * Online Bibtext Tidy：在线整理bib文件
 
@@ -4509,11 +6770,11 @@ One-NAS通过训练一个超网来估计每个可能的子网的性能，从而�
 
 写论文的时候一般引用很多论文，例如这个例子中原bib文件长这样，格式乱七八糟，非常不美观
 
-![](https://picx.zhimg.com/v2-82e8af869c815b2a43cd1c7bd511ed42_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='623' height='421'></svg>)
+![](https://pic1.zhimg.com/v2-82e8af869c815b2a43cd1c7bd511ed42_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='623' height='421'></svg>)
 
 一键清洗后长这样，是不是清爽多了
 
-![](https://pic1.zhimg.com/v2-26790320d8398f3018f6674cf1824c75_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='720' height='355'></svg>)
+![](https://picx.zhimg.com/v2-26790320d8398f3018f6674cf1824c75_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='720' height='355'></svg>)
 
 另外该网页还支持很多其他的功能，例如去重，去除空字符等等，还能够批量修改。对bib文件有其他需求的也可试试这个网页看能不能解决你的问题
 
@@ -4539,7 +6800,7 @@ One-NAS通过训练一个超网来估计每个可能的子网的性能，从而�
 
 首页会推送与你相关领域的研究工作，另外你关注的学者的最新动态也会实时更新
 
-[https://www.researchgate.net/profile/Xin-He-105](https://link.zhihu.com/?target=https%3A//www.researchgate.net/profile/Xin-He-105)![](https://pic1.zhimg.com/v2-976c97990c711c791573b2881cdfe217_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1473' height='907'></svg>)
+[https://www.researchgate.net/profile/Xin-He-105](https://link.zhihu.com/?target=https%3A//www.researchgate.net/profile/Xin-He-105)![](https://pica.zhimg.com/v2-976c97990c711c791573b2881cdfe217_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1473' height='907'></svg>)
 
 
 ---
@@ -4555,7 +6816,7 @@ One-NAS通过训练一个超网来估计每个可能的子网的性能，从而�
 
 之前的阿法狗或者是王者荣耀AI都是基于规则和算力，以一种理性的方式打败人类。而Cicero AI则是通过对话的方式感性地（也有理性成分）说服人类。具体来说，馒头选择了外交作为测试，因为几十年来，外交一直被视为人工智能中几乎不可能的重大挑战，因为它要求AI能够掌握理解他人动机和观点，制定复杂的计划并调整策略，然后使用自然语言与其他人达成协议，说服他们建立伙伴关系和联盟等等。是不是听起来就很复杂
 
-![](https://picx.zhimg.com/v2-411bea782c81b682401b89830ef09382_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1920' height='1080'></svg>)
+![](https://pic1.zhimg.com/v2-411bea782c81b682401b89830ef09382_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1920' height='1080'></svg>)
 
 Cicero AI在（[Home - webDiplomacy](https://link.zhihu.com/?target=https%3A//webdiplomacy.net/)）上进行了测试，这是一个提供了很多游戏的网站，其中网络外交就是其中一个。
 
@@ -4570,13 +6831,13 @@ Cicero AI在（[Home - webDiplomacy](https://link.zhihu.com/?target=https%3A//we
 
 在了解CiceroAI之前，我们先简单了解一下这个网络外交游戏到底是个啥？
 
-![](https://pic1.zhimg.com/v2-e51c2713329df367192a96759222380b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='630' height='546'></svg>)
+![](https://picx.zhimg.com/v2-e51c2713329df367192a96759222380b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='630' height='546'></svg>)
 
 外交游戏模拟的是一战期间七大强国瓜分欧陆的情形，，七名玩家中的每一个都控制着 1901 年欧洲的一个大国,其核心规则是玩家通过交流（即外交）争夺资源点，最终率先拿下一半欧洲领土的即为赢家。
 
 整个游戏过程中，玩家可以在棋盘上移动你的单位，争取将其他玩家的补给中心据为己有。游戏初始状态下每个玩家都有3个军队单位，每个单位战斗力相同。所以刚开始1v1谁也赢不了对方，这个时候就需要找人联盟帮忙，游戏中需要通过对话框来与其他游戏玩家交流来达到结盟等目的。
 
-![](https://pic1.zhimg.com/v2-21fb77c6ea3786ddc01a95d7847ef515_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1536' height='864'></svg>)
+![](https://picx.zhimg.com/v2-21fb77c6ea3786ddc01a95d7847ef515_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1536' height='864'></svg>)
 
 * CICERO打了40场比赛，对阵82名匿名人类竞争对手。
 
@@ -4588,7 +6849,7 @@ Cicero AI在（[Home - webDiplomacy](https://link.zhihu.com/?target=https%3A//we
 
 下图是CICERO在实际游戏过程中的对话信息,其代理国家是是奥地利，通过对话可以看到它正在和代理俄罗斯的玩家进行着某种不可言说的交易
 
-![](https://picx.zhimg.com/v2-da175d35f438b02f5bd243b2fe2b234f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1851' height='1015'></svg>)
+![](https://pica.zhimg.com/v2-da175d35f438b02f5bd243b2fe2b234f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1851' height='1015'></svg>)
 
 这就很像图灵测试，真实的游戏玩家在和CICERO交流时甚至都没有发觉对方是个机器人。和小爱小冰的区别在于，CICERO 更倾向掌握对话主动权，着实有点意思。也许以后在面对甲方的无理要求时，CICERO也许是个不错的帮手。
 
@@ -4604,7 +6865,7 @@ Meta团队开发了自动将训练数据中的消息与游戏中相应的计划�
 
 CiceroAI采用强化学习来更新模型，每次会生成多个文本，然后通过设计好的过滤器筛掉那些废话多，信息量低的句子，已达到最大化value的目的。
 
-![](https://picx.zhimg.com/v2-b6860ed12fd0b970745c885175155673_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='747' height='414'></svg>)
+![](https://pic1.zhimg.com/v2-b6860ed12fd0b970745c885175155673_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='747' height='414'></svg>)
 
 ### 目的一致性、有对话意识
 
@@ -4612,7 +6873,7 @@ CiceroAI采用强化学习来更新模型，每次会生成多个文本，然后
 
 下图展示了AI机器人作为英格兰玩家的时候对法国、德国和俄罗斯发送的对话信息。CICERO试图通过向三个不同的玩家提出行动来执行其战略。在第二个对话框中，AI能够告诉其他玩家为什么他们应该合作以及如何互惠互利。第三，CICERO既在征求信息，又为未来的行动奠定基础。
 
-![](https://pic1.zhimg.com/v2-cd566dfd2dc55cac830512f7396ab4af_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1916' height='970'></svg>)
+![](https://picx.zhimg.com/v2-cd566dfd2dc55cac830512f7396ab4af_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1916' height='970'></svg>)
 
 ## 4. 未来
 
@@ -4801,11 +7062,11 @@ class RandomMutator(Mutator):
 
 Hyperbox框架还有很多可以完善的地方，对框架开发感兴趣的小伙伴可以扫码入群，有问题也可以在群里讨论。
 
-![](https://pica.zhimg.com/v2-a0ad462e687c9bf67c2f85503b077b76_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='910' height='1264'></svg>)
+![](https://pic1.zhimg.com/v2-a0ad462e687c9bf67c2f85503b077b76_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='910' height='1264'></svg>)
 
 ### **微信公众号：AutoML机器学习**
 
-![](https://pica.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
+![](https://picx.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
 
 **MARSGGBO♥原创**  
 **如有意合作或学术讨论欢迎私戳联系~**  
@@ -4821,7 +7082,7 @@ Hyperbox框架还有很多可以完善的地方，对框架开发感兴趣的小
 
 只有导师收到邮件了，accept，但是cmt系统被挤爆了，现在进不去
 
-![](https://pic1.zhimg.com/v2-fea49654a1a2cf5ed730ca1973b99612_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)
+![](https://pica.zhimg.com/v2-fea49654a1a2cf5ed730ca1973b99612_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)
 
 给自己的automl框架打个广告，是基于nni设计的，有设计新的搜索API，文档说明还有待完善，有兴趣参与框架设计的欢迎私戳讨论，也欢迎提issue
 
@@ -4879,7 +7140,7 @@ Hyperbox框架还有很多可以完善的地方，对框架开发感兴趣的小
 
 谈到综述，那必然首推NAS综述鼻祖： **Neural Architecture Search: A Survey**
 
-[a](https://link.zhihu.com/?target=https%3A//arxiv.org/abs/1808.05377)![](https://picx.zhimg.com/v2-3739d240368534f5477c3cc47ef8deb9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='780' height='306'></svg>)
+[a](https://link.zhihu.com/?target=https%3A//arxiv.org/abs/1808.05377)![](https://pic1.zhimg.com/v2-3739d240368534f5477c3cc47ef8deb9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='780' height='306'></svg>)
 
 NAS流程图
 
@@ -4891,7 +7152,7 @@ NAS流程图
 
 我们的综述清晰地给出了一个完整的AutoML的pipeline框架，如下图示。
 
-![](https://pica.zhimg.com/v2-b7d685e80d1ba1e7699b22a1df5a295b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1292' height='629'></svg>)
+![](https://picx.zhimg.com/v2-b7d685e80d1ba1e7699b22a1df5a295b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1292' height='629'></svg>)
 
 AutoML Pipeline
 
@@ -4970,7 +7231,7 @@ NAS和AutoML的综述有不少，你精度几篇之后，另外几篇可以作�
 
 ### 微信公众号：AutoML机器学习
 
-![](https://picx.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
+![](https://pica.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
 
 **MARSGGBO♥原创**
 
@@ -5005,7 +7266,7 @@ NAS和AutoML的综述有不少，你精度几篇之后，另外几篇可以作�
 
 下图给出了这些并行方法的示意图，非常直观好懂。
 
-![](https://picx.zhimg.com/v2-7946bc1070d007f8409f4bce00fe1731_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1916' height='700'></svg>)
+![](https://pic1.zhimg.com/v2-7946bc1070d007f8409f4bce00fe1731_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1916' height='700'></svg>)
 
 不过在介绍各种并行训练方法之前，我们首先对一些概念做一个声明，方便后面理解
 
@@ -5036,7 +7297,7 @@ DP下有很多优化算法，具体的可以看看我优秀师弟 [@二猹树](h
 
 pipeline parallelism是比较常见的模型并行算法，它是模型做层间划分，即inter-layer parallelism。以下图为例，如果模型原本有6层，你想在2个GPU之间运行pipeline，那么每个GPU只要按照先后顺序存3层模型即可。
 
-![](https://picx.zhimg.com/v2-bfeea6ddcc2e60511652d10f4da7acb2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='544' height='546'></svg>)
+![](https://pic1.zhimg.com/v2-bfeea6ddcc2e60511652d10f4da7acb2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='544' height='546'></svg>)
 
 已经有很多Pipeline相关的研究工作了，例如PipeDream，GPipe，和Chimera。它们的主要目的都是降低bubble time。这里不做过多介绍。
 
@@ -5044,7 +7305,7 @@ pipeline parallelism是比较常见的模型并行算法，它是模型做层间
 
 前面介绍的Pipeline Parallelism是对模型层间做划分，叫inter-layer parallelism。那么另一种方式则是对模型层内做划分，即intra-layer Parallelism，也叫Tensor Parallelism。
 
-![](https://pic1.zhimg.com/v2-2befe468a1450ee315c7672c0e40594b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1640' height='570'></svg>)
+![](https://picx.zhimg.com/v2-2befe468a1450ee315c7672c0e40594b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1640' height='570'></svg>)
 
 Tensor Parallelism
 
@@ -5052,11 +7313,11 @@ Tensor Parallelism
 
 Megatron-LM [1]是最早提出1D Tensor并行的工作。该工作主要是为了优化transformer训练效率，把线性层按照行或者列维度对权重进行划分。如下图所示，原本线性层为![Y=W_1W_2X](https://www.zhihu.com/equation?tex=Y%3DW_1W_2X) ，这里将![W_1](https://www.zhihu.com/equation?tex=W_1)按列进行划分，将![W_2](https://www.zhihu.com/equation?tex=W_2)按行进行划分。这样，每个GPU只需要存一半的权重即可，最后通过All-reduce操作来同步Y的结果。当GPU数量为![N](https://www.zhihu.com/equation?tex=N)时，每个GPU只需要存![\frac{1}{N}](https://www.zhihu.com/equation?tex=%5Cfrac%7B1%7D%7BN%7D)的权重即可，只不过每层输出需要用All-reduce来补全结果之后才能继续下一层的计算。
 
-![](https://picx.zhimg.com/v2-692d0821e4bad2eceaec24dbf3fe24dd_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='870' height='436'></svg>)
+![](https://pic1.zhimg.com/v2-692d0821e4bad2eceaec24dbf3fe24dd_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='870' height='436'></svg>)
 
 对于土豪公司，可以使用NVLink来连接GPU（如下图a），从而提供高带宽来降低通信开销。但是土豪终归是少数的，大部分公司和个人是没法承担这昂贵的硬件费用，因此比较常见的GPU连接方式是下图b，即节点内花点钱实现NVLink连接，节点之间通过PCIe连接。
 
-![](https://picx.zhimg.com/v2-2b2f460cb3d80a78dbb939b57119f6a8_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='928' height='688'></svg>)
+![](https://pic1.zhimg.com/v2-2b2f460cb3d80a78dbb939b57119f6a8_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='928' height='688'></svg>)
 
 1D Tensor并行对通信速度要求较高，不过1D在每层的输入和输出都有冗余的内存开销。以Fig.4为例，我们可以看到虽然模型权重被划分了，但是每个GPU都有重复的输入![X](https://www.zhihu.com/equation?tex=X),另外All-reduce之后每个GPU也会有重复的输出![Y](https://www.zhihu.com/equation?tex=Y)，所以后续一些工作尝试从这里做进一步改进,包括2D, 2.5D,和3D tensor并行。
 
@@ -5080,7 +7341,7 @@ Megatron-LM [1]是最早提出1D Tensor并行的工作。该工作主要是为�
 
 2D/2.5D/3D Tensor 并行算法因为在一开始就对输入进行了划分， 所以中间层不需要做通信，只需要在最后做一次通信即可。在扩展到大量设备（如GPU）时，通信开销可以降到很小。这3个改进的Tensor并行算法可以很好地和Pipeline并行方法兼容。
 
-![](https://pica.zhimg.com/v2-13c9d48af74271cc29da70c5faed1bb4_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='906' height='652'></svg>)
+![](https://picx.zhimg.com/v2-13c9d48af74271cc29da70c5faed1bb4_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='906' height='652'></svg>)
 
 ### **2.3 Sequential Parallelism**
 
@@ -5092,7 +7353,7 @@ Tensor parallelism主要是为了解决由 model data （模型权重，梯度�
 
 Sequential Parallelism （SP）就为了解决non-model data导致的性能瓶颈而提出的。下图给出了SP在Transform并行训练上的应用，具体的原理可以查看原论文[7]。
 
-![](https://picx.zhimg.com/v2-30b1dfa8d4feb973615920de0034aa47_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1726' height='920'></svg>)
+![](https://pic1.zhimg.com/v2-30b1dfa8d4feb973615920de0034aa47_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1726' height='920'></svg>)
 
 ## **3. Zero Redundancy Data Parallelism (ZeRO)**
 
@@ -5132,7 +7393,7 @@ ZeRO针对模型状态的三部分都做了对应的内存改进方法：
 
 ### **微信公众号：AutoML机器学习**
 
-![](https://picx.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
+![](https://pic1.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
 
 **MARSGGBO♥原创**  
 **如有意合作或学术讨论欢迎私戳联系~**  
@@ -5154,7 +7415,7 @@ ZeRO针对模型状态的三部分都做了对应的内存改进方法：
 当然，我不否认普通院校或者大专会轻松很多，但问题在于，普通院校的项目申请和经费难度也非常大，而且待遇相对一般，只能说很“稳定”，而且我老家那边的大专院校招的老师只要是硕士以上就可以，博士毕业去这些地方，个人感觉性价比太低。  
 相比之下，研究所其实是个不错的选择，我目前在新加坡的A\*STAR。选研究所主要看它的待遇和近些年的研发成果，如果和自己的方向比较吻合，而且不想过于卷的话，可以考虑国内和国外的研究所。
 
-![](https://pic1.zhimg.com/v2-c1ab8e90b892ac4f938f87ba157e54af_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='554' height='274'></svg>)
+![](https://picx.zhimg.com/v2-c1ab8e90b892ac4f938f87ba157e54af_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='554' height='274'></svg>)
 
 **2. 进入企业**
 
@@ -5167,19 +7428,19 @@ ZeRO针对模型状态的三部分都做了对应的内存改进方法：
 相比创业，加入大厂是一个相对稳妥的选择。大厂现在已经发展的比较成熟了，基础设施也很完善，可以支持各种研发项目的落地。而且，人工智能本身就是现在的热门，各个公司在资源上的倾斜和投入也会大很多。  
 做人工智能和大模型的硕士和博士在很多大厂眼中都是“香饽饽”，提供的待遇和资源也更多。而且从我过去的实习情况来看，现在很多大厂的研发部门氛围其实非常像学校，和同事之间的关系也没有那么复杂，在大厂工作，大家在一起交流、激发灵感，共同解决问题，这种学习和成长的环境对个人发展非常有帮助，这对刚毕业的硕士和博士来说无疑是一个不错的平台。同时，大厂一般都有明确的职业发展通道，有很多不同的岗位选择和晋升机会。而且公司提供的培训和支持也很完善，可以帮助员工不断提升技能。
 
-![](https://pic1.zhimg.com/v2-e5f12ada4b9cbc8b1740cf5f5bd0191f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='554' height='368'></svg>)
+![](https://picx.zhimg.com/v2-e5f12ada4b9cbc8b1740cf5f5bd0191f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='554' height='368'></svg>)
 
 上面我对比了博士毕业后的几种选择，实际上每种选择都有优势和缺点，每种选择也都有适合的人，只不过对大多数应届生来说，我觉得进研究所和进大厂对博士来说性价比相对更高。  
 最近我也在和进入大厂的几个朋友聊过这个问题，他们说现在大厂提供的人才计划非常多，不论是资源的倾斜还是工资待遇都很不错。但如果说针对AI大模型领域博士生的头部人才计划，目前了解到只有字节的Top Seed，我看完以后对这个计划还挺感兴趣。  
 豆包现在的发展我觉得是国内大模型里面比较好的，不仅豆包 APP 的下载量在 AIGC 类应用中排名第一，而且截至 9 月，豆包语言模型的日均 tokens 处理量超过 1.3 万亿，相比 5 月1200 亿 的处理量猛增十倍。  
 字节跳动对大模型非常重视，投入力度也很大。团队里有很多顶尖的人才，像TikTok产品技术负责人朱文佳、豆包大语言模型研究团队负责人王明轩以及Foundation团队负责人项亮等技术大牛都在其中，他们都是技术出身，相比从行政上来的领导会更加务实，而且聚焦的也都是最新的技术热点。前段时间我听说他们在做Transformer架构在语言模型中的优化，提升豆包在处理复杂语义和长文本理解方面的能力。这种对前沿技术的积极探索，能让团队始终站在行业技术发展的前沿。跟着这样的leader，也能对自己的技术能力和研究思路带来快速的提升。
 
-![](https://picx.zhimg.com/v2-54b7ddc58b60e5096f6beda2c4bb6aa6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='554' height='678'></svg>)
+![](https://pic1.zhimg.com/v2-54b7ddc58b60e5096f6beda2c4bb6aa6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='554' height='678'></svg>)
 
 我也和在字节工作的朋友了解了一下，有一位在字节算法优化相关的团队。他们当时主要解决的是一个原有算法效率太低的问题，他们从数据结构分析入手，重新设计了部分算法逻辑，最终使算法效率提升了 30%。新人就直接参与到重要项目实际工作中的情况，在字节很常见。我朋友刚进去的时候还不太适应，好的是带他的mentor不光带他熟悉业务，还辅助他一起解决了很多技术问题，一起讨论有价值的研究课题。最近，朋友组里也在招聘实习生，感兴趣的可以私信我。  
 另外看到网上的信息，猜测Top Seed年薪大概在200左右，甚至更高。外加字节的期权，确实相当有吸引力，字节在17年开始每年有两次回购机会，而且字节期权回购价格一路飙升，已经从21年的126刀涨到了今年的180刀左右。单从三年总共43%左右的上涨幅度来看，这也已经比绝大多数我们能买到的金融产品强很多了。
 
-![](https://picx.zhimg.com/v2-bc6f2cb2df119e1d75d185f8013d4900_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='554' height='243'></svg>)
+![](https://pic1.zhimg.com/v2-bc6f2cb2df119e1d75d185f8013d4900_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='554' height='243'></svg>)
 
 除了字节以外，我看到阿里、腾讯和美团等几个头部的企业也都推出了一些人才计划，不过不是针对AI大模型方向的，身边在这几家公司的朋友比较少，就不展开分享了，大家感兴趣也可以去了解一下。  
 最后还是那句话，每个人的情况不一样，大家还是要根据自己的实际情况，选择适合自己的道路。对研究本身感兴趣且不想太卷的话可以去研究所，如果希望既有资源做研究，也想看到技术成果落地，同时对高回报有需求，进大厂更合适些。
@@ -5192,7 +7453,7 @@ ZeRO针对模型状态的三部分都做了对应的内存改进方法：
 `link: https://www.zhihu.com/question/549071929/answer/2732065927 · created: 1666827851`
 
 
-![](https://picx.zhimg.com/v2-69054686062cbd1114d96c025bb34964_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1170' height='2532'></svg>)
+![](https://pica.zhimg.com/v2-69054686062cbd1114d96c025bb34964_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1170' height='2532'></svg>)
 
 今年又将是腥风血雨，群嘲而至的AAAI
 
@@ -5274,7 +7535,7 @@ AutoML（Automated Machine Learning，自动机器学习）大火应该是从201
 
 效果图如下：
 
-![](https://picx.zhimg.com/v2-5cc18cd7971f3aed51072c0141901ab5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='502' height='648'></svg>)
+![](https://pica.zhimg.com/v2-5cc18cd7971f3aed51072c0141901ab5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='502' height='648'></svg>)
 
 
 ---
@@ -5352,11 +7613,11 @@ d1 & d2 & d3
 
 新加坡top2傻子才想去(真香
 
-![](https://pica.zhimg.com/v2-02fdec8ba0f6b5d8e04e03da6053d663_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2276' height='1280'></svg>)
+![](https://picx.zhimg.com/v2-02fdec8ba0f6b5d8e04e03da6053d663_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2276' height='1280'></svg>)
 
 好家伙，没完没了了，还把西交和哈工大加进来。。。
 
-![](https://pica.zhimg.com/v2-e680528565cadf5059a21f27839d091d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)
+![](https://pic1.zhimg.com/v2-e680528565cadf5059a21f27839d091d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)
 
 
 ---
@@ -5378,7 +7639,7 @@ d1 & d2 & d3
 `link: https://www.zhihu.com/question/28042919/answer/2603362773 · created: 1659334218`
 
 
-![](https://picx.zhimg.com/v2-12427fdb35cbbf350896df829b28bfcc_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1440' height='1284'></svg>)
+![](https://pica.zhimg.com/v2-12427fdb35cbbf350896df829b28bfcc_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1440' height='1284'></svg>)
 
 
 ---
@@ -5392,7 +7653,7 @@ d1 & d2 & d3
 
 ICML 2022 “Virtual Homogeneity Learning: Defending against Data Heterogeneity in Federated Learning” 提出了一种利用虚拟同构数据集来抵御联邦学习中的数据异构性的技术，显著地提高了联邦学习的泛化性能及收敛速度。
 
-![](https://pica.zhimg.com/v2-48018b6a247539b96d3a98b954499469_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1000' height='326'></svg>)
+![](https://pic1.zhimg.com/v2-48018b6a247539b96d3a98b954499469_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1000' height='326'></svg>)
 
 **摘要**
 
@@ -5416,7 +7677,7 @@ VHL的关键挑战是如何生成虚拟数据集以提高模型性能。通常�
 
 幸运的是，我们可以访问有标签的虚拟数据集（即源域）和自然数据集（即目标域），因此我们可以通过域适应（DA）来缓解分布漂移。具体地说，我们可以匹配源域和目标域的条件分布。我们的理论分析表明，匹配基于标签信息的虚拟分布和自然分布可以实现可保证的泛化性能。这一匹配可以通过将同一类中的自然和虚拟数据特征拉到一起来实现，如图1所示。
 
-![](https://pic1.zhimg.com/v2-d994b99159cc0837a447eb70ccf55462_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1383' height='554'></svg>)
+![](https://picx.zhimg.com/v2-d994b99159cc0837a447eb70ccf55462_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1383' height='554'></svg>)
 
 图1 不同客户端的特征分布。圆形和三角形分别表示客户端A和B上的数据。由虚线圆框包围的点表示虚拟数据。不同的颜色代表不同标签的数据。经过本地训练后，同一标签在不同客户端上的私有自然数据的特征相距较远，但同一标签的共享虚拟数据的特征相距较近（左图）。
 
@@ -5432,11 +7693,11 @@ VHL的关键挑战是如何生成虚拟数据集以提高模型性能。通常�
 
 为了证明VHL的有效性，我们在广泛使用的联邦学习模拟数据集上进行了实验，并测试了不同数量的客户端、不同的non-IID程度、不同的本地更新轮次。我们在四个数据集上将VHL应用于几种流行的FL算法，包括FedAvg、FedProx、SCAFFOLD和FedNova。实验结果表明，VHL可以提高泛化能力和收敛速度。对于大多数实验，VHL可以获得最佳泛化性能和以最少的目标通信轮来获得目标精度。
 
-![](https://picx.zhimg.com/v2-aa04ed8f5906431ddf44db6d0ea9daba_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='731' height='890'></svg>)![](https://pic1.zhimg.com/v2-be2bf66396fc0d73bb88532e62c93f8b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='726' height='906'></svg>)
+![](https://picx.zhimg.com/v2-aa04ed8f5906431ddf44db6d0ea9daba_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='731' height='890'></svg>)![](https://picx.zhimg.com/v2-be2bf66396fc0d73bb88532e62c93f8b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='726' height='906'></svg>)
 
 另外，我们验证了不同消融算法和超参数对VHL的影响。第一种算法是虚拟特征转移学习（VFTL）。在该算法中，服务器将在噪声数据集上预训练全局模型，之后正常执行联邦学习算法。该算法没有表现出任何明显的改进，表明噪声预训练对联邦学习没有好处。第二种算法被命名为Naive VHL，其中，联邦学习同时对私有数据和噪声数据进行学习但不进行特征校准。有趣的是，结果表明，Naive VHL也可以改善训练，尽管其性能不如VHL。这一有趣的现象将激发更多的研究工作。第三种是虚拟特征对齐。它仅基于一些随机特征校准私有特征。这个简单的算法还改进了联邦学习。这表明了客户端之间相同标签的一致表示的重要性。我们还修改了VHL的不同超参数以进行敏感性测试。结果表明，VHL对这些因素不敏感
 
-![](https://picx.zhimg.com/v2-42f01384569495c0e321a606cc531cc4_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='588' height='896'></svg>)
+![](https://pica.zhimg.com/v2-42f01384569495c0e321a606cc531cc4_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='588' height='896'></svg>)
 
 **总结与展望**
 
@@ -5479,7 +7740,7 @@ VHL的关键挑战是如何生成虚拟数据集以提高模型性能。通常�
 
 　　换言之，对于上面的例子，我们的假设是：
 
-![](https://picx.zhimg.com/v2-d0ef1e8f65f0f3e09be81d4da214297e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='202'></svg>)
+![](https://pica.zhimg.com/v2-d0ef1e8f65f0f3e09be81d4da214297e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='202'></svg>)
 
 　　一般来说，这个联合正态分布的均值向量不用操心，假设成0 就蛮好。（讲到后面你就知道为什么了）
 
@@ -5493,7 +7754,7 @@ VHL的关键挑战是如何生成虚拟数据集以提高模型性能。通常�
 
 　　话句话说，我们可以假设协方差矩阵的每个元素为对应的两个x值的一个相似性度量：
 
-![](https://picx.zhimg.com/v2-423b23763476b3e1d75a070cf399d771_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='364'></svg>)
+![](https://pica.zhimg.com/v2-423b23763476b3e1d75a070cf399d771_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='364'></svg>)
 > 那么问题来了，这个相似性怎么算？如何保证这个相似性度量所产生的矩阵是一个合法的协方差矩阵？   
 > 好，现在不要往下看了，你自己想3分钟。你也能想出来的。 提示：合法的协方差矩阵就是 (symmetric) Positive Semi-definite Matrix （。。。。。。。。。。。。思考中） 好了时间到。
 
@@ -5511,7 +7772,7 @@ VHL的关键挑战是如何生成虚拟数据集以提高模型性能。通常�
 
 　　具体而言就是
 
-![](https://pica.zhimg.com/v2-84c91180dc314f95fd6a036da2a9ecd4_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='652'></svg>)
+![](https://pic1.zhimg.com/v2-84c91180dc314f95fd6a036da2a9ecd4_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='652'></svg>)
 
 ## **回归分析**
 
@@ -5536,7 +7797,7 @@ VHL的关键挑战是如何生成虚拟数据集以提高模型性能。通常�
 
 　　不难求出f\* 隶属于一个1维的正态分布， 参数是：
 
-![](https://pica.zhimg.com/v2-7e38e2c7e64e89fa8a159b9118610749_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='416'></svg>)
+![](https://pic1.zhimg.com/v2-7e38e2c7e64e89fa8a159b9118610749_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='416'></svg>)
 
 　　所以这是一种贝叶斯方法，和OLS回归不同，这个方法给出了预测值所隶属的整个（后验）概率分布的。再强调一下，我们得到的是f\* 的整个分布！不是一个点估计，而是整个分布啊同志们。
 
@@ -5544,7 +7805,7 @@ VHL的关键挑战是如何生成虚拟数据集以提高模型性能。通常�
 
 　　好办，我们对一个区间里面均匀地硬造出来1万个测试点x\*, 然后求出这些测试点和训练集所对应的y（一个巨高维的向量）的联合分布，然后在这个巨高维的联合分布里采样一次，就得到了函数的（近似的）一个样本。
 
-![](https://pica.zhimg.com/v2-59bf584cb249cb70036711fd2f2dabe6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='723'></svg>)
+![](https://pic1.zhimg.com/v2-59bf584cb249cb70036711fd2f2dabe6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='723'></svg>)
 
 　　比如训练集就三个点，测试集1万个x，图中的每一个红点就分别是这些点f\* 的均值，（当点很多的时候，就可以假设是一个“连续”的函数了）而蓝色的线代表一个或两个标准差的bound.
 
@@ -5559,7 +7820,7 @@ VHL的关键挑战是如何生成虚拟数据集以提高模型性能。通常�
 > 举个例子：Multiple Bandit Problem假设 我们已经有了几个油井，每个油井的价值不一样，我们在这个二维平面上，利用高斯过程回归，对每一个地理位置估计一个该位置对应的出油量。而开发每一口井是有成本的，在预算有限的情况下，如果想尽可能少地花钱，我们就需要定义一个效益函数，同高斯过程回归的预测结果相结合，来指导我们下一次在哪儿打井。这个效益函数往往是 预测值 和 方差 的一个函数。以上这个例子，就是高斯过程回归在贝叶斯优化中的一个典型应用。有时间专门写一篇。  
 >  高斯过程 好了，现在终于可以讲一讲高斯过程了。 高斯过程是在函数上的正态分布。（Gaussian distribution over functions)具体而言就是
 
-![](https://pica.zhimg.com/v2-335fb8407e94db9a7d647949a9f13590_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='384'></svg>)
+![](https://picx.zhimg.com/v2-335fb8407e94db9a7d647949a9f13590_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='384'></svg>)
 
 　　我们具体用的时候，模型假设是酱紫的：
 
@@ -5569,11 +7830,11 @@ VHL的关键挑战是如何生成虚拟数据集以提高模型性能。通常�
 
 　　给定一个测试集 X\* （ X\* 是一个 N\* x D 的矩阵， D是每一个点的维度）我们希望得到 一个 N\* 维的预测向量 f\*. 高斯过程回归的模型假设是
 
-![](https://picx.zhimg.com/v2-8cea79bfd6e16cb1560f403b8c6156f4_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='511'></svg>)
+![](https://pica.zhimg.com/v2-8cea79bfd6e16cb1560f403b8c6156f4_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='511'></svg>)
 
 　　然后根据贝叶斯回归的方法，我们可以求出来 f\*的后验概率：
 
-![](https://pic1.zhimg.com/v2-27d23d8a600cd882866ba0bce6ba5efc_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='349'></svg>)
+![](https://pica.zhimg.com/v2-27d23d8a600cd882866ba0bce6ba5efc_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='349'></svg>)
 
 　　This is it. 要啥有啥了。
 
@@ -5603,7 +7864,7 @@ VHL的关键挑战是如何生成虚拟数据集以提高模型性能。通常�
 
 　　我们仔细观察一下上面那个蓝色的框框
 
-![](https://pic1.zhimg.com/v2-9cf108ff11df202432bd2ead0712afbb_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='423'></svg>)
+![](https://pica.zhimg.com/v2-9cf108ff11df202432bd2ead0712afbb_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1024' height='423'></svg>)
 
 　　所以说，ridge回归是一种最最最最简单的高斯过程回归，核函数就是简单的点积！
 
@@ -5617,11 +7878,11 @@ VHL的关键挑战是如何生成虚拟数据集以提高模型性能。通常�
 
 如下：
 
-![](https://picx.zhimg.com/v2-457bbb3dd2c46358cda0e8ba1f121898_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='440' height='149'></svg>)
+![](https://pic1.zhimg.com/v2-457bbb3dd2c46358cda0e8ba1f121898_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='440' height='149'></svg>)
 
 　　由贝叶斯线性回归和高斯过程回归的对比可知，贝叶斯线性回归是高斯过程回归中的一个子集，只是它用的是线性核而已，通过两者的公式就可以看出它们之间的关系：
 
-![](https://pic1.zhimg.com/50/v2-68ee305f1cff737a9df80cc1af046336_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='182' height='101'></svg>)
+![](https://picx.zhimg.com/50/v2-68ee305f1cff737a9df80cc1af046336_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='182' height='101'></svg>)
 
 　　上面是贝叶斯线性回归，下面是高斯过程回归。
 
@@ -5647,11 +7908,11 @@ VHL的关键挑战是如何生成虚拟数据集以提高模型性能。通常�
 
 　　3. 计算需预测的点
 
-![](https://pica.zhimg.com/50/v2-5b3d5128ac97c5edb32f6cc78b191c1a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='77' height='23'></svg>)
+![](https://picx.zhimg.com/50/v2-5b3d5128ac97c5edb32f6cc78b191c1a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='77' height='23'></svg>)
 
 与训练样本6个点的核值向量，如下：
 
-![](https://pic1.zhimg.com/50/v2-316e96b7f125982c89a56f5570a4fab6_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='388' height='39'></svg>)
+![](https://picx.zhimg.com/50/v2-316e96b7f125982c89a56f5570a4fab6_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='388' height='39'></svg>)
 
 　　4. 自己和自己的核值为
 
@@ -5659,13 +7920,13 @@ VHL的关键挑战是如何生成虚拟数据集以提高模型性能。通常�
 
 且此时整个样本的多维高斯分布表达式为：
 
-![](https://pic1.zhimg.com/50/v2-a3b99c0dcd8197766a023a2a6579aa23_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='247' height='65'></svg>)
+![](https://picx.zhimg.com/50/v2-a3b99c0dcd8197766a023a2a6579aa23_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='247' height='65'></svg>)
 
 　　5. 通过前面m和D的公式，求得m=0.95，D=0.21.
 
 　　6. 画出最终结果如下：
 
-![](https://pica.zhimg.com/50/v2-62ac084e6c0986eb432b221254e732b9_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='386' height='268'></svg>)
+![](https://pic1.zhimg.com/50/v2-62ac084e6c0986eb432b221254e732b9_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='386' height='268'></svg>)
 
 　　这个例子来源于论文Gaussian Processes for Regression A Quick Introduction中，它的核函数等参数选择和基础知识部分的不同，但这里主要是对GPR的应用有个简单的宏观上的理解，让大脑对GPR应用有个初步的印象，否则有了那么多的公式推导但不会应用又有什么用呢？
 
@@ -5754,7 +8015,7 @@ ssh -L8889:10.31.225.89:8889 username@cluster.**.com
 
 ### **微信公众号：AutoML机器学习**
 
-**![](https://pic1.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)**
+**![](https://pica.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)**
 
 **MARSGGBO♥原创**  
 **如有意合作或学术讨论欢迎私戳联系~**  
@@ -5791,7 +8052,7 @@ ssh -L8889:10.31.225.89:8889 username@cluster.**.com
 
 我还听闻有的学校会安排已入职的老师公派出去拿个博士学位，有的去了印度尼西亚，菲律宾。总之，又一大波钱被浪费了
 
-![](https://pica.zhimg.com/50/v2-608c536f09054282bb01ad2148064a3f_720w.gif?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'></svg>)
+![](https://pic1.zhimg.com/50/v2-608c536f09054282bb01ad2148064a3f_720w.gif?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'></svg>)
 
 
 ---
@@ -5803,7 +8064,7 @@ ssh -L8889:10.31.225.89:8889 username@cluster.**.com
 
 最近我们的工作“EAGAN: Efficient Two-stage Evolutionary Architecture Search for GAN”被ECCV2022主会录取。本文提出了一个高效的由两阶段组成的基于进化算法的神经架构搜索（Neural Architecture Search，NAS）框架，用于搜索生成对抗网络（Generative Adversarial Network, GAN）的结构，有效解决了在搜索GAN的过程中的训练不稳定问题。
 
-![](https://picx.zhimg.com/v2-618b46c67d69dae063462bb08bc4ce2f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1500' height='499'></svg>)
+![](https://pic1.zhimg.com/v2-618b46c67d69dae063462bb08bc4ce2f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1500' height='499'></svg>)
 
 ECCV的全称是European Conference on Computer Vision(欧洲计算机视觉国际会议) ，两年一次，是计算机视觉三大会议（另外两个是[ICCV](https://link.zhihu.com/?target=https%3A//baike.baidu.com/item/ICCV%2522%2520%255Ct%2520%2522_blank)和[CVPR](https://link.zhihu.com/?target=https%3A//baike.baidu.com/item/CVPR%2522%2520%255Ct%2520%2522_blank)）之一。ECCV2022将于2022年10月23日至27日在以色列特拉维夫国际会展中心举行，会议共收到有效投稿5,803篇，接收1650篇论文，接受率在28%左右。
 
@@ -5832,7 +8093,7 @@ NAS在图像分类任务上已经取得了非常不错的成绩了，用NAS搜�
 
 为和之前的工作做一个公平对比，我们使用了AdversarialNAS相似的搜索空间，如下图所示
 
-![](https://picx.zhimg.com/v2-aeb268efdd7124904f88d1da7cf6e30f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1107' height='648'></svg>)
+![](https://pic1.zhimg.com/v2-aeb268efdd7124904f88d1da7cf6e30f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1107' height='648'></svg>)
 
 ### 3.2 解决GAN搜索不稳定性问题
 
@@ -5856,7 +8117,7 @@ NAS在图像分类任务上已经取得了非常不错的成绩了，用NAS搜�
 
 下表展示了人工设计的GAN模型和之前的NAS-GAN工作在CIFAR-10和STL-10的实验结果，实验指标使用了IS（越大越好）和FID（越小越好）。
 
-![](https://picx.zhimg.com/v2-b81830ed016356f1f52113c6371c2996_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='747' height='606'></svg>)
+![](https://pic1.zhimg.com/v2-b81830ed016356f1f52113c6371c2996_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='747' height='606'></svg>)
 
 对于NAS-GAN方法，我们划分了两种实验设置：
 
@@ -5964,7 +8225,7 @@ AttentiveNAS想做的是把两个步骤融合成一步，可表示成如下数�
 
 ## **2.2 Pseudo Algorithm**
 
-![](https://picx.zhimg.com/v2-4bd17be6720d4d535d9b65e8f29a9cea_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='647' height='647'></svg>)
+![](https://pic1.zhimg.com/v2-4bd17be6720d4d535d9b65e8f29a9cea_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='647' height='647'></svg>)
 
 上面数学公式中提到的![\gamma(\alpha)](https://www.zhihu.com/equation?tex=%5Cgamma%28%5Calpha%29)是一个指示函数，其条件是![\alpha](https://www.zhihu.com/equation?tex=%5Calpha)是否属于 best或worst Pareto-front，分别记为BestUp-k和WorstUp-k
 
@@ -5987,21 +8248,21 @@ AttentiveNAS想做的是把两个步骤融合成一步，可表示成如下数�
 
 下图是AttentiveNAS基于第二种策略得到的实验结果， 其中![s0,s1](https://www.zhihu.com/equation?tex=s0%2Cs1)分别表示在两个不同种子下跑的实验结果，ep30/ep360表示在训练30个epoch和360个epoch下的结果。可以看到预测的ACC和真实的ACC之间的相关系数Kendall tau（其范围是-1~1）还是比较大的。这表明预测器还是能有效预测出模型的ACC的。
 
-![](https://picx.zhimg.com/v2-fcb46da5a08cbfbdf8ea751c13f2e889_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='932' height='399'></svg>)
+![](https://pic1.zhimg.com/v2-fcb46da5a08cbfbdf8ea751c13f2e889_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='932' height='399'></svg>)
 
 ## **3.2 Sampling Results**
 
-![](https://pic1.zhimg.com/v2-1f4346e6804378f8cf13decc11395166_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='931' height='400'></svg>)
+![](https://picx.zhimg.com/v2-1f4346e6804378f8cf13decc11395166_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='931' height='400'></svg>)
 
 不同采样训练的结果如上图所示，BestUp-50表示从best Pareto front set中每个sampling step采样50个模型做评估。根据上面的结果可以观察到训练WorstUp要比BestUp效果更好，这个常规的想法不太一致。
 
 最终在ImageNet上的结果如下表所示
 
-![](https://picx.zhimg.com/v2-70ea1761d1231e55d55c7e5478a53365_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='615' height='960'></svg>)
+![](https://pic1.zhimg.com/v2-70ea1761d1231e55d55c7e5478a53365_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='615' height='960'></svg>)
 
 ### **微信公众号：AutoML机器学习**
 
-![](https://picx.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
+![](https://pic1.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
 
 **MARSGGBO♥原创**  
 **如有意合作或学术讨论欢迎私戳联系~**  
@@ -6235,7 +8496,7 @@ myapp/
 
 对应到上面的例子，![\lambda](https://www.zhihu.com/equation?tex=%5Clambda)是每天来的顾客数量均值，假设是5，我们可以画出此时的指数分布的概率密度函数
 
-![](https://pic1.zhimg.com/v2-1876ea83055b2b664917222a107d3f48_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='699' height='499'></svg>)
+![](https://picx.zhimg.com/v2-1876ea83055b2b664917222a107d3f48_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='699' height='499'></svg>)
 
 因为我们上面的例子考虑的是每天的顾客数，所以![x=1](https://www.zhihu.com/equation?tex=x%3D1)时，计算得到的![p(X>1)](https://www.zhihu.com/equation?tex=p%28X%3E1%29)表示超过1天都没有顾客的概率是0.00674,这表示你开的店每天大概率还是有人回来关顾的哈哈哈
 
@@ -6243,7 +8504,7 @@ myapp/
 
 因为指数分布有个特点是无记忆性，换言之，不管你从哪个时间点（比如下午1点或者2点）去计算 ![p(x>0.1)](https://www.zhihu.com/equation?tex=p%28x%3E0.1%29)，得到的结果都是一样的，即未来20分钟内没顾客来的概率是0.75749，所以你买出一个馒头后可以比较放心的打一把农药来打发时间。
 
-![](https://picx.zhimg.com/v2-38808a2e720b55c02d49c01dc9ceaf7e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='601' height='315'></svg>)
+![](https://pica.zhimg.com/v2-38808a2e720b55c02d49c01dc9ceaf7e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='601' height='315'></svg>)
 
 Exp Distribution
 
@@ -6263,7 +8524,7 @@ todo: (超)几何分布，伽马分布，贝塔分布。。。
 
 ### **微信公众号：AutoML机器学习**
 
-![](https://pica.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
+![](https://pic1.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
 
 **MARSGGBO♥原创**  
 **如有意合作或学术讨论欢迎私戳联系~**  
@@ -6278,7 +8539,7 @@ todo: (超)几何分布，伽马分布，贝塔分布。。。
 `link: https://www.zhihu.com/question/522023492/answer/2432847586 · created: 1649592620`
 
 
-![](https://pic1.zhimg.com/v2-16becfb363b70bb5a90db0ac83de8563_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1102' height='608'></svg>)
+![](https://picx.zhimg.com/v2-16becfb363b70bb5a90db0ac83de8563_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1102' height='608'></svg>)
 
 MLE&amp;amp;MAP
 
@@ -6349,7 +8610,7 @@ MLE是频率学派模型参数估计的常用方法，它的目的是想最大�
 
 咱就是说 为什么不把最后的内容也放出来供大家讨论？
 
-![](https://pica.zhimg.com/v2-de8318148b084942a7da967f857f6418_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)
+![](https://picx.zhimg.com/v2-de8318148b084942a7da967f857f6418_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)
 
 
 ---
@@ -6398,7 +8659,7 @@ for data, labels in train_loader:
 
 Host（例如CPU）的数据分配默认是\*\*pageable(可分页的)\*\*，但是GPU是没法直接读取pageable内存里的数据的，所以需要先创建一个临时的缓冲区（pinned memory），把数据从pageable内存拷贝pinned内存上，然后GPU才能从pinned内存上读取数据，如下图（左）所示。
 
-![](https://picx.zhimg.com/v2-3c34b5f3aa1e0029fc1bc83179975eff_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1039' height='599'></svg>)
+![](https://pic1.zhimg.com/v2-3c34b5f3aa1e0029fc1bc83179975eff_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1039' height='599'></svg>)
 
 但是CPU将数据从pageable 内存拷贝到 临时的 pinned 内存是有时间开销的，而且这个pinned 内存 还只是临时的，所以用完之后会被销毁。所以为了进一步提高效率，我们需要设置`pin_memory=True`，作用就是从一开始就把一部分内存给锁住（上图（右）），这样一来就减少了Host内部的开销，避免了CPU内存拷贝时间。
 
@@ -6586,7 +8847,7 @@ y = model(x)
 
 在政府多部门的政策要求下，越来越多的企业加入了隐私计算这一竞争赛道。随着投入的加大，这方面招聘需求应该也会增加，大家应该可以考虑换个赛道卷了~
 
-![](https://pica.zhimg.com/v2-2978e5ea4f1d47ac83fd3273c1772b18_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1056' height='595'></svg>)
+![](https://pic1.zhimg.com/v2-2978e5ea4f1d47ac83fd3273c1772b18_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1056' height='595'></svg>)
 
 ## 应用
 
@@ -6629,7 +8890,7 @@ y = model(x)
 #ff8884
 ```
 
-![](https://picx.zhimg.com/v2-45465c466553835ec87ae9f268c814ac_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='908' height='637'></svg>)
+![](https://pic1.zhimg.com/v2-45465c466553835ec87ae9f268c814ac_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='908' height='637'></svg>)
 
 ## Color 3
 
@@ -6643,7 +8904,7 @@ y = model(x)
 #C76DA2
 ```
 
-![](https://picx.zhimg.com/v2-f6327b7ba5c43a28805ca31459986aa2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='790' height='444'></svg>)
+![](https://pica.zhimg.com/v2-f6327b7ba5c43a28805ca31459986aa2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='790' height='444'></svg>)
 
 ## Color 4
 
@@ -6674,7 +8935,7 @@ y = model(x)
 
 （99,178,238）-（118,218,145）-（248,203,127）-（248,149,136）-（124,214,207）-（145,146,171）-（120,152,225）-（239,166,102）-（237,221,134）-（153,135,206）-（99,178,238）-（118,218,145）
 
-![](https://pic1.zhimg.com/50/v2-5475aff589e2d2c67522c2e483e39801_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='420' height='181'></svg>)
+![](https://picx.zhimg.com/50/v2-5475aff589e2d2c67522c2e483e39801_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='420' height='181'></svg>)
 
 ## Color 7
 
@@ -6686,7 +8947,7 @@ y = model(x)
 
 （59,98,145）-（148,60,57）-（119,144,67）-（98,76,124）-（56,132,152）-（191,115,52）-（63,104,153）-（156,64,61）-（125,152,71）-（103,80,131）-（59,139,161）-（201,121,55）
 
-![](https://pic1.zhimg.com/50/v2-e3230b6471ab57d5672bd4052dd9ae98_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='420' height='182'></svg>)
+![](https://picx.zhimg.com/50/v2-e3230b6471ab57d5672bd4052dd9ae98_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='420' height='182'></svg>)
 
 ## Color 8
 
@@ -6777,7 +9038,7 @@ y = model(x)
 
 ## **4.2 Sampling Strategies & Decoupled Learning**
 
-![](https://picx.zhimg.com/v2-c0946b08e3e272bb7768bfea5ec0df7e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1193' height='551'></svg>)
+![](https://pica.zhimg.com/v2-c0946b08e3e272bb7768bfea5ec0df7e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1193' height='551'></svg>)
 
 从Figure1我们能看到一下几个现象：
 
@@ -6792,13 +9053,13 @@ Figure 2 (左) 给出了不同训练模式下 classifier权重的norm值。图�
 
 Figure 2 (右) 给出了 ![\tau](https://www.zhihu.com/equation?tex=%5Ctau)-norm方法![\tau](https://www.zhihu.com/equation?tex=%5Ctau)对结果的影响。可以看到增加τ的大小能明显改善 Few classes的准确率，但是同时Many classes会对应减少。Medium和All 的准确率先增后降，而且后期降得特别厉害，所以τ值的选择也比较重要。
 
-![](https://picx.zhimg.com/v2-c26fe28ced94b3d7d22bd19258c98f1c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1202' height='669'></svg>)
+![](https://pic1.zhimg.com/v2-c26fe28ced94b3d7d22bd19258c98f1c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1202' height='669'></svg>)
 
 ## **4.3 实验结果对比**
 
 作者在3个TL数据集上做了实验，可以看到提升效果都比较明显。
 
-![](https://pic1.zhimg.com/v2-e978c26c393dda87ea9c42dbadf94df8_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='940' height='938'></svg>)
+![](https://picx.zhimg.com/v2-e978c26c393dda87ea9c42dbadf94df8_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='940' height='938'></svg>)
 
 ### **微信公众号：AutoML机器学习**
 
@@ -6834,7 +9095,7 @@ Figure 2 (右) 给出了 ![\tau](https://www.zhihu.com/equation?tex=%5Ctau)-norm
 
 + ConViT (ICML2021) [1] ：unify convolution and self-attention with gated positional self-attention (GPSA) and is more sample-efficient than self-attention.
 
-![](https://pic1.zhimg.com/v2-5c3084b3cf4e1c87a3f1b9471ece1809_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='654' height='860'></svg>)
+![](https://picx.zhimg.com/v2-5c3084b3cf4e1c87a3f1b9471ece1809_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='654' height='860'></svg>)
 
 
 
@@ -6846,7 +9107,7 @@ Figure 2 (右) 给出了 ![\tau](https://www.zhihu.com/equation?tex=%5Ctau)-norm
 
 + CeiT [3]：replace the original patchy stem with convolutional stem and add depth-wise convolution to FFN layer, which obtains fast convergence and better performance.
 
-![](https://pic1.zhimg.com/v2-b2f1c998ee7a26c978eaa9fa9caa03be_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1567' height='736'></svg>)
+![](https://pica.zhimg.com/v2-b2f1c998ee7a26c978eaa9fa9caa03be_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1567' height='736'></svg>)
 
 ## **3. 方法**
 
@@ -6854,7 +9115,7 @@ Figure 2 (右) 给出了 ![\tau](https://www.zhihu.com/equation?tex=%5Ctau)-norm
 
 搜索空间如下图所示。
 
-![](https://picx.zhimg.com/v2-92d5740e21a5d10eec0c796f2db44183_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1143' height='331'></svg>)
+![](https://pic1.zhimg.com/v2-92d5740e21a5d10eec0c796f2db44183_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1143' height='331'></svg>)
 
 * GOP （General Operations）：包含 Convolution, transformer,和 MLP。三种操作都之采用了类似inverted residual的设计方式，即先把原来的通道数c 通过映射扩大ec，然后在通过映射还原为 c，各操作公式如下：
 
@@ -6868,7 +9129,7 @@ Figure 2 (右) 给出了 ![\tau](https://www.zhihu.com/equation?tex=%5Ctau)-norm
 + LG-DSM: 是局部和全局信息都会考虑的下采样模块。可以看到下采样是通过一个stride=2的卷积操作实现的，这里应该就是提取的local context。而attention机制呢就是一个全局的信息了。因为是2d卷积，所以需要先把input reshape成spatial grid，卷积计算完之后再flatten成原来的形状。
 + G-DSM：和LG-DSM的区别就是用了1d的卷积操作，但是论文里并没有解释为什么这个时候就不会保留local context了。
 
-![](https://picx.zhimg.com/v2-f9a6b38d82606593b063ba8060a3387b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='722' height='343'></svg>)
+![](https://pic1.zhimg.com/v2-f9a6b38d82606593b063ba8060a3387b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='722' height='343'></svg>)
 
 完整的搜索空间参数设置如下：
 
@@ -6900,7 +9161,7 @@ Figure 2 (右) 给出了 ![\tau](https://www.zhihu.com/equation?tex=%5Ctau)-norm
 
 结果一个字：好。就完事了hhh
 
-![](https://picx.zhimg.com/v2-afa93e72fc1baae0c1a95a6fe8d9cbd7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='739' height='753'></svg>)
+![](https://pica.zhimg.com/v2-afa93e72fc1baae0c1a95a6fe8d9cbd7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='739' height='753'></svg>)
 
 ## **5. Ablation Study**
 
@@ -6916,11 +9177,11 @@ Figure 2 (右) 给出了 ![\tau](https://www.zhihu.com/equation?tex=%5Ctau)-norm
 
 Table 6 对比了将 DSM全都替换成某一种下采样模块后模型的性能变化，可以看到如果替换成 G-DSM后性能掉的最多，而LG-DSM性能保持的还不错，但是FLOPs和参数量都有一定的增加。L-DSM效果也还不错的亚子
 
-![](https://pic1.zhimg.com/v2-a5e761d16fe541db1d114ef5b4ba405d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='588' height='389'></svg>)
+![](https://picx.zhimg.com/v2-a5e761d16fe541db1d114ef5b4ba405d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='588' height='389'></svg>)
 
 作者还将DSM模块放到了Swin-Transformer (ST)和PVT-Tiny 这些模型上去，这两个模型都是总共由4个stage组成，所以作者把前两个stage的下采样模块替换成了L-DSM，最后两个stage替换成了 LG-DSM，结果如Table 7所示，可以看到都有一定的性能提升。
 
-![](https://pic1.zhimg.com/v2-1d180164911757df529783cba9e0aac2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='548' height='381'></svg>)
+![](https://picx.zhimg.com/v2-1d180164911757df529783cba9e0aac2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='548' height='381'></svg>)
 
 ## 个人看法
 
@@ -6969,7 +9230,7 @@ Table 6 对比了将 DSM全都替换成某一种下采样模块后模型的性�
 
 BossNAS整体的的训练方式和[DNA](https://link.zhihu.com/?target=https%3A//www.notion.so/Blockwisely-supervised-neural-architecture-search-with-knowledge-distillation-8097fd741d4846f1a4b5473407073116)不太一样，在DNA里，学生网络每个block彼此之间的训练是独立开来的，比如学生网络 ![block_k](https://www.zhihu.com/equation?tex=block_k)的输入是教师网络 ![block_{k-1}](https://www.zhihu.com/equation?tex=block_%7Bk-1%7D)的输出，然后使用知识蒸馏(MSE loss)来使得学生网络的输出尽可能和教师网络输出保持一致。BossNAS认为这样会使得搜到的子网和教师网络高度相关，即搜索结果是带有bias的。
 
-![](https://picx.zhimg.com/v2-e529c3b54283e7b12857d63ede25ec84_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1092' height='404'></svg>)
+![](https://pica.zhimg.com/v2-e529c3b54283e7b12857d63ede25ec84_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1092' height='404'></svg>)
 
 为了解决原本block独立训练的问题，BossNAS提出了Ensemble Bootstrapping策略
 
@@ -7006,7 +9267,7 @@ BossNAS整体的的训练方式和[DNA](https://link.zhihu.com/?target=https%3A/
 * CNN的部分采用的是ResNet的Residual Bottleneck，记为 **ResConv**
 * Transformer部分是基于 [BotBlock](https://link.zhihu.com/?target=https%3A//www.notion.so/Aravind-Srinivas-Tsung-Yi-Lin-Niki-Parmar-Jonathon-Shlens-Pieter-Abbeel-and-Ashish-Vaswani-Bot-e79ccbbddbf94c82b85527b6af621ddb)和[NLBlock](https://link.zhihu.com/?target=https%3A//www.notion.so/Xiaolong-Wang-Ross-Girshick-Abhinav-Gupta-and-Kaiming-He-Non-local-neural-networks-In-CVPR-201-19f844893b3c401b9ea1c802c6b52dd6)做了改进的模块，记为 **ResAtt**
 
-![](https://picx.zhimg.com/v2-fc881c164860344dec257b1730b90bc0_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='820' height='256'></svg>)
+![](https://pic1.zhimg.com/v2-fc881c164860344dec257b1730b90bc0_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='820' height='256'></svg>)
 
 ## **3.2 Hybrid CNN-Transformers**
 
@@ -7022,7 +9283,7 @@ BossNAS整体的的训练方式和[DNA](https://link.zhihu.com/?target=https%3A/
 
 ## **4.2 搜索Hybrid CNN-Transformer的结果**
 
-![](https://pic1.zhimg.com/v2-f05844624e442cd11cb6ce80ea4ce00e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='806' height='968'></svg>)![](https://pica.zhimg.com/v2-9f486756a9725257784baf8b2c5a4981_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='785' height='455'></svg>)
+![](https://picx.zhimg.com/v2-f05844624e442cd11cb6ce80ea4ce00e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='806' height='968'></svg>)![](https://picx.zhimg.com/v2-9f486756a9725257784baf8b2c5a4981_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='785' height='455'></svg>)
 
 上图给出了使用DNA算法和BossNAS算法在相同的HyTra搜索空间上搜到的网络结构，可以看到 DNA搜到的网络更倾向于选择卷积操作，作者对此的解释是因为DNA使用了教师网络，而教师网络本身带来了biased supervision。文章把这一现象称作 **candidate preference。**
 
@@ -7030,11 +9291,11 @@ BossNAS整体的的训练方式和[DNA](https://link.zhihu.com/?target=https%3A/
 
 最终模型在ImageNet上的结果如下表，可以看到BossNAS结果的优势有一丢丢，但不明显
 
-![](https://pica.zhimg.com/v2-1cb911e9de438ddfddc6bb9bdeaed225_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='620' height='426'></svg>)
+![](https://pic1.zhimg.com/v2-1cb911e9de438ddfddc6bb9bdeaed225_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='620' height='426'></svg>)
 
 作者进一步比较了搜索一致性结果（Kendall tau: ![\tau](https://www.zhihu.com/equation?tex=%5Ctau), Pearson: ![R](https://www.zhihu.com/equation?tex=R), Spearman: ![\rho](https://www.zhihu.com/equation?tex=%5Crho)），相关性结果是基于 DNA 提供的23个模型结构和acc计算得到的,结果如Table 3所示。可以看到MnasNet相关性还不错，但是由于是multi-trial方法，所以耗时巨大。 另外我们还可以看到 教师网络 的选择对DNA算法影响非常大。文章将这个现象称作 **teacher preference**，而BossNAS完全不需要teacher network。
 
-![](https://pica.zhimg.com/v2-071ab2539fc0462376fe30881999d5ad_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='664' height='326'></svg>)
+![](https://picx.zhimg.com/v2-071ab2539fc0462376fe30881999d5ad_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='664' height='326'></svg>)
 
 ## **4.4 在 NATS-Bench** S_S**搜索空间的结果**
 
@@ -7059,13 +9320,13 @@ Evaluation
 * Supv. linear eval 表示supervised linear evaluation。这个是最常规的权重共享的NAS评估方法。具体来说该方式是首先把supernet权重固定，然后finetune一个权重共享的线性分类器。这个分类器会和所有子网相连接，每个子网的排序就是根据分类器最后得到的accuracy结果决定的。
 * Unsupv. eval就是本文的方法，如公式 (5)
 
-![](https://pic1.zhimg.com/v2-16f08569fb31d7589d82748f95273f43_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='733' height='328'></svg>)
+![](https://picx.zhimg.com/v2-16f08569fb31d7589d82748f95273f43_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='733' height='328'></svg>)
 
 ## **4.6 Supernet训练收敛表现**
 
 前面已经提到过，BossNAS的每个block只训练20个epoch就结束了，下图就给出了在MBConv搜索空间上，基于ImageNet数据集每个epoch对应的搜索一致性结果。可以看到基本上在第12个epoch的时候一致性基本上就固定了，另外前期相关性能够快速地提升。
 
-![](https://picx.zhimg.com/v2-ca2aa28ca3b222e3fdbaa0113629a82d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='669' height='218'></svg>)
+![](https://pic1.zhimg.com/v2-ca2aa28ca3b222e3fdbaa0113629a82d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='669' height='218'></svg>)
 
 在NATS-Bench上已有类似的结果
 
@@ -7095,7 +9356,7 @@ Evaluation
 
 实验结果表明，这样做不仅训练速度加快，而且最终模型性能也得到了保证
 
-![](https://pic1.zhimg.com/v2-345afe9fa028451f103ae88504665cc6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1002' height='286'></svg>)
+![](https://picx.zhimg.com/v2-345afe9fa028451f103ae88504665cc6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1002' height='286'></svg>)
 
 下面详细介绍一下算法细节
 
@@ -7107,7 +9368,7 @@ Evaluation
 2. subnet searching
 3. subnet retraining
 
-![](https://pica.zhimg.com/v2-e269ceb41e915970b4816cb455e7ceaf_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1380' height='602'></svg>)
+![](https://pic1.zhimg.com/v2-e269ceb41e915970b4816cb455e7ceaf_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1380' height='602'></svg>)
 
 ## 2.1 Supernet Training
 
@@ -7126,7 +9387,7 @@ Evaluation
 
 论文中的搜索空间长这样，可以看到是类似MobileNet的结构。模型由多个layer组成，每个layer有 N 个candidate operation，每个operation由多个conv+BN+relu组成，区别就是这些conv的卷积核和通道数（expand ratio）不一样 。
 
-![](https://pica.zhimg.com/v2-14de4e8ecebc6edc118e66ac0b4c23a3_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='661' height='570'></svg>)
+![](https://picx.zhimg.com/v2-14de4e8ecebc6edc118e66ac0b4c23a3_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='661' height='570'></svg>)
 
 需要注意的是每个operation最后都是BN，如上图中的红框所示，所以作者就用这个BN的参数来作为评价指标，具体的方法如下图所示
 
@@ -7136,7 +9397,7 @@ Evaluation
 
 这个只是某一层的BN-based指标值，那么一个子模型的指标值就是所有层的总和，计算如下：
 
-![](https://pic1.zhimg.com/v2-016430c7c51da6428ebb137ce125fab6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='688' height='134'></svg>)
+![](https://picx.zhimg.com/v2-016430c7c51da6428ebb137ce125fab6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='688' height='134'></svg>)
 
 那么优化目标函数可以表示如下：
 
@@ -7156,11 +9417,11 @@ Evaluation
 
 文中对下图的分析师(a)是在30个epoch的时候，不同epoch之间的相似度变得差不多了，而(b)在第10个epoch就很相似了。只能说有点牵强。。。明明还有那么多白色区域
 
-![](https://pica.zhimg.com/v2-b65aa4c2fe4c83bec97757070eddd8c8_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='751' height='698'></svg>)
+![](https://pic1.zhimg.com/v2-b65aa4c2fe4c83bec97757070eddd8c8_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='751' height='698'></svg>)
 
 ## 3.2 Results on ImageNet
 
-![](https://pica.zhimg.com/v2-e16e146e34b1916363b70b28769cab3c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='704' height='392'></svg>)
+![](https://picx.zhimg.com/v2-e16e146e34b1916363b70b28769cab3c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='704' height='392'></svg>)
 
 
 ---
@@ -7264,19 +9525,19 @@ Evaluation
 
 * [5] **GeoMLE** 利用基于不同大小邻居数量 (即 k) 的近邻距离 对 标准MLE进行多项式回归 来说明密度的非均匀性和流形的非线性。问题在于它的ID值是 多个样本 ![\hat{m}_{k}(x)](https://www.zhihu.com/equation?tex=%5Chat%7Bm%7D_%7Bk%7D%28x%29) 的平均，而公式(2) 中是对 ![\hat{m}_{k}(x)^{-1}](https://www.zhihu.com/equation?tex=%5Chat%7Bm%7D_%7Bk%7D%28x%29%5E%7B-1%7D) 求平均后，再取倒数得到最终的估计值。文章也明确说[5] 的估计值非常不准。下图是GeoMLE在 d-dimensional Hypercube data上的表现结果。
 
-![](https://pic1.zhimg.com/v2-6b0c0f7b243868d0365195955521136d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1253' height='401'></svg>)
+![](https://picx.zhimg.com/v2-6b0c0f7b243868d0365195955521136d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1253' height='401'></svg>)
 
 * [6] 提出了 **TwoNN** 算法来估计ID值，简单说就是他基于两个邻居之间的距离 （即 k=2 ）来估计ID。 文献[2]就是基于这个算法的。
 
-![](https://pic1.zhimg.com/v2-51f6d373e93c0608a7f67f60153d0d9a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1254' height='398'></svg>)
+![](https://picx.zhimg.com/v2-51f6d373e93c0608a7f67f60153d0d9a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1254' height='398'></svg>)
 
 * 这篇文章不同邻居之间的距离是使用 norm2 的欧氏距离计算的，而 [7] 中使用的是 geodesic distance，记为 **kNN graph distance**.
 
-![](https://picx.zhimg.com/v2-d0e1143236f61b7f47daed4003cae742_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1244' height='412'></svg>)
+![](https://pic1.zhimg.com/v2-d0e1143236f61b7f47daed4003cae742_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1244' height='412'></svg>)
 
 上面3个图可以看到GeoMLE和TwoNN的估计值一般会比真实值要打，即overestimate。而KNN graph则是略微地underestimate。不同估计方法对不同数据集的ID估计结果如下。TwoNN对MNIST的ID估计值比CIFAR-10还高，这可能多少和直觉相违背。另外前三个数据集对CIFAR10的ID估计值都要比CIFAR100高，这个感觉也有点反直觉。
 
-![](https://pic1.zhimg.com/v2-f03fbf7f71018b44fcbc848b6fe8433c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='969' height='280'></svg>)
+![](https://picx.zhimg.com/v2-f03fbf7f71018b44fcbc848b6fe8433c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='969' height='280'></svg>)
 
 ## **4. 在合成数据上验证 Intrinsic Dimension**
 
@@ -7284,11 +9545,11 @@ Evaluation
 
 作者用BigGAN做了个实验。BigGAN有 128个latent entries，输出大小为128x128x3的图像。作者将128个latent entries大多数设置为0，只留下 ![\bar{d}](https://www.zhihu.com/equation?tex=%5Cbar%7Bd%7D) 个free entries，即视为intrinsic dimension。然后给出了不同 ![\bar{d}](https://www.zhihu.com/equation?tex=%5Cbar%7Bd%7D) 设置下一个类别（即 basenji）生成的图像的对比，如下图示。可以看到 ID值越小，生成的图片背景越简单，当 ![\bar{d}=128](https://www.zhihu.com/equation?tex=%5Cbar%7Bd%7D%3D128) 时，背景复杂了很多。其实换个角度想，当数据的ID越小的时候则表示该数据越容易被区分。文献[2]的实验对比了resent18/50/152等就发现网络最后一层的ID值越低，模型最终的acc也相对高一些。
 
-![](https://picx.zhimg.com/v2-ed9d95c00c3051c6a900f4ef2f708a89_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='769' height='834'></svg>)
+![](https://pica.zhimg.com/v2-ed9d95c00c3051c6a900f4ef2f708a89_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='769' height='834'></svg>)
 
 作者还在 ![\bar{d}=10](https://www.zhihu.com/equation?tex=%5Cbar%7Bd%7D%3D10) 的情况下比较了不同 k 的取值对最终ID估计的影响，结果如下。我们可以看到如下几个现象：
 
-![](https://picx.zhimg.com/v2-ce1c8b3fe09ba2b064ced06b0d4c0e88_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1160' height='494'></svg>)
+![](https://pic1.zhimg.com/v2-ce1c8b3fe09ba2b064ced06b0d4c0e88_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1160' height='494'></svg>)
 
 * 纵坐标10代表ground truth，当k=4的时候得到的ID估计值非常接近真实值。
 * 原本的latent维度是128，虽然其他k值有一定误差，但是整体上偏差不是很大，他们都很接近10
@@ -7307,7 +9568,7 @@ Evaluation
 
 数据集生成好后，作者使用ResNet-18 在这4个数据集上去训练，实验结果如下。可以看到ID （即latent size）越小的数据集，训练ResNet-18所需的训练样本数量也就越少。实验结果证明了假设。
 
-![](https://pica.zhimg.com/v2-9670d7878a4c6a09fbe0871d898897d0_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1023' height='455'></svg>)
+![](https://picx.zhimg.com/v2-9670d7878a4c6a09fbe0871d898897d0_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1023' height='455'></svg>)
 
 1. extrinsic dimension和sample complexity没有关系
 
@@ -7318,21 +9579,21 @@ Evaluation
 
 实验结果如下图，可以看到此时4个数据集在使用2000个训练样本后基本就能达到相似的分类准确率了。实验结果表明extrinsic dimension对sample complexity的影响很小。
 
-![](https://pic1.zhimg.com/v2-66537215138ace3d6c490dfa7c620e7e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1071' height='461'></svg>)
+![](https://picx.zhimg.com/v2-66537215138ace3d6c490dfa7c620e7e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1071' height='461'></svg>)
 
 ## **5. 在真实数据集上验证 Intrinsic Dimension**
 
 前面都是在GAN生成的数据集上做的实验，作者还在像MNIST，CIFAR-10等真实数据集上也做了验证试验。下图是在原始数据集上使用MLE得到的在不同 k 大小下的 ID 估计值。可以看到估计的结果符合预期，即数据集越难，ID值越大。
 
-![](https://pic1.zhimg.com/v2-dc58337b6dc021ef513eaa4f58376786_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1089' height='290'></svg>)
+![](https://picx.zhimg.com/v2-dc58337b6dc021ef513eaa4f58376786_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1089' height='290'></svg>)
 
 因为每个数据集的图形大小不一样，所以不同数据集的图像大小都缩放到 32x32 以保证extrinsic dimension都一样。实验设置和上面的合成数据集的设置类似，比如在ImageNet上随机选取两个类别的数据构造成一个二分类数据子集，然后计算出 ID 值。Table 2是基于两个类别得到的ID值，Table 1是基于原始数据集得到的ID值，可以看到二者虽然具体的ID值不同牡丹石整体呈现的趋势是类似的，即数据集越难，ID值越大。
 
-![](https://picx.zhimg.com/v2-fff321bd9416091b9b388dfe450748c5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1223' height='322'></svg>)
+![](https://pic1.zhimg.com/v2-fff321bd9416091b9b388dfe450748c5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1223' height='322'></svg>)
 
 下图是在4个真实数据集上的结果，每个数据集跑了5次，每次选取不同的两个类别组成subnet。可以看到在真实数据集上的结果和Figure 4的结果类似，intrinsic dimension大的数据集（如ImageNet）需要采样更多的训练样本。
 
-![](https://pic1.zhimg.com/v2-fb142955e0ad7cab33b0f8cf943a72ab_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1087' height='476'></svg>)
+![](https://picx.zhimg.com/v2-fb142955e0ad7cab33b0f8cf943a72ab_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1087' height='476'></svg>)
 
 作者还做了一个比较有意思的实验，就是给数据集加上噪声。其实像ImageNet本身真实的ID我们是不知道的，但是噪声数据的ID我们是可以控制的，所以假如我们构造一个ID为 ![\underline{d}](https://www.zhihu.com/equation?tex=%5Cunderline%7Bd%7D) 的噪声并把它加到原图像上去，那么得到的新的图像的ID肯定是大于或等于![\underline{d}](https://www.zhihu.com/equation?tex=%5Cunderline%7Bd%7D)的。Table 3 给出了加上不同ID噪声后，CIFAR-10数据集的ID估计值的变化情况。可以看到加上噪声后数据集的ID似乎并没有达到噪声的ID值，这很可能是因为数据点太少导致的。不过可以看到的是加入噪声的ID值越大，得到的新的数据集自身的ID值也是随之增加的。
 
@@ -7378,13 +9639,13 @@ AutoML的全称是**Automated Machine Learning，**也就是自动机器学习�
 
 传统的机器学习可能是依靠人工设计的特征对数据做处理。举个最简单的例子，我们在对学生成绩好坏做评价的时候，他每个科目的成绩就可以视为一个特征，最简单的办法就是求和或者加权平均（也就是卷死人的GPA）。这个例子很简单，但是假如我们想让机器自动区分猫和狗的时候，涉及到的特征就很多了，单靠人工设计就没那么简单了，所以人们会尝试着使用**卷积神经网络(CNN)**来对猫和狗进行分类。
 
-![](https://picx.zhimg.com/v2-cf178ea52f819b2362500d8f2a3309d7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='743' height='503'></svg>)![](https://pic1.zhimg.com/v2-b95488a7063831af9a66e21673156b21_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='819' height='530'></svg>)
+![](https://pica.zhimg.com/v2-cf178ea52f819b2362500d8f2a3309d7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='743' height='503'></svg>)![](https://pic1.zhimg.com/v2-b95488a7063831af9a66e21673156b21_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='819' height='530'></svg>)
 
 随着卷积神经网络的成功和流行，科研狗们开始了漫漫的调参之路。。。
 
 一个完整的训练CNN的流程包含很多部分，整个流程划分成了如下几个部分[1]:
 
-![](https://pic1.zhimg.com/v2-87f90036fc25d951532f01bc5430449b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='720' height='357'></svg>)
+![](https://picx.zhimg.com/v2-87f90036fc25d951532f01bc5430449b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='720' height='357'></svg>)
 
 * 数据准备
 * 特征工程
@@ -7410,7 +9671,7 @@ row_title = [str(policy).split('.')[-1] for policy in policies]
 plot(imgs, row_title=row_title)
 ```
 
-![](https://picx.zhimg.com/v2-d6985ac5c110c2e82b2bd977871fe817_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='629' height='438'></svg>)
+![](https://pic1.zhimg.com/v2-d6985ac5c110c2e82b2bd977871fe817_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='629' height='438'></svg>)
 
 ## 3. 神经架构搜索(Neural Architecture Search, NAS)
 
@@ -7440,13 +9701,13 @@ plot(imgs, row_title=row_title)
 
 感谢评论区小伙伴提醒，他终于踏着祥云又来了
 
-![](https://picx.zhimg.com/v2-99d81d419202e2fd3b2f919dec5a0435_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)[https://github.com/pytorch/pytorch/issues/47702](https://link.zhihu.com/?target=https%3A//github.com/pytorch/pytorch/issues/47702)
+![](https://pic1.zhimg.com/v2-99d81d419202e2fd3b2f919dec5a0435_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)[https://github.com/pytorch/pytorch/issues/47702](https://link.zhihu.com/?target=https%3A//github.com/pytorch/pytorch/issues/47702)
 
 关于是否给pytorch适配M1这个问题在官方github issue上讨论都快有一年多了哈哈。
 
 4天前 soumith大大亲自给出答复，pytorch团队决定适配M1，至于什么时候发布出来还不确定，可能4个月后？不过决定适配总是好的，我买mac的决心又有了哈哈哈
 
-![](https://pica.zhimg.com/v2-bba8b1a92d1c8967ad72374f51cbcd15_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)
+![](https://picx.zhimg.com/v2-bba8b1a92d1c8967ad72374f51cbcd15_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2844'></svg>)
 
 
 ---
@@ -7493,20 +9754,20 @@ plot(imgs, row_title=row_title)
 
 英国大学排名靠前的就很多了，当然如果你拿到了牛津，剑桥这种级别学校的offer，那你麻溜的去英国哈哈哈。如果是和香港心仪的大学排名接近的大学，那你还需要考虑一下专业和收费的问题。
 
-![](https://picx.zhimg.com/v2-6d87bd925c626288e8b2fed8c49f4621_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='778' height='781'></svg>)![](https://picx.zhimg.com/v2-a6984983320a16baa995c259694eaf64_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='791' height='857'></svg>)
+![](https://pic1.zhimg.com/v2-6d87bd925c626288e8b2fed8c49f4621_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='778' height='781'></svg>)![](https://picx.zhimg.com/v2-a6984983320a16baa995c259694eaf64_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='791' height='857'></svg>)
 
 ## **2. 费用**
 
 费用主要有两部分，一个是学费，一个是生活费。香港和英国的授课型硕士一般都是一年学制的，所以学费也指的是一年的费用。不同专业收费是不同的，这里我就以计算机为例，把排名相近的学校的学费做了一下比较和总结：
 
-![](https://pic1.zhimg.com/v2-74f45356287e401fcb14ee0dc04c7b7e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='941' height='303'></svg>)
+![](https://pica.zhimg.com/v2-74f45356287e401fcb14ee0dc04c7b7e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='941' height='303'></svg>)
 > “ 数据来源：指南者留学 [http://www.compassedu.hk/](https://link.zhihu.com/?target=http%3A//www.compassedu.hk/) ”
 
 虽然这里仅仅给出的是计算机硕士专业的学费，但是还是可以看到英国留学在学费这一块还是要明显比香港贵的。统计结果显示英国学费比香港平均贵9万人民币左右，这个其实还是个不小的开销的。如果家庭条件有限，香港是个性价比更高的选择。
 
 如果你想选的专业不是计算机，你可以用 **指南者留学APP** 查看和对比不同学校专业和收费情况。他有一个功能我觉得非常nice，就是它会给出每个专业开设了哪些课程，你可以通过查看专业课程大概了解这个专业到底需要学些什么东西，而不至于被专业名称给骗了。
 
-![](https://picx.zhimg.com/v2-61c85ad24f5cb3bb9a8a8e87517d353f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='904' height='897'></svg>)
+![](https://pica.zhimg.com/v2-61c85ad24f5cb3bb9a8a8e87517d353f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='904' height='897'></svg>)
 
 ## **3. 生活方便程度**
 
@@ -7518,7 +9779,7 @@ plot(imgs, row_title=row_title)
 
 另外你如果到香港留学，可以申请香港居民身份证，之后你就可以享受香港政府提供的一系列户外活动服务，大部分收费非常便宜甚至是免费的。你可以申请骑马，划帆船，射箭等。另外虽然说香港面积小，但是令人震惊的是他有很多公园和海岛，这些地方一般都是免费的，如果喜欢户外游玩，香港是个非常不错的地方。
 
-![](https://pic1.zhimg.com/v2-4e37a16d37e77159767dbe1802754925_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='682' height='229'></svg>)
+![](https://picx.zhimg.com/v2-4e37a16d37e77159767dbe1802754925_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='682' height='229'></svg>)
 
 ## **4. 就业认可度**
 
@@ -7569,7 +9830,7 @@ plot(imgs, row_title=row_title)
 
 感觉像我一样只玩过王者荣耀的大部分玩家应该不会被吸引过去吧
 
-![](https://pic1.zhimg.com/v2-7fb21f7d5bd007863b4e36a376fd5982_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2844' height='1280'></svg>)
+![](https://picx.zhimg.com/v2-7fb21f7d5bd007863b4e36a376fd5982_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2844' height='1280'></svg>)
 
 
 ---
@@ -7583,7 +9844,7 @@ plot(imgs, row_title=row_title)
 
 要先试探，之后再开大招
 
-![](https://picx.zhimg.com/v2-8802d30d3afcea26468658b4ea942269_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='432' height='360'></svg>)![](https://picx.zhimg.com/v2-664642c5f359b6ac1e56e37fd9474adf_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='432' height='360'></svg>)
+![](https://pic1.zhimg.com/v2-8802d30d3afcea26468658b4ea942269_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='432' height='360'></svg>)![](https://pica.zhimg.com/v2-664642c5f359b6ac1e56e37fd9474adf_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='432' height='360'></svg>)
 
 
 ---
@@ -7603,7 +9864,7 @@ plot(imgs, row_title=row_title)
 `link: https://www.zhihu.com/question/465716749/answer/1994428880 · created: 1626104046`
 
 
-![](https://pic1.zhimg.com/50/v2-6bbc98cfac16b432222ea0dcf76459d3_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'></svg>)![](https://picx.zhimg.com/50/v2-74175267233ad127da96213a695e5fd0_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'></svg>)
+![](https://pic1.zhimg.com/50/v2-6bbc98cfac16b432222ea0dcf76459d3_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'></svg>)![](https://pic1.zhimg.com/50/v2-74175267233ad127da96213a695e5fd0_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'></svg>)
 
 
 ---
@@ -7617,7 +9878,7 @@ plot(imgs, row_title=row_title)
 
 学费绝对是留学开销的大头了，我查了一下浸会大学文学院两个专业的学费，如下图，大概都是在10W一年左右。另外两个专业的课程也都给出了，仅供参考
 
-![](https://pic1.zhimg.com/v2-0f932e493d4416e167e57bf86fbd6725_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='521' height='642'></svg>)
+![](https://pica.zhimg.com/v2-0f932e493d4416e167e57bf86fbd6725_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='521' height='642'></svg>)
 
 图片来自【指南者留学APP】
 
@@ -7633,7 +9894,7 @@ plot(imgs, row_title=row_title)
 
 学校食堂吃腻了可以试试外卖，第一个必须推荐 foodpanda，之前点了 **湖南少奶（九龙城一家湘菜馆）** 的外卖，一共花了1000多港币，但是外卖费用只要25，这在香港我已经很知足了哈哈哈，平均下来每个人200多左右
 
-![](https://pica.zhimg.com/v2-17c0fb5ae5c074ed56b9697c0926c2c9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='701' height='677'></svg>)
+![](https://picx.zhimg.com/v2-17c0fb5ae5c074ed56b9697c0926c2c9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='701' height='677'></svg>)
 
 ### 港版大众点评：Openrice （开饭喇）
 
@@ -7647,7 +9908,7 @@ plot(imgs, row_title=row_title)
 
 我们之前吃过的一家日式烤肉店叫 牛角，这家店在旺角，感兴趣的小伙伴可以去试试
 
-![](https://picx.zhimg.com/v2-32c9d071c4d6e7da74cdfbb2d8b3c68e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='686' height='580'></svg>)
+![](https://pic1.zhimg.com/v2-32c9d071c4d6e7da74cdfbb2d8b3c68e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='686' height='580'></svg>)
 
 ## 住
 
@@ -7657,13 +9918,13 @@ plot(imgs, row_title=row_title)
 
 我个人经验是 如果你住双人间，价格2000-3000左右比较合理；如果是单人间基本上是4000往上吧 。很多中介会要你一次性交一年的房租，如果可以找到月租的一定要找月租的哈哈哈。总的来说一年的房租大概在3万到7万左右
 
-![](https://pic1.zhimg.com/v2-2db37f886214ad07987251e096b8daf6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1080' height='2400'></svg>)
+![](https://pica.zhimg.com/v2-2db37f886214ad07987251e096b8daf6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1080' height='2400'></svg>)
 
 ### 28Hse
 
 28Hse类似于内地的安居客，功能也还可以，不过还是那句话，优先找上面的房东
 
-![](https://pica.zhimg.com/v2-80c7a49da9a15d00441c426d06b84a25_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='671' height='570'></svg>)
+![](https://pic1.zhimg.com/v2-80c7a49da9a15d00441c426d06b84a25_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='671' height='570'></svg>)
 
 ## 行
 
@@ -7703,7 +9964,7 @@ But邮费却是一个不小的开支，不过我来告诉你省邮费的方式
 
 当然，香港本地也是由电商的，你可以下载 price， 这个软件提供了一些线下门店的联系方式和货品价格，我一般用这个来看价格，最后买东西还是回去实体店
 
-![](https://picx.zhimg.com/v2-88a90560dcabff010134a616bf50349e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='707' height='689'></svg>)
+![](https://pic1.zhimg.com/v2-88a90560dcabff010134a616bf50349e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='707' height='689'></svg>)
 
 ### 支付
 
@@ -7715,11 +9976,11 @@ But邮费却是一个不小的开支，不过我来告诉你省邮费的方式
 
 来香港后，内地的听歌软件很多歌都会变成灰色了，我推荐下载 Spotify，刚开始有三个月的免费试用，你也可以下载YouTube music，都还不错，只不过想要白嫖的话可能需要忍受时不时的广告
 
-![](https://pica.zhimg.com/v2-28f28f9e0701aed6780c21cf11f74109_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='663' height='579'></svg>)
+![](https://pic1.zhimg.com/v2-28f28f9e0701aed6780c21cf11f74109_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='663' height='579'></svg>)
 
 说了这么多，对于想来香港但是还没拿到offer的同学肯定是极其痛苦的，所以你可能还需要一个软件来帮助你选择合适的学校和专业。
 
-![](https://picx.zhimg.com/v2-c50bc7a1517d9c027edb336640ad8f69_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='482' height='355'></svg>)
+![](https://pic1.zhimg.com/v2-c50bc7a1517d9c027edb336640ad8f69_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='482' height='355'></svg>)
 
 对于还在读大二大三的童鞋，如果有想来香港继续深造的想法的，其实现在可以开始了解了。但是估计大多数同学也不知该从何开始了解，选什么学校，什么专业，得花多少钱，这些都是得花不少时间去了解的，一想到这，是不是又打开了王者荣耀在峡谷里畅玩了一把哈哈哈
 
@@ -7733,13 +9994,13 @@ But邮费却是一个不小的开支，不过我来告诉你省邮费的方式
 
 我看了下院校，他很全面地提供了各个港校的不同专业的情况
 
-![](https://pic1.zhimg.com/v2-1c5d09fc6325de25646780e23867707f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1080' height='2400'></svg>)
+![](https://pica.zhimg.com/v2-1c5d09fc6325de25646780e23867707f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1080' height='2400'></svg>)
 
 图片来自【指南者留学APP】
 
 比如它很清晰地给出了不同学校的不同专业的申请条件，课程设置情况等等，另外每个学校的录取率也有做统计
 
-![](https://picx.zhimg.com/v2-d046b509004058e23f5ef5719220d007_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='976' height='705'></svg>)
+![](https://pic1.zhimg.com/v2-d046b509004058e23f5ef5719220d007_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='976' height='705'></svg>)
 
 图片来自【指南者留学APP】
 
@@ -7747,13 +10008,13 @@ But邮费却是一个不小的开支，不过我来告诉你省邮费的方式
 
 其实每个人的情况都不一样，我不太好给出一个统一的建议，最好的是看看其他类似你情况的人的经验， **指南者留学** 这个软件就很贴心的提供了这么一个功能，你可以看看其他人申请成功都做了哪些努力，你就可以借鉴他们的方向去努力了
 
-![](https://pica.zhimg.com/v2-b9c191d60e1782dda607db1141063e2d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1011' height='678'></svg>)
+![](https://picx.zhimg.com/v2-b9c191d60e1782dda607db1141063e2d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1011' height='678'></svg>)
 
 图片来自【指南者留学APP】
 
 当然，如果你担心自己一个人找不到合适的项目，这个软件也有提供一些付费服务，比如给你提供实战项目和科研实习等，不过我的建议是最好自己打好一定基础后再去上这些课，不然只会是浪费钱，这些都是锦上添花的东西，而不是让你一蹴而就的
 
-![](https://pica.zhimg.com/v2-7db0c7ce88e758b36219d17694e4846e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1050' height='672'></svg>)
+![](https://picx.zhimg.com/v2-7db0c7ce88e758b36219d17694e4846e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1050' height='672'></svg>)
 
 图片来自【指南者留学APP】
 
@@ -7775,7 +10036,7 @@ But邮费却是一个不小的开支，不过我来告诉你省邮费的方式
 
 谈到综述，那必然首推NAS综述鼻祖： **Neural Architecture Search: A Survey**
 
-[Neural Architecture Search: A Survey](https://link.zhihu.com/?target=https%3A//arxiv.org/abs/1808.05377)![](https://pic1.zhimg.com/v2-3739d240368534f5477c3cc47ef8deb9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='780' height='306'></svg>)
+[Neural Architecture Search: A Survey](https://link.zhihu.com/?target=https%3A//arxiv.org/abs/1808.05377)![](https://picx.zhimg.com/v2-3739d240368534f5477c3cc47ef8deb9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='780' height='306'></svg>)
 
 NAS流程图
 
@@ -7787,7 +10048,7 @@ NAS流程图
 
 我们的综述清晰地给出了一个完整的AutoML的pipeline框架，如下图示。
 
-![](https://picx.zhimg.com/v2-b7d685e80d1ba1e7699b22a1df5a295b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1292' height='629'></svg>)
+![](https://pic1.zhimg.com/v2-b7d685e80d1ba1e7699b22a1df5a295b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1292' height='629'></svg>)
 
 AutoML Pipeline
 
@@ -7881,7 +10142,7 @@ NAS和AutoML的综述有不少，你精度几篇之后，另外几篇可以作�
 
 ### 微信公众号：AutoML机器学习
 
-![](https://picx.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
+![](https://pica.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
 
 **MARSGGBO♥原创**  
 如有意合作或学术讨论欢迎私戳联系~  
@@ -7922,7 +10183,7 @@ NAS实现规范
 
 ### **微信公众号：AutoML机器学习**
 
-**![](https://pic1.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)**
+**![](https://picx.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)**
 
 **MARSGGBO♥原创**  
 **如有意合作或学术讨论欢迎私戳联系~**  
@@ -7947,13 +10208,13 @@ NAS实现规范
 
 在2015年，有研究用deep Q-Network训练agent玩Atari游戏，下面是游戏列表，看看你都玩了哪些游戏。
 
-![](https://picx.zhimg.com/v2-97ebe6cad33c61530bc835b76d47dc31_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='929' height='221'></svg>)![](https://picx.zhimg.com/v2-fb9898da8658c4d9023393fbdee48281_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='922' height='214'></svg>)
+![](https://picx.zhimg.com/v2-97ebe6cad33c61530bc835b76d47dc31_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='929' height='221'></svg>)![](https://pica.zhimg.com/v2-fb9898da8658c4d9023393fbdee48281_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='922' height='214'></svg>)
 
 2016年让人工智能大火的AlphaGo诞生。2018年，OpenAI团队利用AI技术在Dota2游戏中战胜了专业玩家。
 
 之前参加过腾讯内部举办的Workshop，其中他们就分享了他们利用AutoML在王者荣耀游戏上搜索超参的工作。之后腾讯在2020年的一篇被AAAI接收的论文（简称MOBA1v1）使用DRL技术在王者荣耀1V1模式下完胜人类玩家。下图是AlphaGo和MOBA1V1的对比，可以看到后者的搜索和动作空间都远大于AlphaGo，而且我们都体验过被460的折磨，所以算法对实时性的要求也是非常高的。
 
-![](https://pic1.zhimg.com/v2-24660885ab318a13565dfdb04cde98c1_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='594' height='244'></svg>)
+![](https://picx.zhimg.com/v2-24660885ab318a13565dfdb04cde98c1_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='594' height='244'></svg>)
 
 看看下面的系统设计，可以粗略地感受一下每时每刻需要处理的信息量之大。之前还以为是腾讯会直接通过后台数据拿到所有对象的数据，没想到是通过每一帧的图像信息提取特征的。
 
@@ -7985,7 +10246,7 @@ NAS实现规范
 
 计图创新的采用了统一计算图，用户并不需要手动切换，计图可以动态的将计算图拆分成可以优化的子静态图。让计图在保持动态图灵活性的同时，还可以发挥出静态图的运算性能。计图与国际主流平台相比，具有多项先进特性，其统一计算图的特性如下图所示。
 
-![](https://pica.zhimg.com/v2-020eb553024a0913ec6e7135b3955dc1_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='650' height='400'></svg>)
+![](https://picx.zhimg.com/v2-020eb553024a0913ec6e7135b3955dc1_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='650' height='400'></svg>)
 
 ### Oneflow
 
@@ -8025,11 +10286,11 @@ NAS技术也越来越被广泛应用到各个领域，未来应该也会变成�
 
 ### **微软-Azure Machine Learning**
 
-[Azure Machine Learning - ML as a Service | Microsoft Azure](https://link.zhihu.com/?target=https%3A//azure.microsoft.com/en-us/services/machine-learning/%23features)![](https://pica.zhimg.com/v2-6c1b29b20f848a17e4e3c2f39c8faa29_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='734' height='413'></svg>)
+[Azure Machine Learning - ML as a Service | Microsoft Azure](https://link.zhihu.com/?target=https%3A//azure.microsoft.com/en-us/services/machine-learning/%23features)![](https://picx.zhimg.com/v2-6c1b29b20f848a17e4e3c2f39c8faa29_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='734' height='413'></svg>)
 
 ### **亚马逊-SageMaker**
 
-[Amazon SageMaker 机器学习\_机器学习模型构建训练部署-AWS云服务](https://link.zhihu.com/?target=https%3A//aws.amazon.com/cn/sagemaker/)![](https://picx.zhimg.com/v2-e7c286be2abef854ca779e12f08311ce_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2286' height='574'></svg>)
+[Amazon SageMaker 机器学习\_机器学习模型构建训练部署-AWS云服务](https://link.zhihu.com/?target=https%3A//aws.amazon.com/cn/sagemaker/)![](https://pic1.zhimg.com/v2-e7c286be2abef854ca779e12f08311ce_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2286' height='574'></svg>)
 
 不过以上平台都是商用的，换句话说你如果想自定义AutoML算法，这些平台并不能满足你的需求。我个人比较推荐的可以自定义的框架（我自己亲测好用的）如下，这两个我真的推荐无数次了，对AutoML感兴趣的朋友一定要试试
 
@@ -8047,7 +10308,7 @@ NAS技术也越来越被广泛应用到各个领域，未来应该也会变成�
 
 ### **微信公众号：AutoML机器学习**
 
-![](https://pic1.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
+![](https://picx.zhimg.com/50/v2-87083e55cd41dbef83cc840c142df48a_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'></svg>)
 
 **MARSGGBO♥原创**  
 **如有意合作或学术讨论欢迎私戳联系~**  
@@ -8067,7 +10328,7 @@ NAS技术也越来越被广泛应用到各个领域，未来应该也会变成�
 
 主要是AutoML相关内容，下面是内容截图
 
-![](https://picx.zhimg.com/v2-d694e0e1e5f9994cd69eb53615607af2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1080' height='2400'></svg>)![](https://pic1.zhimg.com/v2-e3c411a305ffba03678d5f53c80777a7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1080' height='2400'></svg>)
+![](https://pic1.zhimg.com/v2-d694e0e1e5f9994cd69eb53615607af2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1080' height='2400'></svg>)![](https://pic1.zhimg.com/v2-e3c411a305ffba03678d5f53c80777a7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1080' height='2400'></svg>)
 
 * 知乎专栏：
 
@@ -8113,7 +10374,7 @@ NAS技术也越来越被广泛应用到各个领域，未来应该也会变成�
 
 附上若干年前拍的照片，现在设施越来越好了，估计再也看不到海了哈哈哈
 
-![](https://picx.zhimg.com/v2-85fecc8d289b5590d9be63b63bc90be2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='853' height='640'></svg>)![](https://pic1.zhimg.com/v2-bbd53c0a49a74dfd277eae1a37d878d2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1920' height='1080'></svg>)![](https://picx.zhimg.com/v2-4e86c23e1b37bd0ca46cbfbeeef2c182_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1920' height='1080'></svg>)![](https://picx.zhimg.com/v2-bf055cf55d45df2580889a17bf738d4c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='640' height='853'></svg>)![](https://pic1.zhimg.com/v2-a884f2b0f85a9d04deadd028138396c9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='720' height='541'></svg>)![](https://picx.zhimg.com/v2-1d7a54e38b48a44a7f78b65a7e644989_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='800' height='600'></svg>)![](https://picx.zhimg.com/v2-4deed73411834b70cf87dd75c7040e85_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='849' height='482'></svg>)![](https://picx.zhimg.com/v2-f147725773e0bfbe0f51cd1c2d368e08_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1456' height='1080'></svg>)
+![](https://picx.zhimg.com/v2-85fecc8d289b5590d9be63b63bc90be2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='853' height='640'></svg>)![](https://picx.zhimg.com/v2-bbd53c0a49a74dfd277eae1a37d878d2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1920' height='1080'></svg>)![](https://picx.zhimg.com/v2-4e86c23e1b37bd0ca46cbfbeeef2c182_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1920' height='1080'></svg>)![](https://pic1.zhimg.com/v2-bf055cf55d45df2580889a17bf738d4c_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='640' height='853'></svg>)![](https://pica.zhimg.com/v2-a884f2b0f85a9d04deadd028138396c9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='720' height='541'></svg>)![](https://pic1.zhimg.com/v2-1d7a54e38b48a44a7f78b65a7e644989_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='800' height='600'></svg>)![](https://picx.zhimg.com/v2-4deed73411834b70cf87dd75c7040e85_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='849' height='482'></svg>)![](https://picx.zhimg.com/v2-f147725773e0bfbe0f51cd1c2d368e08_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1456' height='1080'></svg>)
 
 
 ---
@@ -8356,11 +10617,11 @@ D
 
 简单看了下文档，源代码还没细究，简单地跑了两个demo，感觉蛮有意思的，可以看到首先是对`nn.Module` 模块进行解析得到中间表达式（`st.graph` ），后面的`st.code` 可以自动转化成`forward` 函数
 
-![](https://picx.zhimg.com/v2-caef60196eb4102ac3dbf59680d04986_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='738' height='835'></svg>)
+![](https://pic1.zhimg.com/v2-caef60196eb4102ac3dbf59680d04986_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='738' height='835'></svg>)
 
 不过目前版本不支持逻辑控制，这也可以理解
 
-![](https://picx.zhimg.com/v2-6b47f64a62c620fc0f020a81c7980a48_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='825' height='656'></svg>)
+![](https://pic1.zhimg.com/v2-6b47f64a62c620fc0f020a81c7980a48_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='825' height='656'></svg>)
 
 不过说道新的应用场景，我觉得FX可以很好地和NAS、模型压缩等结合起来，原因如下：
 
@@ -8373,7 +10634,7 @@ D
 
 NAS任务同样也会遇到上面两个问题，虽然使用Mask可以指定使用哪一个模型，但是我始终觉得这种两种处理方式都不太好，而Pytorch1.8的FX功能可能会让我们实现一个优雅的处理解决方案
 
-![](https://picx.zhimg.com/50/v2-17a6a01b652bfa0f57e9295dddc8c6f8_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='143' height='163'></svg>)
+![](https://pica.zhimg.com/50/v2-17a6a01b652bfa0f57e9295dddc8c6f8_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='143' height='163'></svg>)
 
 后面抽时间看看FX源码，看看是否真的可行，未完待续。。。
 
@@ -8427,7 +10688,7 @@ rebuttal整理好了，可以看看这篇文章
 
 下图是我的提交记录，我提交的是一个AutoML（自动机器学习）方向的综述，第一次投是2月份，然后4月份直接拒了，虽然当时很心痛，因为综述写起来真的是要命，不过reviewer感觉很专业，提了很多有用的建议。
 
-![](https://picx.zhimg.com/v2-9033673667a85c981bebf3c948a99251_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1851' height='182'></svg>)
+![](https://pic1.zhimg.com/v2-9033673667a85c981bebf3c948a99251_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1851' height='182'></svg>)
 
 后来疫情在家痛定思痛，参照reviewer的意见把Survey基本上是把主要内容和画图都重新写了一遍，内容也丰富了很多，引用文献超过了300多个。这一过程很痛苦，好多次想着算了，随便写写得了，但是睡觉起来后又觉得瞎写一通也是浪费时间，还不如认真写。就这么前前后后一直拖到7月份才写完（主要是疫情在家效率的确很低）。给老师检查之后，在2020.7.8重新提交，之后就听天由命了。
 
@@ -8449,7 +10710,7 @@ rebuttal整理好了，可以看看这篇文章
 
 made，这跟我开会前没做啥东西，但是为了应对开会还是不得不硬凑出东西来一样一样的，出来混都不容易哈哈哈哈
 
-![](https://pic1.zhimg.com/50/v2-84d64f299643f087c92e5ab1f355032b_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='225' height='225'></svg>)
+![](https://picx.zhimg.com/50/v2-84d64f299643f087c92e5ab1f355032b_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='225' height='225'></svg>)
 
 
 ---
@@ -8479,7 +10740,7 @@ made，这跟我开会前没做啥东西，但是为了应对开会还是不得�
 
 AutoML全称是Automated Machine Learning，即自动机器学习，听起来是不是很酷，没错的确很酷，如果感兴趣的话可以读一下我们实验室写的AutoML综述： AutoML: A Survey of State-of-the-art。
 
-![](https://picx.zhimg.com/v2-83339b83c0a1c95e86b920b41e4736d6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1299' height='661'></svg>)<https://zhuanlan.zhihu.com/p/158162306>
+![](https://pic1.zhimg.com/v2-83339b83c0a1c95e86b920b41e4736d6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1299' height='661'></svg>)<https://zhuanlan.zhihu.com/p/158162306>
 
 至于开发框架主要以基于深度学习的为主推荐一下几个：
 
@@ -8489,7 +10750,7 @@ AutoML全称是Automated Machine Learning，即自动机器学习，听起来是
 
 2. 第二个推荐巨硬的 NNI, 易用性很强，下至胎儿，上至100岁都很容易上手。反正Vega和NNI选哪个都不差
 
-[microsoft/nni](https://link.zhihu.com/?target=https%3A//github.com/microsoft/nni)![](https://pica.zhimg.com/v2-ca12c4ea927679918ab7198b00b9af8d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1545' height='761'></svg>)
+[microsoft/nni](https://link.zhihu.com/?target=https%3A//github.com/microsoft/nni)![](https://picx.zhimg.com/v2-ca12c4ea927679918ab7198b00b9af8d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1545' height='761'></svg>)
 
 3. 其他没怎么用过，仅列出名字，欢迎大佬们评论区留言评价以下这些框架：
 
@@ -8529,11 +10790,11 @@ AutoML全称是Automated Machine Learning，即自动机器学习，听起来是
 
 [https://github.com/facebookresearch/detectron2](https://link.zhihu.com/?target=https%3A//github.com/facebookresearch/detectron2)
 
-![](https://picx.zhimg.com/50/v2-378187915986b5d66c31019d6b843d98_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='332' height='95'></svg>)
+![](https://pic1.zhimg.com/50/v2-378187915986b5d66c31019d6b843d98_720w.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='332' height='95'></svg>)
 
 * 联邦学习开发框架: [FedML.ai](https://link.zhihu.com/?target=https%3A//fedml.ai/)
 
-![](https://pic1.zhimg.com/v2-746d2b261b6750fa6eae9e07cfadefa4_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='974' height='474'></svg>)<https://zhuanlan.zhihu.com/p/262497372>
+![](https://picx.zhimg.com/v2-746d2b261b6750fa6eae9e07cfadefa4_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='974' height='474'></svg>)<https://zhuanlan.zhihu.com/p/262497372>
 
 * 图形学开发框架：
 
@@ -8677,7 +10938,7 @@ ProcessOn在线流程图画图工具，免费用户好像可以创建10个文档
 
 ## 10. Mathpix
 
-[Mathpix Snip](https://link.zhihu.com/?target=https%3A//mathpix.com/)![](https://picx.zhimg.com/v2-364308520447ee51b88ba74cab8ff695_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1213' height='495'></svg>)
+[Mathpix Snip](https://link.zhihu.com/?target=https%3A//mathpix.com/)![](https://pica.zhimg.com/v2-364308520447ee51b88ba74cab8ff695_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1213' height='495'></svg>)
 
 Mathpix可以非常方便地将图片中的数学公式转化成latex代码，写论文超级方便。每个月好像只有一定数量的免费使用次数，如果你使用频率很高，可以去闲鱼上买账号~
 
@@ -8736,7 +10997,7 @@ Mathpix可以非常方便地将图片中的数学公式转化成latex代码，�
 * Auto-Keras，看名字也知道它是基于Keras实现的，换句话说它只支持TensorFlow，目前最新版本的要求是**Python >= 3.5 and TensorFlow >= 2.3.0**，因此如果你常用的框架是Pytorch，这个可能不适合你。
 * NNI是微软开发的**轻量型**AutoML工具包，如下图示，其提供的功能非常丰富，包括自动特征工程、NAS（神经网络架构搜索）、模型压缩、超参数搜索等等，而且还提供了可视化界面方便管理。我本人也用过NNI的NAS模块，易用性非常高。NNI将搜索空间和搜索算法解耦，而且设计了一种统一的接口，可以很方便地实现你的NAS算法，具体可看官方文档介绍：[https://nni.readthedocs.io/zh/latest/nas.html](https://link.zhihu.com/?target=https%3A//nni.readthedocs.io/zh/latest/nas.html)
 
-![](https://picx.zhimg.com/v2-4fdb9e86dd0461c352b207d0dfa82684_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1624' height='803'></svg>)
+![](https://pica.zhimg.com/v2-4fdb9e86dd0461c352b207d0dfa82684_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1624' height='803'></svg>)
 
 ## **3. Vega**
 
@@ -8762,7 +11023,7 @@ Vega提供了诺亚方舟实验室自研的 业界标杆 算法，并提供 Mode
 
 Vega提供高性能Trainer，加速模型训练和评估。Vega设计了Scheduler模块，可以很方便的管理本地集群部署等任务。
 
-![](https://pic1.zhimg.com/v2-8227e2ff21f0120e81a18bbd412ab89d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1428' height='806'></svg>)
+![](https://picx.zhimg.com/v2-8227e2ff21f0120e81a18bbd412ab89d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1428' height='806'></svg>)
 
 ## **3.4 多Backend支持**
 
@@ -8887,7 +11148,7 @@ Vega提供了丰富的搜索空间，你可以很方便地自定义你的搜索�
 
 下面是书里的一个插图，下次小朋友问你 **阿姨/蜀黍, 为什么扫地机器人不会迷路啊?** 你就可以用非常浅显易懂的语句解释了 ~
 
-![](https://pica.zhimg.com/v2-27b472d7613af7ddb16117c24054d684_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='720' height='621'></svg>)
+![](https://pic1.zhimg.com/v2-27b472d7613af7ddb16117c24054d684_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='720' height='621'></svg>)
 
 其他适合小孩子的科普书籍：
 
@@ -8968,15 +11229,15 @@ Vega提供了丰富的搜索空间，你可以很方便地自定义你的搜索�
 
 无图无真相，整理了本科时候拍的一些照片。中间校区适宜摆拍，西校区适宜体验现代生活，玩累了可以去东校区体验最淳朴的乡下生活。
 
-![](https://pic1.zhimg.com/v2-534c8ca23ebc895a6405ecf6282d5eaf_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1536' height='2048'></svg>)
+![](https://pica.zhimg.com/v2-534c8ca23ebc895a6405ecf6282d5eaf_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1536' height='2048'></svg>)
 
 东九孔子
 
-![](https://pica.zhimg.com/v2-d78e880ebd6d4474c1adee401b6ad121_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1536' height='2048'></svg>)
+![](https://pic1.zhimg.com/v2-d78e880ebd6d4474c1adee401b6ad121_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1536' height='2048'></svg>)
 
 华科趵突泉
 
-![](https://picx.zhimg.com/v2-fd04ae68fa179030686886de451e5faf_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1536' height='2048'></svg>)
+![](https://pic1.zhimg.com/v2-fd04ae68fa179030686886de451e5faf_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1536' height='2048'></svg>)
 
 东九教学楼A栋
 
@@ -8986,11 +11247,11 @@ Vega提供了丰富的搜索空间，你可以很方便地自定义你的搜索�
 
 (下图是QQ空间上盗的图哈哈哈哈)
 
-![](https://picx.zhimg.com/v2-a934cc19f3edab8b491b01c7065e1f4a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='853' height='640'></svg>)
+![](https://pic1.zhimg.com/v2-a934cc19f3edab8b491b01c7065e1f4a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='853' height='640'></svg>)
 
 东九前的玉兰花海
 
-![](https://pic1.zhimg.com/v2-96d2d7ff4b07028370e07e70918ac41b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2276' height='1280'></svg>)
+![](https://picx.zhimg.com/v2-96d2d7ff4b07028370e07e70918ac41b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2276' height='1280'></svg>)
 
 宿舍眺望
 
@@ -8998,7 +11259,7 @@ Vega提供了丰富的搜索空间，你可以很方便地自定义你的搜索�
 
 宿舍再眺望
 
-![](https://picx.zhimg.com/v2-241748d66ce5da631f43de0e267782d9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2276'></svg>)
+![](https://pic1.zhimg.com/v2-241748d66ce5da631f43de0e267782d9_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2276'></svg>)
 
 南一楼毛爷爷
 
@@ -9006,23 +11267,23 @@ Vega提供了丰富的搜索空间，你可以很方便地自定义你的搜索�
 
 东九教学楼前的玉兰花贼漂亮，而且会有好几种颜色过渡，没记错的话应该先是红色，然后变成黄白色
 
-![](https://picx.zhimg.com/v2-8268475f5f9799ed4c40f74444bc95c7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1536' height='2048'></svg>)
+![](https://pica.zhimg.com/v2-8268475f5f9799ed4c40f74444bc95c7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1536' height='2048'></svg>)
 
 玉兰花（黄白）
 
-![](https://pic1.zhimg.com/v2-60e57bd458096a02d8c2f68208117167_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2276' height='1280'></svg>)![](https://picx.zhimg.com/v2-035e0a98580a54c62b5b2af0b752d073_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2276'></svg>)![](https://pica.zhimg.com/v2-8ff607cc99b0fb4d0d44e0c299560cce_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1536' height='2048'></svg>)![](https://pic1.zhimg.com/v2-70ee3e3a2cb2dec999d3a7865abfb8f5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2048' height='1532'></svg>)![](https://pica.zhimg.com/v2-57fc0b6eb38092a0acabeb7c18bf7f5f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2048' height='1532'></svg>)
+![](https://picx.zhimg.com/v2-60e57bd458096a02d8c2f68208117167_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2276' height='1280'></svg>)![](https://pica.zhimg.com/v2-035e0a98580a54c62b5b2af0b752d073_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1280' height='2276'></svg>)![](https://pic1.zhimg.com/v2-8ff607cc99b0fb4d0d44e0c299560cce_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1536' height='2048'></svg>)![](https://picx.zhimg.com/v2-70ee3e3a2cb2dec999d3a7865abfb8f5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2048' height='1532'></svg>)![](https://picx.zhimg.com/v2-57fc0b6eb38092a0acabeb7c18bf7f5f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2048' height='1532'></svg>)
 
 主图书馆前坪
 
-![](https://picx.zhimg.com/v2-bd05231aaf49259c9ac47cdb6eafb828_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2048' height='1536'></svg>)![](https://pica.zhimg.com/v2-ec23f2607284eeba0563e5a1325e9bee_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1920' height='1080'></svg>)
+![](https://picx.zhimg.com/v2-bd05231aaf49259c9ac47cdb6eafb828_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2048' height='1536'></svg>)![](https://pic1.zhimg.com/v2-ec23f2607284eeba0563e5a1325e9bee_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1920' height='1080'></svg>)
 
 亲眼见更好看的秋景，整条马路都是金黄树叶
 
-![](https://pica.zhimg.com/v2-a75c98e0168402c0bdcdb8c97bac4c46_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1532' height='2048'></svg>)
+![](https://pic1.zhimg.com/v2-a75c98e0168402c0bdcdb8c97bac4c46_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1532' height='2048'></svg>)
 
 东图书馆小径
 
-![](https://picx.zhimg.com/v2-abc3561726bafcf2a2aeda018027fc1b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1443' height='1080'></svg>)![](https://pic1.zhimg.com/v2-5d83069edb4143fd5c2ef6c2cc44a209_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2784' height='544'></svg>)![](https://picx.zhimg.com/v2-90117df3db83ddd9f5fbecde122cf672_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='720' height='960'></svg>)![](https://picx.zhimg.com/v2-5c6899a0ddd9a3fc25f427882b2ce9c5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1536' height='2048'></svg>)
+![](https://pic1.zhimg.com/v2-abc3561726bafcf2a2aeda018027fc1b_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1443' height='1080'></svg>)![](https://picx.zhimg.com/v2-5d83069edb4143fd5c2ef6c2cc44a209_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='2784' height='544'></svg>)![](https://picx.zhimg.com/v2-90117df3db83ddd9f5fbecde122cf672_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='720' height='960'></svg>)![](https://picx.zhimg.com/v2-5c6899a0ddd9a3fc25f427882b2ce9c5_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1536' height='2048'></svg>)
 
 
 ---
@@ -9306,7 +11567,7 @@ class DetectionNetSPP(nn.Module):
 
 让我感到十分恐惧的《憨豆先生》，每每看到他那表情就让我觉得非常恐怖，而且眼睛又瞪得很大
 
-![](https://pic1.zhimg.com/v2-3a2c7dc678f3248e3a4fd28c7b0d417f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='500' height='425'></svg>)![](https://pic1.zhimg.com/v2-b056dc02d0155d21caa4712fdeba49d6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='500' height='701'></svg>)  
+![](https://picx.zhimg.com/v2-3a2c7dc678f3248e3a4fd28c7b0d417f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='500' height='425'></svg>)![](https://pica.zhimg.com/v2-b056dc02d0155d21caa4712fdeba49d6_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='500' height='701'></svg>)  
 ![](https://picx.zhimg.com/v2-ce5db97bf28d2f072ca2072f55d926b2_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='450' height='482'></svg>)
 
 而且大部分是不说话的，所以让我感觉不能呼吸，很压抑。
@@ -9348,10 +11609,10 @@ class DetectionNetSPP(nn.Module):
 正是因为买了这台灯，他又抽奖抽到了1999红包，然后顺手又买了小米note3。
 
   
-![](https://pic1.zhimg.com/v2-5a580b2eda7ca10664d5ac060f5988b7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1058' height='1412'></svg>)  
-![](https://pic1.zhimg.com/v2-49fa136468fb6735cdc65dc02ce8e77d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='640' height='1136'></svg>)  
+![](https://picx.zhimg.com/v2-5a580b2eda7ca10664d5ac060f5988b7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1058' height='1412'></svg>)  
+![](https://picx.zhimg.com/v2-49fa136468fb6735cdc65dc02ce8e77d_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='640' height='1136'></svg>)  
 ![](https://picx.zhimg.com/v2-d83c8f9f9c892f5aa9332fc9c5f49db7_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='640' height='1136'></svg>)  
-![](https://picx.zhimg.com/50/v2-dd2fd5283feb82a5110b66d49c884c31_720w.gif?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='400' height='426'></svg>)  
+![](https://pic1.zhimg.com/50/v2-dd2fd5283feb82a5110b66d49c884c31_720w.gif?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='400' height='426'></svg>)  
   
   
 
@@ -9367,7 +11628,7 @@ class DetectionNetSPP(nn.Module):
 
   
   
-![](https://pic1.zhimg.com/v2-b8461bc2f339f00e11aff39ff4442e9a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1080' height='1920'></svg>)
+![](https://picx.zhimg.com/v2-b8461bc2f339f00e11aff39ff4442e9a_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1080' height='1920'></svg>)
 
 
 ---
@@ -9403,11 +11664,11 @@ class DetectionNetSPP(nn.Module):
 
 假设我们有一离散信号x[n]，如下图所示
 
-![](https://picx.zhimg.com/17d151224910f352c660d8b5fcaf854e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1152' height='974'></svg>)
+![](https://pic1.zhimg.com/17d151224910f352c660d8b5fcaf854e_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1152' height='974'></svg>)
 
 由冲激信号的抽样性质，我们可以得到![x[-2]=x[-2]\delta [n+2]](https://www.zhihu.com/equation?tex=x%5B-2%5D%3Dx%5B-2%5D%5Cdelta+%5Bn%2B2%5D),![x[-1]=x[-1]\delta [n+1]](https://www.zhihu.com/equation?tex=x%5B-1%5D%3Dx%5B-1%5D%5Cdelta+%5Bn%2B1%5D)等等。因此我们将x[n]分解成一组**加权**了的**移位**的脉冲之和。，图像如下：
 
-![](https://pica.zhimg.com/acced95eb35a89035b11762903f8214f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='922' height='2041'></svg>)
+![](https://pic1.zhimg.com/acced95eb35a89035b11762903f8214f_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='922' height='2041'></svg>)
 
 因此对于这个x[n]信号我们可以表示成![x[n] = ... + x[-2]\delta [n+2] + x[-1]\delta [n+1] +x[0]\delta [0] +x[1]\delta [n-1]+...](https://www.zhihu.com/equation?tex=x%5Bn%5D+%3D+...+%2B+x%5B-2%5D%5Cdelta+%5Bn%2B2%5D+%2B+x%5B-1%5D%5Cdelta+%5Bn%2B1%5D+%2Bx%5B0%5D%5Cdelta+%5B0%5D+%2Bx%5B1%5D%5Cdelta+%5Bn-1%5D%2B...)
 
@@ -9435,4 +11696,4 @@ class DetectionNetSPP(nn.Module):
 
 回答中的图片是这本教材。
 
-![](https://picx.zhimg.com/v2-f37143073d7b26f110f73ec299eb5b44_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1518' height='2048'></svg>)![](https://pic1.zhimg.com/v2-0a5e9b263e4a7516db9cc0c0aa5f93f1_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1518' height='2048'></svg>)
+![](https://pic1.zhimg.com/v2-f37143073d7b26f110f73ec299eb5b44_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1518' height='2048'></svg>)![](https://picx.zhimg.com/v2-0a5e9b263e4a7516db9cc0c0aa5f93f1_r.jpg?source=2c26e567)![](data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1518' height='2048'></svg>)

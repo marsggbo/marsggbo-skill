@@ -1,9 +1,67 @@
-# marsggbo 全量内容索引（按月倒序）
+# hexin 全量内容索引（按月倒序）
 
 
-## 2026-04  (2)
+## 2026-06  (15)
 
+- [ART] [巴西「主权大模型」“翻车”：当模型可以随便融合，怎么证明它偷了你的权重？](http://zhuanlan.zhihu.com/p/2050534438925235435) · 0
+- [ART] [进阶篇 | 不靠人工设计，让遗传算法自己进化出 SOTA 的 LLM 剪枝指标](http://zhuanlan.zhihu.com/p/2050167804033292239) · 0
+- [ART] [说人话：一文搞懂现在火热的 LLM agent 自进化原理](http://zhuanlan.zhihu.com/p/2049816837009969932) · 0
+- [ART] [说人话：AI 这么火，为什么最后是卖内存的韩国海力士赚翻了？](http://zhuanlan.zhihu.com/p/2049596447658718796) · 0
+- [ART] [为什么你的多智能体系统越加 agent 越慢？DeLM 用去中心化解了这个矛盾](http://zhuanlan.zhihu.com/p/2048720788275180090) · 0
+- [ART] [当 AI 开始造自己：Anthropic 递归自我改进报告深度解读](http://zhuanlan.zhihu.com/p/2048719162080491226) · 0
+- [ART] [NF-CoT：当 LLM 的思维链不再是文字，而是连续概率流](http://zhuanlan.zhihu.com/p/2048718395135244079) · 0
+- [ART] [Transformer 真的需要三个投影矩阵吗？Q-K=V 让 KV Cache 直接砍半](http://zhuanlan.zhihu.com/p/2048717365010027716) · 0
+- [ART] [FlashMemory-DeepSeek-V4：用 13.5% 的显存干 100% 的活，超长上下文推理的 less is more](http://zhuanlan.zhihu.com/p/2048428311282446662) · 0
+- [ART] [Self-Harness：让 Agent 自己改自己的 harness，pass rate 最高翻倍](http://zhuanlan.zhihu.com/p/2048419900767703241) · 0
+- [ART] [Mirage：把世界模型的 3D 记忆搬进 Latent Space，快 10 倍还省 55 倍显存](http://zhuanlan.zhihu.com/p/2048413967098418149) · 0
+- [ART] [Frontier：LLM 推理仿真器，端到端误差从 51.7% 降到 2.6%](http://zhuanlan.zhihu.com/p/2048410700926674150) · 0
+- [ART] [ReMoE：只动 Router 就让 MoE 推理快 2 倍？这才是端侧 MoE 部署该有的姿势](http://zhuanlan.zhihu.com/p/2045781500352894289) · 0
+- [ART] [我们的书《动手学 AutoML》出版啦！从 NAS 到大模型优化，系统讲透这套方法论](http://zhuanlan.zhihu.com/p/2045618069813437716) · 0
+- [ANS] [模拟计算芯片能帮助LLM的边缘部署吗？](https://www.zhihu.com/question/646605657/answer/2048411283993671118) · 0
+
+## 2026-05  (24)
+
+- [ART] [LLM Agent Memory 全景拆解：从 RAG 到 KV Cache 到参数写入，100+ 篇工作的方法演进与真实取舍](http://zhuanlan.zhihu.com/p/2040092674112348271) · 0
+- [ART] [LLMRouterBench：当所有 routing 方法被拉到同一起跑线，结果有些尴尬](http://zhuanlan.zhihu.com/p/2040085525135110665) · 0
+- [ART] [EuroSys'26 | TokenFlow：让 LLM 流式输出真正「流」起来](http://zhuanlan.zhihu.com/p/2040043117089404821) · 0
+- [ART] [EuroSys'26 | KUNSERVE 把冗余参数副本临时让给 KVCache，P99 TTFT 最快降 72×](http://zhuanlan.zhihu.com/p/2039714845847704017) · 0
+- [ART] [EuroSys'26 | IBP 用无损 bit 压缩缓解 PCIe 瓶颈，GNN/DLRM/LLM 推理都能用](http://zhuanlan.zhihu.com/p/2039711887265420167) · 0
+- [ART] [EuroSys'26 | PARD 提前丢掉注定超时的请求，goodput 最高提升 176%](http://zhuanlan.zhihu.com/p/2039687254512243195) · 0
+- [ART] [EuroSys26 | MFS 把整个 model family 融进一套嵌套模型，KVCache 跨 tier 直接共享](http://zhuanlan.zhihu.com/p/2039679928266904690) · 0
+- [ART] [Eurosys26 | LLMFolder用编译器「常量折叠」的思路压缩 LLM,把 FFN 参数砍了80%](http://zhuanlan.zhihu.com/p/2039392963726464032) · 0
+- [ART] [Fast26 | SolidAttention 内存不够，SSD 来凑。笔记本也能跑 128k 上下文 LLM](http://zhuanlan.zhihu.com/p/2039385982823355233) · 0
+- [ART] [Fast26 | LLM 推理启动慢？华为用一个「可编程 Page Cache」把模型加载砍了 79%](http://zhuanlan.zhihu.com/p/2038940931668317492) · 0
+- [ART] [Fast26 | KV Cache 的两层存储(内存+SSD)到底卡在哪？](http://zhuanlan.zhihu.com/p/2038938063070607023) · 0
+- [ART] [Eurosys26 | LoRAFusion 把内存带宽浪费和pipeline bubble一起干掉,吞吐量提升1.96倍](http://zhuanlan.zhihu.com/p/2038726965591549739) · 0
+- [ART] [Eurosys26 | FineMoE如何用「细粒度」打破MoE推理的显存-延迟死局](http://zhuanlan.zhihu.com/p/2038725437078106990) · 0
+- [ART] [ICML25 Workshop | PiKV 处理MoE 推理的 KV Cache 问题](http://zhuanlan.zhihu.com/p/2037525754863472651) · 0
+- [ART] [ISCA26 | DySHARP 直接在交换机里做计算，干掉 50% 冗余 MoE 训练通信流量](http://zhuanlan.zhihu.com/p/2037522644136931500) · 0
+- [ART] [Google 训练一个「会管技能库」的 AI——SkillOS 让 agent 真正越用越强](http://zhuanlan.zhihu.com/p/2037520526248293388) · 0
+- [ART] [ICML25 | EPIC：KV Cache 复用的「编译-链接」范式（附可运行代码复现）](http://zhuanlan.zhihu.com/p/2036841445596862090) · 0
+- [ART] [NeurIPS 2024 | Read-ME 把 Dense LLM 变成 MoE 还能推理提速](http://zhuanlan.zhihu.com/p/2036836718767255979) · 0
+- [ANS] [const常量折叠？](https://www.zhihu.com/question/25583301/answer/2039393750548493611) · 0
+- [ANS] [Attention mechanism目前有什么缺点和改进空间？](https://www.zhihu.com/question/305644438/answer/2039386344347153119) · 0
+- [ANS] [web端加载大模型现在有什么好方法吗？](https://www.zhihu.com/question/264699392/answer/2038941358321350628) · 0
+- [ANS] [GPT模型如何优化kv-cache对芯片影响的问题？](https://www.zhihu.com/question/648630053/answer/2038938758620434794) · 0
+- [ANS] [有没有什么方法来识别大模型推理过程中KV cache的冷热程度。？](https://www.zhihu.com/question/1898389278096093545/answer/2036842162999015414) · 0
+- [ANS] [MoE与Dense模型之间是否存在规模等效算法？](https://www.zhihu.com/question/1988091347719192660/answer/2036838489161982622) · 0
+
+## 2026-04  (15)
+
+- [ART] [说人话理解 RoPE：从 sin/cos 位置编码到旋转矩阵，一次讲清楚](http://zhuanlan.zhihu.com/p/2032881588019663675) · 0
+- [ART] [写完 Markdown 还要手动排版？我写了个 VS Code 插件一键搞定微信公众号、知乎、小红书](http://zhuanlan.zhihu.com/p/2032224464654578464) · 0
+- [ART] [多 Agent 协作不需要说「人话」？LatentMAS 让 LLM 在隐空间里直接协作](http://zhuanlan.zhihu.com/p/2032219144121209209) · 0
+- [ART] [KV Cache 也能「语义共享」？SemShareKV 用 LSH 做到了](http://zhuanlan.zhihu.com/p/2032216700423287711) · 0
+- [ART] [Neurips25 | KVCOMM：让多 Agent 系统的 KV Cache 真正“通起来”，TTFT 直接砍掉 7.8 倍](http://zhuanlan.zhihu.com/p/2032027171540165158) · 0
+- [ART] [NSDI26 | DroidSpeak让不同 LLM 之间共享 KV Cache](http://zhuanlan.zhihu.com/p/2031750167255367893) · 0
+- [ART] [KV Cache 复用的第三条路：FAST 2026 CacheSlide 是怎么解决 Agent 推理的位置漂移问题的](http://zhuanlan.zhihu.com/p/2031738806794199145) · 0
+- [ART] [MoE 推理的内存墙，被一块多芯粒芯片打穿了？](http://zhuanlan.zhihu.com/p/2031042989108228947) · 0
+- [ART] [【论文分享】TokenDance 解决多 Agent LLM 推理的 KV Cache 冗余问题](http://zhuanlan.zhihu.com/p/2031034890666390988) · 0
 - [ART] [当 AI 开始学会"记住"：LLM Agent 记忆系统的统一视角](http://zhuanlan.zhihu.com/p/2023430185664423077) · 0
+- [ANS] [基于Decoder的LLM为何需要位置编码？](https://www.zhihu.com/question/640465759/answer/2032882623555576577) · 0
+- [ANS] [公众号不支持markdown格式文件编写怎么办？](https://www.zhihu.com/question/640911439/answer/2032224962321305978) · 0
+- [ANS] [AI 算力需求转向推理，中国 AI 芯片在「推理赛道」面临哪些机遇与挑战？](https://www.zhihu.com/question/1976982561671636721/answer/2031044239103088090) · 0
+- [ANS] [在推理过程中，如果一个token在两个prompt中相对偏移相同，对应的KV Cache能否复用？](https://www.zhihu.com/question/1958916857244411203/answer/2031036618811945316) · 0
 - [ANS] [个性化llm的memory方向怎么样?](https://www.zhihu.com/question/1957619016504967717/answer/2023430823353788148) · 0
 
 ## 2026-02  (2)

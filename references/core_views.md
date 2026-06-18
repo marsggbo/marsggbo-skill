@@ -1,56 +1,156 @@
-# marsggbo 核心观点索引
+# hexin 核心观点索引
 
 按主题聚合本人写过的相关文章/回答。生成内容前先用 grep 找原文保持一致性。
 
 
-## 机器学习 / 深度学习  (212 条)
+## AGI / 大模型  (104 条)
 
-- [当 AI 开始学会"记住"：LLM Agent 记忆系统的统一视角](http://zhuanlan.zhihu.com/p/2023430185664423077) · 0 赞
-- [DAC2026 | ExpertFlow：高效 MoE 推理系统，单卡部署省内存提速度](http://zhuanlan.zhihu.com/p/2010728514375144803) · 0 赞
-- [尝试从源头来理解 SVD 原理和计算](http://zhuanlan.zhihu.com/p/1967653700144181450) · 0 赞
-- [LLM技术详解好文指路明灯](http://zhuanlan.zhihu.com/p/1965423420725494410) · 0 赞
-- [在各种 AI里反复切换，科研真的更高效了吗？](http://zhuanlan.zhihu.com/p/1962631618977042473) · 0 赞
-- [在新加坡工作，为什么我最终选择了一副能对话的AI耳机来练英语？](http://zhuanlan.zhihu.com/p/1907831468014702679) · 0 赞
-- [解决 Overleaf 中插入 PDF 图片失败的问题：排查与修复](http://zhuanlan.zhihu.com/p/1896933834148254566) · 0 赞
-- [Self-attention 计算 QK^T 为什么要缩放？](http://zhuanlan.zhihu.com/p/695762892) · 0 赞
-- [Pytorch 如何使用 storage 实现参数 offload？](http://zhuanlan.zhihu.com/p/693734466) · 0 赞
-- [大模型推理框架 vLLM 源码解析（二）：Block 模块分配和管理](http://zhuanlan.zhihu.com/p/688660090) · 0 赞
-- [OpenAI 的视频生成大模型Sora的核心技术详解（一）：Diffusion模型原理和代码详解](http://zhuanlan.zhihu.com/p/683418039) · 0 赞
-- [大模型推理框架 vLLM 源码解析（一）：框架概览](http://zhuanlan.zhihu.com/p/681402162) · 0 赞
-- [LLM 学习笔记-Deepspeed-MoE 论文](http://zhuanlan.zhihu.com/p/670968683) · 0 赞
-- [LLM 学习笔记-transformers库的 PreTrainedModel 和 ModelOutput 到底是什么](http://zhuanlan.zhihu.com/p/670008015) · 0 赞
-- [LLM 入门笔记-Tokenizer](http://zhuanlan.zhihu.com/p/669901093) · 0 赞
-- [FlashAttention算法简介](http://zhuanlan.zhihu.com/p/645028049) · 0 赞
-- [《Transformer Quality in Linear Time》论文解读](http://zhuanlan.zhihu.com/p/639135451) · 0 赞
-- [AAAI2023论文 | 基于局部本征维度的高效神经架构搜索算法](http://zhuanlan.zhihu.com/p/591027254) · 0 赞
-- [自动机器学习框架Hyperbox：妈妈再也不用担心我不会设计模型和调参啦](http://zhuanlan.zhihu.com/p/585073718) · 0 赞
-- [深度学习并行训练算法一锅炖: DDP, TP, PP, ZeRO](http://zhuanlan.zhihu.com/p/581677880) · 0 赞
+- [巴西「主权大模型」“翻车”：当模型可以随便融合，怎么证明它偷了你的权重？](http://zhuanlan.zhihu.com/p/2050534438925235435) · 0 赞
+- [进阶篇 | 不靠人工设计，让遗传算法自己进化出 SOTA 的 LLM 剪枝指标](http://zhuanlan.zhihu.com/p/2050167804033292239) · 0 赞
+- [说人话：一文搞懂现在火热的 LLM agent 自进化原理](http://zhuanlan.zhihu.com/p/2049816837009969932) · 0 赞
+- [说人话：AI 这么火，为什么最后是卖内存的韩国海力士赚翻了？](http://zhuanlan.zhihu.com/p/2049596447658718796) · 0 赞
+- [为什么你的多智能体系统越加 agent 越慢？DeLM 用去中心化解了这个矛盾](http://zhuanlan.zhihu.com/p/2048720788275180090) · 0 赞
+- [当 AI 开始造自己：Anthropic 递归自我改进报告深度解读](http://zhuanlan.zhihu.com/p/2048719162080491226) · 0 赞
+- [NF-CoT：当 LLM 的思维链不再是文字，而是连续概率流](http://zhuanlan.zhihu.com/p/2048718395135244079) · 0 赞
+- [Transformer 真的需要三个投影矩阵吗？Q-K=V 让 KV Cache 直接砍半](http://zhuanlan.zhihu.com/p/2048717365010027716) · 0 赞
+- [FlashMemory-DeepSeek-V4：用 13.5% 的显存干 100% 的活，超长上下文推理的 less is more](http://zhuanlan.zhihu.com/p/2048428311282446662) · 0 赞
+- [Self-Harness：让 Agent 自己改自己的 harness，pass rate 最高翻倍](http://zhuanlan.zhihu.com/p/2048419900767703241) · 0 赞
+- [Mirage：把世界模型的 3D 记忆搬进 Latent Space，快 10 倍还省 55 倍显存](http://zhuanlan.zhihu.com/p/2048413967098418149) · 0 赞
+- [Frontier：LLM 推理仿真器，端到端误差从 51.7% 降到 2.6%](http://zhuanlan.zhihu.com/p/2048410700926674150) · 0 赞
+- [ReMoE：只动 Router 就让 MoE 推理快 2 倍？这才是端侧 MoE 部署该有的姿势](http://zhuanlan.zhihu.com/p/2045781500352894289) · 0 赞
+- [我们的书《动手学 AutoML》出版啦！从 NAS 到大模型优化，系统讲透这套方法论](http://zhuanlan.zhihu.com/p/2045618069813437716) · 0 赞
+- [LLM Agent Memory 全景拆解：从 RAG 到 KV Cache 到参数写入，100+ 篇工作的方法演进与真实取舍](http://zhuanlan.zhihu.com/p/2040092674112348271) · 0 赞
+- [LLMRouterBench：当所有 routing 方法被拉到同一起跑线，结果有些尴尬](http://zhuanlan.zhihu.com/p/2040085525135110665) · 0 赞
+- [EuroSys'26 | TokenFlow：让 LLM 流式输出真正「流」起来](http://zhuanlan.zhihu.com/p/2040043117089404821) · 0 赞
+- [EuroSys'26 | KUNSERVE 把冗余参数副本临时让给 KVCache，P99 TTFT 最快降 72×](http://zhuanlan.zhihu.com/p/2039714845847704017) · 0 赞
+- [EuroSys'26 | IBP 用无损 bit 压缩缓解 PCIe 瓶颈，GNN/DLRM/LLM 推理都能用](http://zhuanlan.zhihu.com/p/2039711887265420167) · 0 赞
+- [EuroSys'26 | PARD 提前丢掉注定超时的请求，goodput 最高提升 176%](http://zhuanlan.zhihu.com/p/2039687254512243195) · 0 赞
 
-## AGI / 大模型  (53 条)
+## 研究方法 / 读论文  (194 条)
 
+- [巴西「主权大模型」“翻车”：当模型可以随便融合，怎么证明它偷了你的权重？](http://zhuanlan.zhihu.com/p/2050534438925235435) · 0 赞
+- [进阶篇 | 不靠人工设计，让遗传算法自己进化出 SOTA 的 LLM 剪枝指标](http://zhuanlan.zhihu.com/p/2050167804033292239) · 0 赞
+- [说人话：一文搞懂现在火热的 LLM agent 自进化原理](http://zhuanlan.zhihu.com/p/2049816837009969932) · 0 赞
+- [为什么你的多智能体系统越加 agent 越慢？DeLM 用去中心化解了这个矛盾](http://zhuanlan.zhihu.com/p/2048720788275180090) · 0 赞
+- [当 AI 开始造自己：Anthropic 递归自我改进报告深度解读](http://zhuanlan.zhihu.com/p/2048719162080491226) · 0 赞
+- [NF-CoT：当 LLM 的思维链不再是文字，而是连续概率流](http://zhuanlan.zhihu.com/p/2048718395135244079) · 0 赞
+- [Transformer 真的需要三个投影矩阵吗？Q-K=V 让 KV Cache 直接砍半](http://zhuanlan.zhihu.com/p/2048717365010027716) · 0 赞
+- [FlashMemory-DeepSeek-V4：用 13.5% 的显存干 100% 的活，超长上下文推理的 less is more](http://zhuanlan.zhihu.com/p/2048428311282446662) · 0 赞
+- [Self-Harness：让 Agent 自己改自己的 harness，pass rate 最高翻倍](http://zhuanlan.zhihu.com/p/2048419900767703241) · 0 赞
+- [Mirage：把世界模型的 3D 记忆搬进 Latent Space，快 10 倍还省 55 倍显存](http://zhuanlan.zhihu.com/p/2048413967098418149) · 0 赞
+- [Frontier：LLM 推理仿真器，端到端误差从 51.7% 降到 2.6%](http://zhuanlan.zhihu.com/p/2048410700926674150) · 0 赞
+- [ReMoE：只动 Router 就让 MoE 推理快 2 倍？这才是端侧 MoE 部署该有的姿势](http://zhuanlan.zhihu.com/p/2045781500352894289) · 0 赞
+- [我们的书《动手学 AutoML》出版啦！从 NAS 到大模型优化，系统讲透这套方法论](http://zhuanlan.zhihu.com/p/2045618069813437716) · 0 赞
+- [LLM Agent Memory 全景拆解：从 RAG 到 KV Cache 到参数写入，100+ 篇工作的方法演进与真实取舍](http://zhuanlan.zhihu.com/p/2040092674112348271) · 0 赞
+- [LLMRouterBench：当所有 routing 方法被拉到同一起跑线，结果有些尴尬](http://zhuanlan.zhihu.com/p/2040085525135110665) · 0 赞
+- [EuroSys'26 | TokenFlow：让 LLM 流式输出真正「流」起来](http://zhuanlan.zhihu.com/p/2040043117089404821) · 0 赞
+- [EuroSys'26 | KUNSERVE 把冗余参数副本临时让给 KVCache，P99 TTFT 最快降 72×](http://zhuanlan.zhihu.com/p/2039714845847704017) · 0 赞
+- [EuroSys'26 | IBP 用无损 bit 压缩缓解 PCIe 瓶颈，GNN/DLRM/LLM 推理都能用](http://zhuanlan.zhihu.com/p/2039711887265420167) · 0 赞
+- [EuroSys'26 | PARD 提前丢掉注定超时的请求，goodput 最高提升 176%](http://zhuanlan.zhihu.com/p/2039687254512243195) · 0 赞
+- [EuroSys26 | MFS 把整个 model family 融进一套嵌套模型，KVCache 跨 tier 直接共享](http://zhuanlan.zhihu.com/p/2039679928266904690) · 0 赞
+
+## 工具 / 效率  (179 条)
+
+- [巴西「主权大模型」“翻车”：当模型可以随便融合，怎么证明它偷了你的权重？](http://zhuanlan.zhihu.com/p/2050534438925235435) · 0 赞
+- [进阶篇 | 不靠人工设计，让遗传算法自己进化出 SOTA 的 LLM 剪枝指标](http://zhuanlan.zhihu.com/p/2050167804033292239) · 0 赞
+- [说人话：一文搞懂现在火热的 LLM agent 自进化原理](http://zhuanlan.zhihu.com/p/2049816837009969932) · 0 赞
+- [为什么你的多智能体系统越加 agent 越慢？DeLM 用去中心化解了这个矛盾](http://zhuanlan.zhihu.com/p/2048720788275180090) · 0 赞
+- [当 AI 开始造自己：Anthropic 递归自我改进报告深度解读](http://zhuanlan.zhihu.com/p/2048719162080491226) · 0 赞
+- [NF-CoT：当 LLM 的思维链不再是文字，而是连续概率流](http://zhuanlan.zhihu.com/p/2048718395135244079) · 0 赞
+- [Transformer 真的需要三个投影矩阵吗？Q-K=V 让 KV Cache 直接砍半](http://zhuanlan.zhihu.com/p/2048717365010027716) · 0 赞
+- [FlashMemory-DeepSeek-V4：用 13.5% 的显存干 100% 的活，超长上下文推理的 less is more](http://zhuanlan.zhihu.com/p/2048428311282446662) · 0 赞
+- [Self-Harness：让 Agent 自己改自己的 harness，pass rate 最高翻倍](http://zhuanlan.zhihu.com/p/2048419900767703241) · 0 赞
+- [Mirage：把世界模型的 3D 记忆搬进 Latent Space，快 10 倍还省 55 倍显存](http://zhuanlan.zhihu.com/p/2048413967098418149) · 0 赞
+- [Frontier：LLM 推理仿真器，端到端误差从 51.7% 降到 2.6%](http://zhuanlan.zhihu.com/p/2048410700926674150) · 0 赞
+- [ReMoE：只动 Router 就让 MoE 推理快 2 倍？这才是端侧 MoE 部署该有的姿势](http://zhuanlan.zhihu.com/p/2045781500352894289) · 0 赞
+- [我们的书《动手学 AutoML》出版啦！从 NAS 到大模型优化，系统讲透这套方法论](http://zhuanlan.zhihu.com/p/2045618069813437716) · 0 赞
+- [LLMRouterBench：当所有 routing 方法被拉到同一起跑线，结果有些尴尬](http://zhuanlan.zhihu.com/p/2040085525135110665) · 0 赞
+- [EuroSys'26 | TokenFlow：让 LLM 流式输出真正「流」起来](http://zhuanlan.zhihu.com/p/2040043117089404821) · 0 赞
+- [EuroSys'26 | IBP 用无损 bit 压缩缓解 PCIe 瓶颈，GNN/DLRM/LLM 推理都能用](http://zhuanlan.zhihu.com/p/2039711887265420167) · 0 赞
+- [EuroSys'26 | PARD 提前丢掉注定超时的请求，goodput 最高提升 176%](http://zhuanlan.zhihu.com/p/2039687254512243195) · 0 赞
+- [Fast26 | SolidAttention 内存不够，SSD 来凑。笔记本也能跑 128k 上下文 LLM](http://zhuanlan.zhihu.com/p/2039385982823355233) · 0 赞
+- [Fast26 | LLM 推理启动慢？华为用一个「可编程 Page Cache」把模型加载砍了 79%](http://zhuanlan.zhihu.com/p/2038940931668317492) · 0 赞
+- [Fast26 | KV Cache 的两层存储(内存+SSD)到底卡在哪？](http://zhuanlan.zhihu.com/p/2038938063070607023) · 0 赞
+
+## 机器学习 / 深度学习  (238 条)
+
+- [进阶篇 | 不靠人工设计，让遗传算法自己进化出 SOTA 的 LLM 剪枝指标](http://zhuanlan.zhihu.com/p/2050167804033292239) · 0 赞
+- [说人话：一文搞懂现在火热的 LLM agent 自进化原理](http://zhuanlan.zhihu.com/p/2049816837009969932) · 0 赞
+- [说人话：AI 这么火，为什么最后是卖内存的韩国海力士赚翻了？](http://zhuanlan.zhihu.com/p/2049596447658718796) · 0 赞
+- [NF-CoT：当 LLM 的思维链不再是文字，而是连续概率流](http://zhuanlan.zhihu.com/p/2048718395135244079) · 0 赞
+- [Transformer 真的需要三个投影矩阵吗？Q-K=V 让 KV Cache 直接砍半](http://zhuanlan.zhihu.com/p/2048717365010027716) · 0 赞
+- [FlashMemory-DeepSeek-V4：用 13.5% 的显存干 100% 的活，超长上下文推理的 less is more](http://zhuanlan.zhihu.com/p/2048428311282446662) · 0 赞
+- [我们的书《动手学 AutoML》出版啦！从 NAS 到大模型优化，系统讲透这套方法论](http://zhuanlan.zhihu.com/p/2045618069813437716) · 0 赞
+- [LLMRouterBench：当所有 routing 方法被拉到同一起跑线，结果有些尴尬](http://zhuanlan.zhihu.com/p/2040085525135110665) · 0 赞
+- [EuroSys'26 | TokenFlow：让 LLM 流式输出真正「流」起来](http://zhuanlan.zhihu.com/p/2040043117089404821) · 0 赞
+- [EuroSys26 | MFS 把整个 model family 融进一套嵌套模型，KVCache 跨 tier 直接共享](http://zhuanlan.zhihu.com/p/2039679928266904690) · 0 赞
+- [Eurosys26 | LLMFolder用编译器「常量折叠」的思路压缩 LLM,把 FFN 参数砍了80%](http://zhuanlan.zhihu.com/p/2039392963726464032) · 0 赞
+- [Fast26 | LLM 推理启动慢？华为用一个「可编程 Page Cache」把模型加载砍了 79%](http://zhuanlan.zhihu.com/p/2038940931668317492) · 0 赞
+- [Fast26 | KV Cache 的两层存储(内存+SSD)到底卡在哪？](http://zhuanlan.zhihu.com/p/2038938063070607023) · 0 赞
+- [Eurosys26 | LoRAFusion 把内存带宽浪费和pipeline bubble一起干掉,吞吐量提升1.96倍](http://zhuanlan.zhihu.com/p/2038726965591549739) · 0 赞
+- [Eurosys26 | FineMoE如何用「细粒度」打破MoE推理的显存-延迟死局](http://zhuanlan.zhihu.com/p/2038725437078106990) · 0 赞
+- [ICML25 Workshop | PiKV 处理MoE 推理的 KV Cache 问题](http://zhuanlan.zhihu.com/p/2037525754863472651) · 0 赞
+- [ICML25 | EPIC：KV Cache 复用的「编译-链接」范式（附可运行代码复现）](http://zhuanlan.zhihu.com/p/2036841445596862090) · 0 赞
+- [NeurIPS 2024 | Read-ME 把 Dense LLM 变成 MoE 还能推理提速](http://zhuanlan.zhihu.com/p/2036836718767255979) · 0 赞
+- [说人话理解 RoPE：从 sin/cos 位置编码到旋转矩阵，一次讲清楚](http://zhuanlan.zhihu.com/p/2032881588019663675) · 0 赞
+- [多 Agent 协作不需要说「人话」？LatentMAS 让 LLM 在隐空间里直接协作](http://zhuanlan.zhihu.com/p/2032219144121209209) · 0 赞
+
+## 职业 / 成长  (86 条)
+
+- [进阶篇 | 不靠人工设计，让遗传算法自己进化出 SOTA 的 LLM 剪枝指标](http://zhuanlan.zhihu.com/p/2050167804033292239) · 0 赞
+- [说人话：一文搞懂现在火热的 LLM agent 自进化原理](http://zhuanlan.zhihu.com/p/2049816837009969932) · 0 赞
+- [当 AI 开始造自己：Anthropic 递归自我改进报告深度解读](http://zhuanlan.zhihu.com/p/2048719162080491226) · 0 赞
+- [Transformer 真的需要三个投影矩阵吗？Q-K=V 让 KV Cache 直接砍半](http://zhuanlan.zhihu.com/p/2048717365010027716) · 0 赞
+- [Mirage：把世界模型的 3D 记忆搬进 Latent Space，快 10 倍还省 55 倍显存](http://zhuanlan.zhihu.com/p/2048413967098418149) · 0 赞
+- [我们的书《动手学 AutoML》出版啦！从 NAS 到大模型优化，系统讲透这套方法论](http://zhuanlan.zhihu.com/p/2045618069813437716) · 0 赞
+- [LLM Agent Memory 全景拆解：从 RAG 到 KV Cache 到参数写入，100+ 篇工作的方法演进与真实取舍](http://zhuanlan.zhihu.com/p/2040092674112348271) · 0 赞
+- [LLMRouterBench：当所有 routing 方法被拉到同一起跑线，结果有些尴尬](http://zhuanlan.zhihu.com/p/2040085525135110665) · 0 赞
+- [Fast26 | KV Cache 的两层存储(内存+SSD)到底卡在哪？](http://zhuanlan.zhihu.com/p/2038938063070607023) · 0 赞
+- [Google 训练一个「会管技能库」的 AI——SkillOS 让 agent 真正越用越强](http://zhuanlan.zhihu.com/p/2037520526248293388) · 0 赞
+- [Neurips25 | KVCOMM：让多 Agent 系统的 KV Cache 真正“通起来”，TTFT 直接砍掉 7.8 倍](http://zhuanlan.zhihu.com/p/2032027171540165158) · 0 赞
 - [当 AI 开始学会"记住"：LLM Agent 记忆系统的统一视角](http://zhuanlan.zhihu.com/p/2023430185664423077) · 0 赞
 - [DAC2026 | ExpertFlow：高效 MoE 推理系统，单卡部署省内存提速度](http://zhuanlan.zhihu.com/p/2010728514375144803) · 0 赞
 - [A*STAR CFAR 带薪实习生（1200-1400SGD每月）招募](http://zhuanlan.zhihu.com/p/1972054520587621092) · 0 赞
-- [LLM技术详解好文指路明灯](http://zhuanlan.zhihu.com/p/1965423420725494410) · 0 赞
-- [LLM 场景下的强化学习技术](http://zhuanlan.zhihu.com/p/1964814898312769887) · 0 赞
 - [在各种 AI里反复切换，科研真的更高效了吗？](http://zhuanlan.zhihu.com/p/1962631618977042473) · 0 赞
-- [在新加坡工作，为什么我最终选择了一副能对话的AI耳机来练英语？](http://zhuanlan.zhihu.com/p/1907831468014702679) · 0 赞
 - [解决 Overleaf 中插入 PDF 图片失败的问题：排查与修复](http://zhuanlan.zhihu.com/p/1896933834148254566) · 0 赞
 - [新加坡科技局大模型实习招聘](http://zhuanlan.zhihu.com/p/25079568651) · 0 赞
 - [科大讯飞最近发布会上新发布的星火语音同传大模型有哪些升级？实用性如何？](http://zhuanlan.zhihu.com/p/18727702327) · 0 赞
 - [新加坡 A*STAR 实习生招聘✨](http://zhuanlan.zhihu.com/p/6416905165) · 0 赞
-- [大模型推理框架 vLLM 源码解析（二）：Block 模块分配和管理](http://zhuanlan.zhihu.com/p/688660090) · 0 赞
-- [OpenAI 的视频生成大模型Sora的核心技术详解（一）：Diffusion模型原理和代码详解](http://zhuanlan.zhihu.com/p/683418039) · 0 赞
-- [大模型推理框架 vLLM 源码解析（一）：框架概览](http://zhuanlan.zhihu.com/p/681402162) · 0 赞
-- [LLM 学习笔记-Deepspeed-MoE 论文](http://zhuanlan.zhihu.com/p/670968683) · 0 赞
-- [LLM 学习笔记-transformers库的 PreTrainedModel 和 ModelOutput 到底是什么](http://zhuanlan.zhihu.com/p/670008015) · 0 赞
-- [LLM 入门笔记-Tokenizer](http://zhuanlan.zhihu.com/p/669901093) · 0 赞
-- [Megatron-Deepspeed：用Wikipedia数据集训练GPT实战笔记](http://zhuanlan.zhihu.com/p/668913089) · 0 赞
-- [GPT 训练和推理过程示意图](http://zhuanlan.zhihu.com/p/668897662) · 0 赞
-- [AAAI2023论文 | 基于局部本征维度的高效神经架构搜索算法](http://zhuanlan.zhihu.com/p/591027254) · 0 赞
+- [香港留学经验分享-英语考试篇](http://zhuanlan.zhihu.com/p/669191062) · 0 赞
 
-## 强化学习 RL  (49 条)
+## 思考 / 观点  (88 条)
 
+- [当 AI 开始造自己：Anthropic 递归自我改进报告深度解读](http://zhuanlan.zhihu.com/p/2048719162080491226) · 0 赞
+- [NF-CoT：当 LLM 的思维链不再是文字，而是连续概率流](http://zhuanlan.zhihu.com/p/2048718395135244079) · 0 赞
+- [FlashMemory-DeepSeek-V4：用 13.5% 的显存干 100% 的活，超长上下文推理的 less is more](http://zhuanlan.zhihu.com/p/2048428311282446662) · 0 赞
+- [Self-Harness：让 Agent 自己改自己的 harness，pass rate 最高翻倍](http://zhuanlan.zhihu.com/p/2048419900767703241) · 0 赞
+- [Mirage：把世界模型的 3D 记忆搬进 Latent Space，快 10 倍还省 55 倍显存](http://zhuanlan.zhihu.com/p/2048413967098418149) · 0 赞
+- [Frontier：LLM 推理仿真器，端到端误差从 51.7% 降到 2.6%](http://zhuanlan.zhihu.com/p/2048410700926674150) · 0 赞
+- [我们的书《动手学 AutoML》出版啦！从 NAS 到大模型优化，系统讲透这套方法论](http://zhuanlan.zhihu.com/p/2045618069813437716) · 0 赞
+- [LLM Agent Memory 全景拆解：从 RAG 到 KV Cache 到参数写入，100+ 篇工作的方法演进与真实取舍](http://zhuanlan.zhihu.com/p/2040092674112348271) · 0 赞
+- [EuroSys'26 | TokenFlow：让 LLM 流式输出真正「流」起来](http://zhuanlan.zhihu.com/p/2040043117089404821) · 0 赞
+- [EuroSys'26 | PARD 提前丢掉注定超时的请求，goodput 最高提升 176%](http://zhuanlan.zhihu.com/p/2039687254512243195) · 0 赞
+- [Fast26 | KV Cache 的两层存储(内存+SSD)到底卡在哪？](http://zhuanlan.zhihu.com/p/2038938063070607023) · 0 赞
+- [Eurosys26 | LoRAFusion 把内存带宽浪费和pipeline bubble一起干掉,吞吐量提升1.96倍](http://zhuanlan.zhihu.com/p/2038726965591549739) · 0 赞
+- [多 Agent 协作不需要说「人话」？LatentMAS 让 LLM 在隐空间里直接协作](http://zhuanlan.zhihu.com/p/2032219144121209209) · 0 赞
+- [Neurips25 | KVCOMM：让多 Agent 系统的 KV Cache 真正“通起来”，TTFT 直接砍掉 7.8 倍](http://zhuanlan.zhihu.com/p/2032027171540165158) · 0 赞
+- [【论文分享】TokenDance 解决多 Agent LLM 推理的 KV Cache 冗余问题](http://zhuanlan.zhihu.com/p/2031034890666390988) · 0 赞
+- [当 AI 开始学会"记住"：LLM Agent 记忆系统的统一视角](http://zhuanlan.zhihu.com/p/2023430185664423077) · 0 赞
+- [DAC2026 | ExpertFlow：高效 MoE 推理系统，单卡部署省内存提速度](http://zhuanlan.zhihu.com/p/2010728514375144803) · 0 赞
+- [LLM技术详解好文指路明灯](http://zhuanlan.zhihu.com/p/1965423420725494410) · 0 赞
+- [在各种 AI里反复切换，科研真的更高效了吗？](http://zhuanlan.zhihu.com/p/1962631618977042473) · 0 赞
+- [在新加坡工作，为什么我最终选择了一副能对话的AI耳机来练英语？](http://zhuanlan.zhihu.com/p/1907831468014702679) · 0 赞
+
+## 强化学习 RL  (59 条)
+
+- [NF-CoT：当 LLM 的思维链不再是文字，而是连续概率流](http://zhuanlan.zhihu.com/p/2048718395135244079) · 0 赞
+- [Frontier：LLM 推理仿真器，端到端误差从 51.7% 降到 2.6%](http://zhuanlan.zhihu.com/p/2048410700926674150) · 0 赞
+- [ReMoE：只动 Router 就让 MoE 推理快 2 倍？这才是端侧 MoE 部署该有的姿势](http://zhuanlan.zhihu.com/p/2045781500352894289) · 0 赞
+- [LLM Agent Memory 全景拆解：从 RAG 到 KV Cache 到参数写入，100+ 篇工作的方法演进与真实取舍](http://zhuanlan.zhihu.com/p/2040092674112348271) · 0 赞
+- [EuroSys'26 | PARD 提前丢掉注定超时的请求，goodput 最高提升 176%](http://zhuanlan.zhihu.com/p/2039687254512243195) · 0 赞
+- [Fast26 | LLM 推理启动慢？华为用一个「可编程 Page Cache」把模型加载砍了 79%](http://zhuanlan.zhihu.com/p/2038940931668317492) · 0 赞
+- [ICML25 Workshop | PiKV 处理MoE 推理的 KV Cache 问题](http://zhuanlan.zhihu.com/p/2037525754863472651) · 0 赞
+- [Google 训练一个「会管技能库」的 AI——SkillOS 让 agent 真正越用越强](http://zhuanlan.zhihu.com/p/2037520526248293388) · 0 赞
 - [当 AI 开始学会"记住"：LLM Agent 记忆系统的统一视角](http://zhuanlan.zhihu.com/p/2023430185664423077) · 0 赞
 - [A*STAR CFAR 带薪实习生（1200-1400SGD每月）招募](http://zhuanlan.zhihu.com/p/1972054520587621092) · 0 赞
 - [LLM技术详解好文指路明灯](http://zhuanlan.zhihu.com/p/1965423420725494410) · 0 赞
@@ -63,109 +163,10 @@
 - [强化学习3-Policy gradient](http://zhuanlan.zhihu.com/p/359282662) · 0 赞
 - [强化学习2-动作价值函数&DQN](http://zhuanlan.zhihu.com/p/359110697) · 0 赞
 - [强化学习1-基础概念(state,action,reward,policy)](http://zhuanlan.zhihu.com/p/358787399) · 0 赞
-- [中文版深度强化学习课程6：Monte Carlo](http://zhuanlan.zhihu.com/p/358717630) · 0 赞
-- [中文版深度强化学习课程5：](http://zhuanlan.zhihu.com/p/358716614) · 0 赞
-- [中文版深度强化学习课程4：Actor-Critic](http://zhuanlan.zhihu.com/p/358716156) · 0 赞
-- [中文版深度强化学习课程3：策略学习](http://zhuanlan.zhihu.com/p/358715378) · 0 赞
-- [中文版深度强化学习课程2：动作价值函数](http://zhuanlan.zhihu.com/p/358714461) · 0 赞
-- [中文版深度强化学习课程1：基础概念](http://zhuanlan.zhihu.com/p/358712928) · 0 赞
-- [华为诺亚AutoML框架-Vega：(2) 代码结构](http://zhuanlan.zhihu.com/p/306462348) · 0 赞
-- [自动搜索损失函数？AM-LFS：AutoML for Loss Function Search](http://zhuanlan.zhihu.com/p/180465704) · 0 赞
 
-## 研究方法 / 读论文  (145 条)
+## 具身智能 / 机器人  (10 条)
 
-- [当 AI 开始学会"记住"：LLM Agent 记忆系统的统一视角](http://zhuanlan.zhihu.com/p/2023430185664423077) · 0 赞
-- [DAC2026 | ExpertFlow：高效 MoE 推理系统，单卡部署省内存提速度](http://zhuanlan.zhihu.com/p/2010728514375144803) · 0 赞
-- [A*STAR CFAR 带薪实习生（1200-1400SGD每月）招募](http://zhuanlan.zhihu.com/p/1972054520587621092) · 0 赞
-- [在各种 AI里反复切换，科研真的更高效了吗？](http://zhuanlan.zhihu.com/p/1962631618977042473) · 0 赞
-- [在新加坡工作，为什么我最终选择了一副能对话的AI耳机来练英语？](http://zhuanlan.zhihu.com/p/1907831468014702679) · 0 赞
-- [新加坡科技局大模型实习招聘](http://zhuanlan.zhihu.com/p/25079568651) · 0 赞
-- [OpenAI 的视频生成大模型Sora的核心技术详解（一）：Diffusion模型原理和代码详解](http://zhuanlan.zhihu.com/p/683418039) · 0 赞
-- [LLM 学习笔记-Deepspeed-MoE 论文](http://zhuanlan.zhihu.com/p/670968683) · 0 赞
-- [香港留学经验分享-英语考试篇](http://zhuanlan.zhihu.com/p/669191062) · 0 赞
-- [《Transformer Quality in Linear Time》论文解读](http://zhuanlan.zhihu.com/p/639135451) · 0 赞
-- [NAS Benchmark 数据集汇总](http://zhuanlan.zhihu.com/p/613711139) · 0 赞
-- [AAAI2023论文 | 基于局部本征维度的高效神经架构搜索算法](http://zhuanlan.zhihu.com/p/591027254) · 0 赞
-- [自动机器学习框架Hyperbox：妈妈再也不用担心我不会设计模型和调参啦](http://zhuanlan.zhihu.com/p/585073718) · 0 赞
-- [深度学习并行训练算法一锅炖: DDP, TP, PP, ZeRO](http://zhuanlan.zhihu.com/p/581677880) · 0 赞
-- [AutoML方向 博士毕业论文汇总](http://zhuanlan.zhihu.com/p/569902591) · 0 赞
-- [ICML2022论文 | 虚拟同构化学习：抵御联邦学习中的数据异构性](http://zhuanlan.zhihu.com/p/548508633) · 0 赞
-- [(转载)浅谈高斯过程回归](http://zhuanlan.zhihu.com/p/547953159) · 0 赞
-- [ECCV2022论文 | EAGAN：一种高效的用于搜索GAN 的两阶段进化算法](http://zhuanlan.zhihu.com/p/542169585) · 0 赞
-- [MICCAI2022论文 | 进化多目标架构搜索框架：在COVID-19三维CT分类中的应用](http://zhuanlan.zhihu.com/p/542168478) · 0 赞
-- [NVIDIA GPU Cloud (NGC)集群使用笔记](http://zhuanlan.zhihu.com/p/534424910) · 0 赞
-
-## 职业 / 成长  (74 条)
-
-- [当 AI 开始学会"记住"：LLM Agent 记忆系统的统一视角](http://zhuanlan.zhihu.com/p/2023430185664423077) · 0 赞
-- [DAC2026 | ExpertFlow：高效 MoE 推理系统，单卡部署省内存提速度](http://zhuanlan.zhihu.com/p/2010728514375144803) · 0 赞
-- [A*STAR CFAR 带薪实习生（1200-1400SGD每月）招募](http://zhuanlan.zhihu.com/p/1972054520587621092) · 0 赞
-- [在各种 AI里反复切换，科研真的更高效了吗？](http://zhuanlan.zhihu.com/p/1962631618977042473) · 0 赞
-- [解决 Overleaf 中插入 PDF 图片失败的问题：排查与修复](http://zhuanlan.zhihu.com/p/1896933834148254566) · 0 赞
-- [新加坡科技局大模型实习招聘](http://zhuanlan.zhihu.com/p/25079568651) · 0 赞
-- [科大讯飞最近发布会上新发布的星火语音同传大模型有哪些升级？实用性如何？](http://zhuanlan.zhihu.com/p/18727702327) · 0 赞
-- [新加坡 A*STAR 实习生招聘✨](http://zhuanlan.zhihu.com/p/6416905165) · 0 赞
-- [香港留学经验分享-英语考试篇](http://zhuanlan.zhihu.com/p/669191062) · 0 赞
-- [自动机器学习框架Hyperbox：妈妈再也不用担心我不会设计模型和调参啦](http://zhuanlan.zhihu.com/p/585073718) · 0 赞
-- [ICML2022论文 | 虚拟同构化学习：抵御联邦学习中的数据异构性](http://zhuanlan.zhihu.com/p/548508633) · 0 赞
-- [详解Pytorch里的pin_memory 和 non_blocking](http://zhuanlan.zhihu.com/p/477870660) · 0 赞
-- [【帮推|实习招聘】商汤-研究员-深度学习框架应用实习生](http://zhuanlan.zhihu.com/p/376429851) · 0 赞
-- [Transformer自下而上理解(3) Self-attention机制](http://zhuanlan.zhihu.com/p/374868669) · 0 赞
-- [Retiarii：微软在NAS框架上的新动作，已被顶会OSDI2020接收](http://zhuanlan.zhihu.com/p/372128920) · 0 赞
-- [强化学习1-基础概念(state,action,reward,policy)](http://zhuanlan.zhihu.com/p/358787399) · 0 赞
-- [Python的super函数直观理解](http://zhuanlan.zhihu.com/p/356720970) · 0 赞
-- [超详细且包教包会的梯度下降优化算法概览](http://zhuanlan.zhihu.com/p/348246286) · 0 赞
-- [AAAI21-Rebuttal起死回生示例](http://zhuanlan.zhihu.com/p/344196352) · 0 赞
-- [通过损失函数优化提高训练速度、准确性和数据利用率](http://zhuanlan.zhihu.com/p/299693390) · 0 赞
-
-## 工具 / 效率  (136 条)
-
-- [当 AI 开始学会"记住"：LLM Agent 记忆系统的统一视角](http://zhuanlan.zhihu.com/p/2023430185664423077) · 0 赞
-- [LLM技术详解好文指路明灯](http://zhuanlan.zhihu.com/p/1965423420725494410) · 0 赞
-- [LLM 场景下的强化学习技术](http://zhuanlan.zhihu.com/p/1964814898312769887) · 0 赞
-- [二叉树的前中后序遍历到底是什么？](http://zhuanlan.zhihu.com/p/1963989382580109799) · 0 赞
-- [在各种 AI里反复切换，科研真的更高效了吗？](http://zhuanlan.zhihu.com/p/1962631618977042473) · 0 赞
-- [在新加坡工作，为什么我最终选择了一副能对话的AI耳机来练英语？](http://zhuanlan.zhihu.com/p/1907831468014702679) · 0 赞
-- [使用 Node.js 将 Markdown 转换为 HTML 并截图为小红书风格长图](http://zhuanlan.zhihu.com/p/1896974320389038875) · 0 赞
-- [解决 Overleaf 中插入 PDF 图片失败的问题：排查与修复](http://zhuanlan.zhihu.com/p/1896933834148254566) · 0 赞
-- [新加坡科技局大模型实习招聘](http://zhuanlan.zhihu.com/p/25079568651) · 0 赞
-- [Self-attention 计算 QK^T 为什么要缩放？](http://zhuanlan.zhihu.com/p/695762892) · 0 赞
-- [Pytorch 如何使用 storage 实现参数 offload？](http://zhuanlan.zhihu.com/p/693734466) · 0 赞
-- [大模型推理框架 vLLM 源码解析（二）：Block 模块分配和管理](http://zhuanlan.zhihu.com/p/688660090) · 0 赞
-- [OpenAI 的视频生成大模型Sora的核心技术详解（一）：Diffusion模型原理和代码详解](http://zhuanlan.zhihu.com/p/683418039) · 0 赞
-- [大模型推理框架 vLLM 源码解析（一）：框架概览](http://zhuanlan.zhihu.com/p/681402162) · 0 赞
-- [LLM 学习笔记-Deepspeed-MoE 论文](http://zhuanlan.zhihu.com/p/670968683) · 0 赞
-- [LLM 学习笔记-transformers库的 PreTrainedModel 和 ModelOutput 到底是什么](http://zhuanlan.zhihu.com/p/670008015) · 0 赞
-- [LLM 入门笔记-Tokenizer](http://zhuanlan.zhihu.com/p/669901093) · 0 赞
-- [Megatron-Deepspeed：用Wikipedia数据集训练GPT实战笔记](http://zhuanlan.zhihu.com/p/668913089) · 0 赞
-- [FlashAttention算法简介](http://zhuanlan.zhihu.com/p/645028049) · 0 赞
-- [《Transformer Quality in Linear Time》论文解读](http://zhuanlan.zhihu.com/p/639135451) · 0 赞
-
-## 思考 / 观点  (71 条)
-
-- [当 AI 开始学会"记住"：LLM Agent 记忆系统的统一视角](http://zhuanlan.zhihu.com/p/2023430185664423077) · 0 赞
-- [DAC2026 | ExpertFlow：高效 MoE 推理系统，单卡部署省内存提速度](http://zhuanlan.zhihu.com/p/2010728514375144803) · 0 赞
-- [LLM技术详解好文指路明灯](http://zhuanlan.zhihu.com/p/1965423420725494410) · 0 赞
-- [在各种 AI里反复切换，科研真的更高效了吗？](http://zhuanlan.zhihu.com/p/1962631618977042473) · 0 赞
-- [在新加坡工作，为什么我最终选择了一副能对话的AI耳机来练英语？](http://zhuanlan.zhihu.com/p/1907831468014702679) · 0 赞
-- [使用 Node.js 将 Markdown 转换为 HTML 并截图为小红书风格长图](http://zhuanlan.zhihu.com/p/1896974320389038875) · 0 赞
-- [大模型推理框架 vLLM 源码解析（二）：Block 模块分配和管理](http://zhuanlan.zhihu.com/p/688660090) · 0 赞
-- [大模型推理框架 vLLM 源码解析（一）：框架概览](http://zhuanlan.zhihu.com/p/681402162) · 0 赞
-- [LLM 学习笔记-Deepspeed-MoE 论文](http://zhuanlan.zhihu.com/p/670968683) · 0 赞
-- [LLM 入门笔记-Tokenizer](http://zhuanlan.zhihu.com/p/669901093) · 0 赞
-- [香港留学经验分享-英语考试篇](http://zhuanlan.zhihu.com/p/669191062) · 0 赞
-- [AAAI2023论文 | 基于局部本征维度的高效神经架构搜索算法](http://zhuanlan.zhihu.com/p/591027254) · 0 赞
-- [自动机器学习框架Hyperbox：妈妈再也不用担心我不会设计模型和调参啦](http://zhuanlan.zhihu.com/p/585073718) · 0 赞
-- [(转载)浅谈高斯过程回归](http://zhuanlan.zhihu.com/p/547953159) · 0 赞
-- [MICCAI2022论文 | 进化多目标架构搜索框架：在COVID-19三维CT分类中的应用](http://zhuanlan.zhihu.com/p/542168478) · 0 赞
-- [[CVPR2021] AttentiveNAS： Improving Neural Architecture Search via Attentive Sampling](http://zhuanlan.zhihu.com/p/505556494) · 0 赞
-- [科研论文配色【不断更新】](http://zhuanlan.zhihu.com/p/457797561) · 0 赞
-- [ICCV 2021 | BossNAS: Exploring Hybrid CNN-transformers with Block-wisely Self-supervised NAS](http://zhuanlan.zhihu.com/p/448262248) · 0 赞
-- [ICLR2021 | The Intrinsic Dimension of Images and Its Impact on Learning](http://zhuanlan.zhihu.com/p/443219643) · 0 赞
-- [NAS-Bench-101: Towards Reproducible Neural Architecture Search](http://zhuanlan.zhihu.com/p/385532786) · 0 赞
-
-## 具身智能 / 机器人  (9 条)
-
+- [Mirage：把世界模型的 3D 记忆搬进 Latent Space，快 10 倍还省 55 倍显存](http://zhuanlan.zhihu.com/p/2048413967098418149) · 0 赞
 - [【GAMES101-现代计算机图形学课程笔记】Lecture 07 Shading (着色&漫反射)](http://zhuanlan.zhihu.com/p/136945620) · 0 赞
 - [【论文笔记系列】AutoML：A Survey of State-of-the-art （上）](http://zhuanlan.zhihu.com/p/106205363) · 0 赞
 - [【转载】NeurIPS 2018 | 腾讯AI Lab详解3大热点：模型压缩、机器学习及最优化算法](http://zhuanlan.zhihu.com/p/55601795) · 0 赞
