@@ -231,7 +231,7 @@ tags: [LLM, 论文解读]
 
 > 插播：之前写的[《动手学 AutoML》](https://item.jd.com/14945889.html)终于出版了，从 NAS 到超参优化都有覆盖，适合想系统入门 AutoML 的同学。好了广告结束，现在进入正题。
 >
-> ![动手学AutoML书籍封面](/assets/img/book_cover_automl.png)
+> ![动手学AutoML书籍封面](https://github.com/marsggbo/marsggbo.github.io/blob/master/assets/img/book_cover_automl.png?raw=true)
 
 # 文章标题
 
@@ -243,7 +243,7 @@ tags: [LLM, 论文解读]
 ...
 ```
 
-- **书籍广告（默认开启，可关）**：紧跟 front matter 之后、正文 `# 标题` 之前。图片路径固定为 `/assets/img/book_cover_automl.png`。
+- **书籍广告（默认开启，可关）**：紧跟 front matter 之后、正文 `# 标题` 之前。图片路径固定为 `https://github.com/marsggbo/marsggbo.github.io/blob/master/assets/img/book_cover_automl.png?raw=true`。
   - **何时跳过广告**：当用户在 prompt 中**明确表达不要广告**时（如"不要书籍广告"、"取消广告"、"去掉广告"、"no book ad"、"skip ad"、"这次别加广告"等），生成的文章中**直接省略**整个广告引用块（含图片），从 front matter 之后直接跳到 `# 标题`。
   - **何时保留广告**：用户未提到广告时，或明确说"加上广告"、"keep ad"、"带广告" 时。
   - 判断原则：只看用户对**广告/书/promo** 的意图。其他对文章风格的要求不影响广告。
