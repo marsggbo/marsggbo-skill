@@ -1,1 +1,10 @@
-*pyc
+# Python
+*.pyc
+__pycache__/
+
+# 本地 venv —— 机器特定（activate/pyvenv.cfg 里有绝对路径），不要提交。
+# 换机器后跑 `bash scripts/env.sh` 会自动按 requirements.txt 重建。
+.venv/
+
+# 密钥 —— 绝不提交
+github_token

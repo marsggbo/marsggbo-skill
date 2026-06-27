@@ -1,0 +1,5 @@
+PyMuPDF
+requests
+beautifulsoup4
+markdownify
+Pillow

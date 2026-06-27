@@ -12,6 +12,26 @@ description: |
 
 ---
 
+## 环境与路径约定（跨机器可移植，最先读）
+
+**不要硬编码任何「用户机器特定」的绝对路径**（如 `~/.claude/skills/marsggbo`、`~/miniforge3/bin/python3`、`~/marsggbo-skill`）。不同电脑、不同 IDE 下，这个 skill 的位置可能是 `~/.claude/skills/marsggbo`、`~/.cursor/skills/marsggbo`，或别的地方；Python 也未必在同一处。本文档里出现的 `$SKILL_DIR` 和 `$PY` 都是**占位符**，按下面规则解析：
+
+- **`$SKILL_DIR`** = 触发本 skill 时注入给你的「Base directory for this skill」那个绝对路径。**以注入值为准**，每次都用它来拼后续路径（脚本、数据、references 全在它下面）。
+- **`$PY`** = 本 skill 专属 venv 的 Python 解释器。**会话里第一次需要跑脚本前，先解析一次**：
+
+  ```bash
+  bash "$SKILL_DIR/scripts/env.sh"
+  ```
+
+  `env.sh` 会自己定位 skill 目录（不依赖任何家目录假设），若 `.venv` 不存在则用系统 `python3` 自动创建并按 `requirements.txt`（PyMuPDF / requests / beautifulsoup4 / markdownify / Pillow）装好依赖，最后把解释器绝对路径打印到 stdout。
+
+- ⚠️ **Bash 工具每次调用是独立 shell，`export` 的变量不跨调用保留。** 所以不要指望 `SKILL_DIR=...; export PY=...` 能传到下一条命令。正确做法：把 `env.sh` 解析出的解释器**字面路径**和注入的 base directory 记在你自己的上下文里，之后每条命令直接写**字面绝对路径**（或在该条命令内联 `PY=$(bash "<base dir>/scripts/env.sh")` 后立刻使用）。
+- **输出目录**（文章/图片）默认 `~/Desktop/posts/`；若该机器没有 `~/Desktop`（如 Linux 服务器），改用 `~/posts/` 或当前工作目录下的 `posts/`，并在回复里告诉用户实际落盘位置。
+
+> 下文所有命令示例里的 `$PY`、`$SKILL_DIR` 请替换成上面解析出的实际值，不要原样照抄。
+
+---
+
 ## 身份速写
 
 - **网络 ID**：hexin / marsggbo
@@ -144,20 +164,22 @@ OR 直接用加粗关键概念 + 正文展开，适合短文/回答。
 
 所有爬取的历史写作在：
 
-- `~/marsggbo-skill/data/zhihu/articles.json` / `articles.md` — 228 篇专栏文章
-- `~/marsggbo-skill/data/zhihu/pins.json` / `pins.md` — 226 条知乎想法
-- `~/marsggbo-skill/data/zhihu/answers.json` / `answers.md` — 137 个回答
+- `$SKILL_DIR/data/zhihu/articles.json` / `articles.md` — 228 篇专栏文章
+- `$SKILL_DIR/data/zhihu/pins.json` / `pins.md` — 226 条知乎想法
+- `$SKILL_DIR/data/zhihu/answers.json` / `answers.md` — 137 个回答
 
 参考文件（自动生成）：
-- `~/.claude/skills/marsggbo/references/writing_style_examples.md` — 高赞文章开头样本
-- `~/.claude/skills/marsggbo/references/core_views.md` — 按主题聚合的核心观点
-- `~/.claude/skills/marsggbo/references/title_index.md` — 全量内容索引
+- `$SKILL_DIR/references/writing_style_examples.md` — 高赞文章开头样本
+- `$SKILL_DIR/references/core_views.md` — 按主题聚合的核心观点
+- `$SKILL_DIR/references/title_index.md` — 全量内容索引
+
+（`$SKILL_DIR` = 注入的 Base directory，见顶部「环境与路径约定」。）
 
 ### 使用原则
 
 1. **回答涉及具体技术前，先检索**：
    ```bash
-   ~/.claude/skills/marsggbo/references/search_zhihu.sh "关键词"
+   "$SKILL_DIR/references/search_zhihu.sh" "关键词"
    ```
 2. **对应历史写过的话题** → 先找原文，保持立场一致性
 3. **从未写过的话题** → 基于身份（A\*STAR 研究员，LLM/MoE/NAS 方向）推断，开头可以用"今天想和大家聊聊..."
@@ -192,16 +214,17 @@ posts/
 
 ### 第二步：提取论文资源
 
-使用 `paper_assets.py` 脚本提取所有图表（**不加 `--flat`**，图片自动存到 `assets/` 子目录）：
+先按顶部约定解析解释器：`PY=$(bash "$SKILL_DIR/scripts/env.sh")`，记下打印出的字面路径。然后用 `paper_assets.py` 提取所有图表（**不加 `--flat`**，图片自动存到 `assets/` 子目录）：
 
 ```bash
-~/miniforge3/bin/python3 ~/.claude/skills/marsggbo/paper_assets.py \
+# $PY、$SKILL_DIR 替换成实际解析值（见顶部「环境与路径约定」）
+"$PY" "$SKILL_DIR/paper_assets.py" \
   <paper_url_or_path> \
   --output-dir ~/Desktop/posts/<paper_slug>/ \
   --format summary
 
 # 如需额外渲染特定页（算法页、主结果表等）
-~/miniforge3/bin/python3 ~/.claude/skills/marsggbo/paper_assets.py \
+"$PY" "$SKILL_DIR/paper_assets.py" \
   <paper_url_or_path> \
   --output-dir ~/Desktop/posts/<paper_slug>/ \
   --render-pages 3,5,8 \
@@ -211,9 +234,44 @@ posts/
 
 图片保存到 `<paper_slug>/assets/` 子目录，文件名如 `001_Figure_1.png`。
 
-### 第三步：读取提取结果
+### 第三步：读取提取结果 + 逐张目视验证（必须）
 
-读取 `output_dir/assets.json`，记录所有图的 `rel_path` 和 `caption`，供写文章时引用。
+1. 读取 `output_dir/assets.json`，记录所有图的 `rel_path` 和 `caption`，供写文章时引用。
+2. **用 Read 工具逐张打开提取出的 png 检查**——这一步不能省。自动提取（无论 pdf 嵌入图还是整页渲染）在双栏论文上经常给出不可用的结果，典型症状：
+   - 跨双栏的「整页宽」图/表被栏边界从中间切断，只截到半张
+   - 只截到 caption 文字、没截到图本体（或反之）
+   - 整页渲染把多个图/表 + 正文糊在一张大图里，没法单独引用
+   宽图/表（双栏论文里横跨整页的总览框架图、主结果大表、多子图并排的横图）几乎必踩此坑。
+
+#### 第三步补充：用 PyMuPDF 手动重裁兜底（踩坑高发）
+
+一旦发现某张图不可用，**不要将就**，改用 PyMuPDF 按版面坐标手动重裁。配方如下（按页码 + 比例裁剪，DPI 拉到 3.2~3.4 倍）：
+
+```bash
+# "$PY" = 顶部 env.sh 解析出的解释器字面路径
+"$PY" - <<'PY'
+import fitz
+doc = fitz.open("/path/to/paper.pdf")
+H = doc[0].rect.height; W = doc[0].rect.width   # 常见 A4: H≈841.89, W≈595.28
+m = fitz.Matrix(3.2, 3.2)                        # 渲染倍率，越大越清晰
+def crop(page_idx, y0f, y1f, name, x0=18, x1=None):
+    # y0f/y1f 是相对页高的比例(0~1)；x0/x1 是绝对点坐标
+    if x1 is None: x1 = W - 18
+    clip = fitz.Rect(x0, y0f*H, x1, y1f*H)
+    pix = doc[page_idx].get_pixmap(matrix=m, clip=clip)
+    pix.save(f"/path/to/posts/<slug>/assets/{name}.png")
+    print(name, pix.width, pix.height)
+
+# 整页宽图/表：x 用整页宽(18..W-18)；y 比例靠目视微调
+crop(2, 0.082, 0.515, "table1_full")            # 跨栏大表
+# 单栏图/表：x 限定在左栏(≈56..300)或右栏(≈300..W-45)
+crop(6, 0.455, 0.745, "table2_full", x0=56, x1=300)
+PY
+```
+
+工作流：先用 `doc[p].get_pixmap(matrix=fitz.Matrix(1.3,1.3))` 把目标整页渲染出来用 Read 看版面 → 估出每个图/表的 y 比例区间和左/右栏的 x 范围 → crop → Read 复核 → 不对就微调比例重裁。裁好后删掉不可用的原始 png，文章里只引用重裁版（命名如 `xxx_full.png`）。
+
+> 经验值：A4 双栏论文页高 841.89pt、页宽 595.28pt；左栏 x≈56..300，右栏 x≈300..550，整页宽 x≈18..577。多子图并排的横图通常 y 跨度只有 0.10~0.20。
 
 ### 第四步：写文章时的要求
 
@@ -317,10 +375,10 @@ alt text 用**简短的中文描述**（5-15 字），说明图的内容，不�
 
 ### 第五步：自动上传到 GitHub Pages（写完文章后必须执行）
 
-写完文章后，立即执行上传脚本：
+写完文章后，立即执行上传脚本（`$PY`、`$SKILL_DIR` 见顶部约定）：
 
 ```bash
-~/miniforge3/bin/python3 ~/.claude/skills/marsggbo/upload_post.py ~/Desktop/posts/<paper_slug>/
+"$PY" "$SKILL_DIR/upload_post.py" ~/Desktop/posts/<paper_slug>/
 ```
 
 脚本会自动：
@@ -355,7 +413,9 @@ Python import：
   print(assets.md_snippets())  # 直接粘贴进 markdown 的图片引用
 ```
 
-脚本位置：`~/.claude/skills/marsggbo/paper_assets.py`
+脚本位置：`$SKILL_DIR/paper_assets.py`（`$SKILL_DIR` = 注入的 Base directory）
+
+> ⚠️ 自动提取（`html`/`pdf`/`pages`）的结果**必须逐张目视验证**，双栏宽图/表经常切坏或糊在一起，切坏就按第三步用 PyMuPDF 手动重裁。
 
 ---
 

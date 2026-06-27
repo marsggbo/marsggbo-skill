@@ -4,6 +4,8 @@
 
 Forked from [floodsung/floodsung-skill](https://github.com/floodsung/floodsung-skill) — Option B 方式。
 
+> **路径说明（跨机器）**：下文命令里的 `~/.claude/skills/marsggbo` 只是常见安装位置；本 skill 也可能装在 `~/.cursor/skills/marsggbo` 或别处。请把它替换成你本机的实际 skill 目录（即触发 skill 时注入的「Base directory」）。所有维护脚本都用 skill 自带的 venv 解释器 `<skill_dir>/.venv/bin/python3` 运行——若 venv 还没建好，先跑一次 `bash <skill_dir>/scripts/env.sh` 即可自动创建并装好依赖（见 `requirements.txt`）。运行时（写文章/解读论文）的解释器与路径解析规则以 `SKILL.md` 顶部「环境与路径约定」为准。
+
 ---
 
 ## 目录结构
@@ -58,9 +60,9 @@ export ZHIHU_COOKIE="d_c0=...; z_c0=...; _xsrf=..."
 ### 第三步：抓取内容
 
 ```bash
-cd ~/marsggbo-skill/scripts
+cd ~/.claude/skills/marsggbo/scripts   # 换成你本机的 skill 目录
 USER_NAME="hexin_marsggbo"
-python3 scraper.py --user $USER_NAME --out ../data/zhihu
+../.venv/bin/python3 scraper.py --user $USER_NAME --out ../data/zhihu
 ```
 
 输出示例：
@@ -83,16 +85,16 @@ DONE: {'user': 'hexin_marsggbo', 'counts': {...}, 'scraped_at': '...'}
 
 ### 第四步：补全内容（可选）
 
-如果文章正文不完整，运行 enrich：
+如果文章正文不完整，运行 enrich（在 skill 的 scripts 目录下执行）：
 
 ```bash
-python3 enrich.py --dir ../data/zhihu
+../.venv/bin/python3 enrich.py --dir ../data/zhihu
 ```
 
 ### 第五步：生成 skill 参考文件
 
 ```bash
-python3 build_references.py
+../.venv/bin/python3 build_references.py
 ```
 
 会在 `~/.claude/skills/marsggbo/references/` 生成：
@@ -132,7 +134,8 @@ Cookie 有效期有限，内容更新时重新执行步骤 2-5：
 ```bash
 export ZHIHU_COOKIE="新的 cookie"
 USER_NAME="hexin_marsggbo"
-python3 scraper.py --user $USER_NAME --out ../data/zhihu
-python3 enrich.py --dir ../data/zhihu
-python3 build_references.py
+cd ~/.claude/skills/marsggbo/scripts   # 换成你本机的 skill 目录
+../.venv/bin/python3 scraper.py --user $USER_NAME --out ../data/zhihu
+../.venv/bin/python3 enrich.py --dir ../data/zhihu
+../.venv/bin/python3 build_references.py
 ```
