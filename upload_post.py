@@ -46,31 +46,55 @@ def get_token() -> str:
     )
 
 
-def get_file_sha(session: requests.Session, path: str) -> str | None:
-    """Return the SHA of an existing file, or None if not found."""
-    r = session.get(f"{API_BASE}/repos/{REPO}/contents/{path}")
-    if r.status_code == 200:
-        return r.json().get("sha")
-    return None
+def _api(session: requests.Session, method: str, path: str, **kw) -> requests.Response:
+    url = f"{API_BASE}/repos/{REPO}"
+    if path:
+        url += f"/{path}"
+    r = session.request(method, url, **kw)
+    if r.status_code >= 400:
+        raise RuntimeError(f"{method} {path} -> {r.status_code} {r.json().get('message', r.text)}")
+    return r
 
 
-def upload_file(session: requests.Session, repo_path: str, content: bytes, message: str) -> bool:
-    """Create or update a file in the repo. Returns True on success."""
-    sha = get_file_sha(session, repo_path)
-    payload: dict = {
+def commit_files(session: requests.Session, files: list[tuple[str, bytes]], message: str) -> str:
+    """Commit multiple files in a SINGLE commit via the Git Data API.
+
+    files: list of (repo_path, content_bytes). Returns the new commit SHA.
+    """
+    # 1. Resolve default branch + its tip commit
+    default_branch = _api(session, "GET", "").json()["default_branch"]
+    ref = _api(session, "GET", f"git/ref/heads/{default_branch}").json()
+    base_commit_sha = ref["object"]["sha"]
+    base_tree_sha = _api(session, "GET", f"git/commits/{base_commit_sha}").json()["tree"]["sha"]
+
+    # 2. Create a blob per file
+    tree_entries = []
+    for repo_path, content in files:
+        blob = _api(session, "POST", "git/blobs", json={
+            "content": base64.b64encode(content).decode(),
+            "encoding": "base64",
+        }).json()
+        tree_entries.append({
+            "path": repo_path,
+            "mode": "100644",
+            "type": "blob",
+            "sha": blob["sha"],
+        })
+        print(f"  staged  {repo_path}")
+
+    # 3. Build a tree, commit, and move the branch ref
+    new_tree = _api(session, "POST", "git/trees", json={
+        "base_tree": base_tree_sha,
+        "tree": tree_entries,
+    }).json()
+    new_commit = _api(session, "POST", "git/commits", json={
         "message": message,
-        "content": base64.b64encode(content).decode(),
-    }
-    if sha:
-        payload["sha"] = sha
-
-    r = session.put(f"{API_BASE}/repos/{REPO}/contents/{repo_path}", json=payload)
-    if r.status_code in (200, 201):
-        print(f"  OK  {repo_path}")
-        return True
-    else:
-        print(f"  FAIL {repo_path}: {r.status_code} {r.json().get('message', '')}")
-        return False
+        "tree": new_tree["sha"],
+        "parents": [base_commit_sha],
+    }).json()
+    _api(session, "PATCH", f"git/refs/heads/{default_branch}", json={"sha": new_commit["sha"]})
+    print(f"  committed {new_commit['sha'][:7]} to {default_branch}")
+    return new_commit["sha"]
 
 
 def main() -> None:
@@ -104,31 +128,26 @@ def main() -> None:
 
     print(f"=== Uploading post: {slug} ===")
 
-    # 1. Upload markdown — rewrite image paths
-    print("--- Uploading markdown ---")
-    md_content = md_file.read_text(encoding="utf-8")
-    # Replace relative `assets/xxx.png` with absolute `/assets/img/posts/<slug>/xxx.png`
-    remote_img_base = f"/assets/img/posts/{slug}"
-    md_content_remote = re.sub(
-        r"\]\(assets/",
-        f"]({remote_img_base}/",
-        md_content,
-    )
-    upload_file(session, f"_posts/{md_name}", md_content_remote.encode("utf-8"),
-                f"Add post: {slug}")
+    # Collect ALL files (markdown + images) so they go in one commit
+    files: list[tuple[str, bytes]] = []
 
-    # 2. Upload images
+    # 1. Markdown — rewrite relative `assets/xxx.png` to absolute repo path
+    md_content = md_file.read_text(encoding="utf-8")
+    remote_img_base = f"/assets/img/posts/{slug}"
+    md_content_remote = re.sub(r"\]\(assets/", f"]({remote_img_base}/", md_content)
+    files.append((f"_posts/{md_name}", md_content_remote.encode("utf-8")))
+
+    # 2. Images
     if assets_dir.is_dir():
-        print("--- Uploading images ---")
         imgs = sorted(
             f for f in assets_dir.iterdir()
             if f.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp")
         )
         for img in imgs:
-            upload_file(session, f"assets/img/posts/{slug}/{img.name}",
-                        img.read_bytes(), f"Add image: {slug}/{img.name}")
-    else:
-        print("--- No assets/ directory, skipping images ---")
+            files.append((f"assets/img/posts/{slug}/{img.name}", img.read_bytes()))
+
+    # 3. One commit for everything
+    commit_files(session, files, f"Add post: {slug} ({len(files)} files)")
 
     print()
     print("=== Done! ===")
