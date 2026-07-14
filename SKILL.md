@@ -536,18 +536,33 @@ mmdc --version   # 应输出版本号如 11.x.x
 ### 渲染命令
 
 ```bash
+# config 文件（控制字体大小，每次复用）
+cat > /tmp/mmdc-config.json << 'EOF'
+{
+  "theme": "default",
+  "themeVariables": {
+    "fontSize": "12px",
+    "fontFamily": "ui-sans-serif, system-ui, -apple-system, sans-serif"
+  }
+}
+EOF
+
 # 写 .mmd 文件 → 渲染成 PNG → 放到 assets/ 里
 mmdc -i /tmp/diagram.mmd \
      -o ~/Desktop/posts/<slug>/assets/diagram_xxx.png \
-     -b transparent \
-     -w 900 \
+     -c /tmp/mmdc-config.json \
+     -b white \
+     -w 660 \
      -s 2
 ```
 
 参数说明：
-- `-b transparent`：透明背景，博客深色/浅色主题都好看
-- `-w 900`：画布宽度 900px，适合博客正文宽度
-- `-s 2`：2x 缩放，高 DPI 屏清晰不模糊
+- `-c /tmp/mmdc-config.json`：**必须指定**，否则默认字体 16px 在博客里显得巨大突兀
+- `-b white`：白色背景，和博客正文背景一致；深色对比图的节点颜色自己在 style 里控制
+- `-w 660`：画布宽度 660px，对应博客正文区域宽度
+- `-s 2`：2x 缩放用于高 DPI 屏清晰显示——注意 `-w` 是逻辑宽度，实际输出是 1320px 宽
+
+**字体突兀的根本原因**：`-s 2` 把像素翻倍，但博客按原始逻辑尺寸显示图片，如果 fontSize 不缩小，字体会显得是正文的两倍大。config 里的 12px + `-s 2` 组合，渲染出来和正文字号视觉上匹配。
 
 渲染完之后**必须用 Read 工具看一眼结果图**，确认文字没有溢出、截断、重叠。
 
