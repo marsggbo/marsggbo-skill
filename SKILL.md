@@ -589,10 +589,10 @@ S1["① _update_states()<br/>gpu_model_runner.py:1148<br/>应用 SchedulerOutput
 | 错误/反例（深色背景） | `#3b1219` | `#ef4444` | `#fca5a5` |
 | 正确/正例（深色背景） | `#14291e` | `#22c55e` | `#86efac` |
 
-**对比图用 subgraph**。需要展示"旧方案 vs 新方案"时，用两个 subgraph 包裹，箭头连接两个 subgraph，标注转变的原因：
+**对比图用 subgraph**。需要展示"旧方案 vs 新方案"时，用两个 subgraph 包裹，箭头连接两个 subgraph，标注转变的原因。**用浅色背景**，不要用深色背景——深色背景的 subgraph 连接箭头会和背景融合，看不清楚：
 
 ```
-graph TB
+graph LR
     subgraph BAD["❌ 旧方案标题"]
         ...
     end
@@ -600,9 +600,13 @@ graph TB
         ...
     end
     BAD -->|"改进原因"| GOOD
-    style BAD fill:#3b1219,stroke:#ef4444,color:#fca5a5
-    style GOOD fill:#14291e,stroke:#22c55e,color:#86efac
+    style BAD fill:#fff0f0,stroke:#ef4444,color:#7f1d1d
+    style GOOD fill:#f0fdf4,stroke:#22c55e,color:#14532d
 ```
+
+节点也用对应的浅色：
+- 反例节点：`fill:#fee2e2,stroke:#ef4444,color:#7f1d1d`
+- 正例节点：`fill:#dcfce7,stroke:#22c55e,color:#14532d`
 
 **流程图用 `graph TD`，时序/对比用 `graph TB`**。多层级模块依赖可以用 `graph LR`，但节点不能超过 8 个，否则太挤。
 
