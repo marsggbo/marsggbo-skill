@@ -520,9 +520,72 @@ GPUModelRunner 是 SD 相关逻辑的宿主，持有两个 SD 专用成员：
 
 ---
 
-## F. 画图规范（mermaid → PNG）
+## F. 画图规范（HTML/CSS + puppeteer → PNG）
 
 文章里的图一律渲染成 PNG 图片文件，**不要把 mermaid 源码直接写进 markdown**——GitHub Pages 的 Jekyll 不渲染 mermaid，读者看到的是一坨源码。
+
+### 工具选择
+
+**优先用 HTML/CSS + puppeteer**，不用 mermaid。原因：
+- mermaid 对节点内边距、subgraph 空白、字体大小的控制极差，反复调参也难看
+- HTML/CSS 有完全的布局控制权，字体直接用系统 `-apple-system / PingFang SC`，中文渲染正常
+- puppeteer 已随 `@mermaid-js/mermaid-cli` 一起装好，无需额外安装
+
+**mermaid 只用于**简单的纯英文流程图（节点少、无对比布局、无中文）。
+
+### puppeteer 渲染模板
+
+```javascript
+// /tmp/screenshot.cjs
+const puppeteer = require('/opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/node_modules/puppeteer');
+const { pathToFileURL } = require('url');
+
+const jobs = [
+  { html: '/tmp/my_diagram.html', out: '~/Desktop/posts/<slug>/assets/xxx.png', width: 800 },
+];
+
+(async () => {
+  const browser = await puppeteer.launch({ headless: 'new' });
+  for (const { html, out, width } of jobs) {
+    const page = await browser.newPage();
+    await page.setViewport({ width, height: 2000, deviceScaleFactor: 2 });
+    await page.goto(pathToFileURL(html).href, { waitUntil: 'networkidle0' });
+    const body = await page.$('body');
+    await body.screenshot({ path: out });
+    console.log('saved:', out);
+    await page.close();
+  }
+  await browser.close();
+})();
+```
+
+```bash
+node /tmp/screenshot.cjs
+```
+
+- `deviceScaleFactor: 2`：2x 渲染，高 DPI 屏清晰
+- `body.screenshot()`：自动裁到 body 实际高度，无多余空白
+- `width` 设为博客正文宽度（流程图 620px，宽对比图 860px）
+
+### HTML 模板要点
+
+```html
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+    font-size: 13px;
+    background: white;
+    padding: 18px;
+    width: <与 viewport width 一致>px;
+  }
+</style>
+```
+
+- `width` 必须和 puppeteer 里的 `viewport.width` 一致，否则布局错乱
+- `body` 设 `padding: 18px`，截图时内容不贴边
+- 对比图（左右布局）用 `display: flex`；流程图用 `flex-direction: column`
+- 颜色规范见下方配色表，用浅色背景保证箭头/边框可见
 
 ### 工具链
 
