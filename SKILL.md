@@ -526,12 +526,14 @@ GPUModelRunner 是 SD 相关逻辑的宿主，持有两个 SD 专用成员：
 
 ### 工具选择
 
-**优先用 HTML/CSS + puppeteer**，不用 mermaid。原因：
-- mermaid 对节点内边距、subgraph 空白、字体大小的控制极差，反复调参也难看
-- HTML/CSS 有完全的布局控制权，字体直接用系统 `-apple-system / PingFang SC`，中文渲染正常
-- puppeteer 已随 `@mermaid-js/mermaid-cli` 一起装好，无需额外安装
+**默认用 mermaid**，自动处理节点间距和布局，省事。
 
-**mermaid 只用于**简单的纯英文流程图（节点少、无对比布局、无中文）。
+遇到以下情况时改用 HTML/CSS + puppeteer：
+- 需要左右对比布局（如 bad vs good），mermaid subgraph 两侧宽度比例失衡、大量空白
+- 节点内需要精细排版（多行文字、等宽数字对齐、色块等）
+- 包含大量中文且对字体有要求（mermaid 中文字体 fallback 不稳定）
+
+puppeteer 已随 `@mermaid-js/mermaid-cli` 一起装好，无需额外安装。
 
 ### puppeteer 渲染模板
 
