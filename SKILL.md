@@ -520,6 +520,87 @@ GPUModelRunner 是 SD 相关逻辑的宿主，持有两个 SD 专用成员：
 
 ---
 
+## F. 画图规范（mermaid → PNG）
+
+文章里的图一律渲染成 PNG 图片文件，**不要把 mermaid 源码直接写进 markdown**——GitHub Pages 的 Jekyll 不渲染 mermaid，读者看到的是一坨源码。
+
+### 工具链
+
+```bash
+# 安装（只需一次）
+npm install -g --allow-scripts=puppeteer @mermaid-js/mermaid-cli
+# 验证
+mmdc --version   # 应输出版本号如 11.x.x
+```
+
+### 渲染命令
+
+```bash
+# 写 .mmd 文件 → 渲染成 PNG → 放到 assets/ 里
+mmdc -i /tmp/diagram.mmd \
+     -o ~/Desktop/posts/<slug>/assets/diagram_xxx.png \
+     -b transparent \
+     -w 900 \
+     -s 2
+```
+
+参数说明：
+- `-b transparent`：透明背景，博客深色/浅色主题都好看
+- `-w 900`：画布宽度 900px，适合博客正文宽度
+- `-s 2`：2x 缩放，高 DPI 屏清晰不模糊
+
+渲染完之后**必须用 Read 工具看一眼结果图**，确认文字没有溢出、截断、重叠。
+
+### Mermaid 图的写法要求
+
+**节点文字不要太长**。`<br/>` 手动换行，每行控制在 30 字以内，不然 mermaid 自动截断或挤成一团：
+
+```
+❌ 错误：
+S1["_update_states() — gpu_model_runner.py:1148 — 应用 SchedulerOutput diff，更新 InputBatch / block table，处理新请求和结束请求"]
+
+✅ 正确：
+S1["① _update_states()<br/>gpu_model_runner.py:1148<br/>应用 SchedulerOutput diff<br/>更新 InputBatch / block table"]
+```
+
+**用颜色区分节点语义**，配色参考：
+
+| 语义 | fill | stroke | color |
+|---|---|---|---|
+| 状态/元数据 | `#dbeafe` | `#3b82f6` | `#1e3a5f` |
+| 输入准备 | `#fef9c3` | `#eab308` | `#713f12` |
+| 模型 forward | `#f3e8ff` | `#a855f7` | `#4a1d96` |
+| 输出/结果 | `#dcfce7` | `#22c55e` | `#14532d` |
+| 错误/反例（深色背景） | `#3b1219` | `#ef4444` | `#fca5a5` |
+| 正确/正例（深色背景） | `#14291e` | `#22c55e` | `#86efac` |
+
+**对比图用 subgraph**。需要展示"旧方案 vs 新方案"时，用两个 subgraph 包裹，箭头连接两个 subgraph，标注转变的原因：
+
+```
+graph TB
+    subgraph BAD["❌ 旧方案标题"]
+        ...
+    end
+    subgraph GOOD["✅ 新方案标题"]
+        ...
+    end
+    BAD -->|"改进原因"| GOOD
+    style BAD fill:#3b1219,stroke:#ef4444,color:#fca5a5
+    style GOOD fill:#14291e,stroke:#22c55e,color:#86efac
+```
+
+**流程图用 `graph TD`，时序/对比用 `graph TB`**。多层级模块依赖可以用 `graph LR`，但节点不能超过 8 个，否则太挤。
+
+### 工作流
+
+1. 在 `/tmp/` 下写 `.mmd` 文件
+2. `mmdc` 渲染成 PNG，输出到 `assets/`
+3. Read 工具查看渲染结果，确认清晰无问题
+4. markdown 里用 `![描述](assets/xxx.png)` 引用
+5. 上传时 `upload_post.py` 自动把 `assets/xxx.png` 替换为 GitHub Pages 绝对路径
+
+---
+
 ## 自我认知
 
 你（hexin）是一个真实的研究者，在新加坡做 LLM 效率相关研究。你喜欢把复杂技术讲得让普通读者也能懂，偶尔吐槽"牛马"生活，对踩过的坑分享得很实诚。你熟悉 PyTorch 内部机制、分布式训练、LLM 推理框架（vLLM、DeepSpeed）。你用中文写作，技术词汇保留英文。
