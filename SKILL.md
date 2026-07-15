@@ -477,46 +477,126 @@ Python import：
 - 所有数字来自原文，所有架构图/实验图嵌入对应段落
 - 引用具体数字（显存、速度倍数等）增加可信度
 
-### E. 源码解读（自上而下原则）
+### E. 源码解读写作规范
 
-写源码解析文章时，**必须先建立整体框架，再深入细节**。反模式是直接罗列"几点说明"——读者不知道这些细节彼此的关系，也不知道为什么要介绍这些，一头雾水。
+#### E.1 结构顺序（必须遵守）
 
-#### 写作顺序（必须遵守）
+写源码解析文章时，**必须先建立整体框架，再深入细节**。
 
-1. **先交代问题**：这段代码要解决什么问题？用一句话说清楚（如"SD 怎么嵌进 vllm 的推理流水线"）
-2. **先讲 high-level 调用链**：谁调用谁？入口在哪？数据怎么流？用文字 + 时序图/架构图说清楚整体结构
-3. **介绍模块依赖**：有哪些核心模块？各模块的职责是什么？彼此怎么依赖？先给全景图，再说细节
-4. **接口设计**：关键接口/基类的设计意图是什么？为什么这么设计？（不是直接上继承关系，而是先说"为什么要抽象"）
-5. **具体实现**：在已有 high-level 理解的基础上，才深入每个子模块的具体实现，包括继承关系、关键代码路径、边界条件
+1. **先交代问题**：这段代码要解决什么问题？一句话说清楚
+2. **先建立概念**：文章里反复出现的专有名词，先用大白话解释清楚，再进代码
+3. **整体架构图**：模块依赖、持有关系、数据流向，用图展示全景——图要放在细节之前，不是之后
+4. **初始化链路**：模块怎么创建、依赖怎么注入，读者需要知道"这个对象从哪来"
+5. **运行时主线**：按执行顺序讲，函数入口→返回值→传给谁，每个函数的输入输出都要说清楚
+6. **模块细节**：有了全局视角后，才展开每个子模块的实现差异
 
-#### 反模式示例（绝对不要这样写）
+每个 section 的小标题要体现递进或并列关系，读者看标题就能知道文章的走向，不能"想到哪写到哪"。
 
-```
-❌ 错误（孤立细节，没有铺垫）：
-几点说明：
-- self.drafter 和 self.rejection_sampler 都是 GPUModelRunner 的成员，在 __init__() 第 565~641 行初始化
-- EagleProposer 和 DraftModelProposer 继承 SpecDecodeBaseProposer；MedusaProposer 和 NgramProposer 是独立实现
-- RejectionSampler 在 vllm/v1/sample/ 目录下，不在 spec_decode/ 里
-```
+#### E.2 代码块规范
 
-读者不知道 self.drafter 是什么、为什么要有它、它和 rejection_sampler 的关系是什么——你直接说"在哪里初始化"毫无意义。
+**每个代码块必须标注 class 和 function**，不能只有文件名和行号：
 
-```
-✅ 正确（先讲 why 和 what，再讲 where）：
-GPUModelRunner 是 SD 相关逻辑的宿主，持有两个 SD 专用成员：
-- self.drafter：Proposer，负责生成 draft tokens
-- self.rejection_sampler：负责做 rejection sampling
+```python
+# ✅ 正确
+# vllm/v1/worker/gpu_model_runner.py
+# class GPUModelRunner
+# def execute_model(self, scheduler_output)  第 4352 行
 
-有了这个全景，再来看各自的代码位置和初始化逻辑...
+# ❌ 错误（读者不知道在哪个类的哪个方法下）
+# gpu_model_runner.py，第 4352 行
 ```
 
-#### 图表和文字的关系
+**函数有入口必须有出口**：展示一个函数的代码时，必须同时说明：
+- 这个函数的输入是什么（来自哪里）
+- 返回值是什么（shape、类型）
+- 返回值传给了谁、被怎么用
+
+```
+❌ 错误（只有调用，没有返回和去向）：
+for token_index in range(self.num_speculative_tokens - 1):
+    ...
+    draft_token_ids, _ = self._sample_draft_tokens(...)
+    draft_token_ids_list.append(draft_token_ids)
+
+✅ 正确（明确输入输出和去向）：
+return draft_token_ids_list  # list[Tensor]，长度 K，每个 shape [batch_size]
+# ↑ 这个返回值最终进入 execute_model_state，下一轮被打包进 input_ids
+```
+
+#### E.3 变量必须有上下文和具体例子
+
+代码里出现的变量，必须解释它**从哪里来、值域是什么**，光写注释不够，要配具体例子：
+
+```
+❌ 错误（remaining_token_budget 没解释来源，remaining 不知道取值范围）：
+remaining = len(request.prompt_token_ids) - request.num_computed_tokens
+num_new = min(remaining, remaining_token_budget)
+
+✅ 正确（解释来源 + 给例子）：
+# remaining_token_budget 在循环外初始化为 max_num_batched_tokens（如 256）
+# 正在 decode 的请求在 self.running 里，不在 self.waiting，所以 remaining 永远 > 0
+# 例子：prompt 1000 token，已 prefill 256，remaining = 744
+# num_new = min(744, 254) = 254（254 是扣掉 2 个 decode 请求后的剩余 budget）
+```
+
+涉及 tensor shape 的地方必须给具体数字例子：
+
+```
+❌ 错误（只有抽象 shape）：
+# kv_cache 的 shape: [num_blocks, 2, block_size, num_kv_heads, head_dim]
+
+✅ 正确（给具体数字，并说明含义）：
+# 假设 num_blocks=1000, block_size=16, num_kv_heads=8, head_dim=128
+# kv_cache.shape = [1000, 2, 16, 8, 128]
+# kv_cache[42, 0] 就是第 42 号物理块的 K cache，存了 16 个 token 的 K 向量
+```
+
+涉及地址计算、索引映射的公式，必须配一个走完一遍的例子：
+
+```
+❌ 错误（只有公式）：
+slot_id = block_table[req][pos // B] * B + (pos % B)
+
+✅ 正确（配具体计算）：
+# 例：block_size=16，请求的 token 17（pos=17）
+# 逻辑块 = 17 // 16 = 1 → 物理块 = block_table[req][1] = 12
+# 块内偏移 = 17 % 16 = 1
+# slot_id = 12 * 16 + 1 = 193
+```
+
+#### E.4 概念先铺垫，再用
+
+文章里第一次出现的专业术语或缩写，必须在当前位置或之前某节解释清楚，不能空降。反模式：
+
+```
+❌ 错误（EAGLE/DraftModel/bookkeeping 等术语在没解释的情况下直接使用）：
+EAGLE/DraftModel 的 propose 可以和 CPU bookkeeping 重叠
+
+✅ 正确（先在概念节解释，再使用）：
+## 2. 先建立概念
+Bookkeeping（账本同步）：rejection sampling 的结果在 GPU 上算出来，但 KV Cache 的
+block table 在 CPU 侧维护。bookkeeping 就是把结果同步到 CPU 更新 block table...
+```
+
+#### E.5 图表和文字的关系
 
 有时序图/架构图是好事，但图不能代替文字解释。每张图出现之前，必须用文字交代：
 - 这张图展示什么
 - 读者应该从图里看到什么关键信息
 
-图之后，用文字点出图里最重要的 2-3 个细节（不是复述图里的全部内容）。**图是辅助，文字是主体**。
+图之后，用文字**逐步走读**图里的关键节点（不是笼统说"三个关键点"），让读者可以对着图一步步看懂。**图是辅助，文字是主体**。
+
+#### E.6 反模式速查
+
+| 反模式 | 正确做法 |
+|---|---|
+| 只有文件名+行号，没有 class/function | 必须标注 `class Xxx` + `def yyy()` |
+| 展示函数调用但不说返回值和去向 | 说明返回值类型/shape，以及传给了谁 |
+| 变量没有来源解释和取值例子 | 解释变量从哪来、给具体数字例子 |
+| tensor shape 只有符号没有数字 | 补充具体数字，并说明每个维度含义 |
+| 术语/缩写空降，没有铺垫 | 在文章前面先定义，再使用 |
+| 时序图后只有"三个关键点" | 逐步走读每个节点，对着图一步步解释 |
+| 多个主题混排，section 间无逻辑关系 | 每个主题独立成节，标题体现递进/并列 |
 
 ---
 
