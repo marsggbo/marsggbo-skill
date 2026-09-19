@@ -5,7 +5,9 @@
 set -e
 # 如果用户不传参就报错终止 (-1:? 语法)
 KEYWORD="${1:?need keyword}"
-DATA_DIR="/Users/hex/hexin-marsggbo-skill/data/zhihu"
+# 跨机器可移植：相对本脚本位置解析 skill 根目录，不硬编码任何用户机器的绝对路径
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="$(dirname "$SCRIPT_DIR")/data/zhihu"
 
 # 使用 grep 的 -n 显示行数, -i 忽略大小写
 # 抓取每个分类匹配的前若干行，最后加上 || true 确保即便 grep 返回非0值 (没东西) 时不引发 set -e 中断崩溃
